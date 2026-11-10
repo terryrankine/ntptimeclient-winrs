@@ -63,19 +63,70 @@ fn div_round_half_away(n: i128, d: i128) -> i128 {
     if n < 0 { -q } else { q }
 }
 
+/// Values beyond this many ppm are returned by `quantise` unchanged. Far
+/// above any real rate, and it keeps the nano-ppm integers exact.
+const QUANTISE_LIMIT_PPM: f64 = 1e9;
+
 /// Rounds `ppm` to a whole number of `granularity_ppm` steps.
 ///
-/// Ties round away from zero. A granularity that is zero, negative or not
-/// finite leaves `ppm` unchanged. So does a result that would not be finite.
-/// This mirrors what the OS does to a rate, so the host can report the rate
-/// it really applied.
+/// It works on the same whole nano-ppm integers as [`ppm_to_adjustment`],
+/// ties away from zero. So with the OS granularity `1e6 / nominal` it gives
+/// exactly the rate the mapping applies, whenever that granularity is a whole
+/// number of nano-ppm (0.1 ppm and 6.4 ppm both are). Inside plus or minus
+/// [`MAX_ADJUSTMENT_PPM`] only: the mapping clamps there, this does not.
+///
+/// `ppm` comes back unchanged for a granularity that is not finite, not
+/// above zero or under half a nano-ppm, and for a `ppm` that is not finite
+/// or beyond 1e9 ppm.
 #[must_use]
 pub fn quantise(ppm: Ppm, granularity_ppm: f64) -> Ppm {
-    if !(granularity_ppm.is_finite() && granularity_ppm > 0.0) {
+    let v = ppm.value();
+    let usable = granularity_ppm.is_finite()
+        && granularity_ppm > 0.0
+        && granularity_ppm <= QUANTISE_LIMIT_PPM
+        && v.is_finite()
+        && v.abs() <= QUANTISE_LIMIT_PPM;
+    if !usable {
         return ppm;
     }
-    let q = (ppm.value() / granularity_ppm).round() * granularity_ppm;
-    if q.is_finite() { Ppm::new(q) } else { ppm }
+    // Both are at most 1e18 after scaling, far inside i128.
+    #[allow(clippy::cast_possible_truncation)]
+    let (n, g) = (
+        (v * PPM_SCALE).round() as i128,
+        (granularity_ppm * PPM_SCALE).round() as i128,
+    );
+    if g == 0 {
+        return ppm;
+    }
+    let q = div_round_half_away(n, g) * g;
+    // |q| is at most 2e18, which f64 holds to within one nano-ppm part.
+    #[allow(clippy::cast_precision_loss)]
+    let out = q as f64 / PPM_SCALE;
+    Ppm::new(out)
+}
+
+/// `ERROR_PRIVILEGE_NOT_HELD`.
+const PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// Runs `call`. If it fails with `ERROR_PRIVILEGE_NOT_HELD`, runs `enable`
+/// and then `call` once more.
+///
+/// Learn says `SetSystemTime` disables `SE_SYSTEMTIME_NAME` before it
+/// returns. So after a step the next rate call can find the privilege off.
+///
+/// # Errors
+/// The error of `enable`, or of the last `call`.
+pub fn with_privilege_retry<T>(
+    mut call: impl FnMut() -> std::io::Result<T>,
+    mut enable: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<T> {
+    match call() {
+        Err(e) if e.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+            enable()?;
+            call()
+        }
+        other => other,
+    }
 }
 
 /// The clock rate state the OS reports.
@@ -220,6 +271,9 @@ pub fn mono_now() -> Mono {
 pub struct WindowsClock {
     nominal: u64,
     initial: AdjustmentState,
+    /// Re-enabling the privilege after a step failed. The next rate call
+    /// enables it first and reports the error if it fails again.
+    reenable_pending: bool,
 }
 
 #[cfg(windows)]
@@ -242,7 +296,39 @@ impl WindowsClock {
         Ok(Self {
             nominal: initial.increment,
             initial,
+            reenable_pending: false,
         })
+    }
+
+    /// Takes the rate at start: nominal, with the OS kept out (R71). Calls
+    /// `SetSystemTimeAdjustmentPrecise(increment, FALSE)`.
+    ///
+    /// The host calls it once at start, after logging
+    /// [`WindowsClock::initial_state`]. `new` does not, because `new` must not
+    /// change anything. At stop the host calls [`Clock::reset_frequency`],
+    /// which hands timekeeping back to the system so `w32time` can take over.
+    ///
+    /// Unverified on a VM. No test runs it.
+    ///
+    /// # Errors
+    /// [`ClockError`] if the OS refuses.
+    pub fn take_rate_control(&mut self) -> Result<(), ClockError> {
+        let nominal = self.nominal;
+        self.set_raw(nominal, false, "take clock rate")
+    }
+
+    /// One rate call with the privilege retry.
+    fn set_raw(&mut self, adjustment: u64, disabled: bool, op: &str) -> Result<(), ClockError> {
+        if self.reenable_pending {
+            win32::enable_systemtime_privilege()
+                .map_err(|e| clock_error("enable privilege", &e))?;
+            self.reenable_pending = false;
+        }
+        with_privilege_retry(
+            || win32::set_time_adjustment_precise(adjustment, disabled),
+            win32::enable_systemtime_privilege,
+        )
+        .map_err(|e| clock_error(op, &e))
     }
 
     /// The rate state found at start. A non-nominal state means a rate left
@@ -281,19 +367,32 @@ impl Clock for WindowsClock {
 
     fn step(&mut self, by: Offset) -> Result<(), ClockError> {
         let ft = step_target_filetime(wall_now_ns(), by)?;
-        win32::set_system_time(ft).map_err(|e| clock_error("set system time", &e))
+        with_privilege_retry(
+            || win32::set_system_time(ft),
+            win32::enable_systemtime_privilege,
+        )
+        .map_err(|e| clock_error("set system time", &e))?;
+        // Learn: SetSystemTime disables the privilege before it returns.
+        // The step itself succeeded, so a failure here must not report it
+        // as failed. The next rate call enables first and reports then.
+        if win32::enable_systemtime_privilege().is_err() {
+            self.reenable_pending = true;
+        }
+        Ok(())
     }
 
     fn set_frequency(&mut self, ppm: Ppm) -> Result<(), ClockError> {
+        // No magnitude cap here (R70). The discipline caps at 500 ppm and
+        // `ppm_to_adjustment` clamps at 1000 ppm. A third cap would only
+        // hide a discipline bug behind a silent clamp.
         let adjustment = ppm_to_adjustment(ppm, self.nominal);
-        win32::set_time_adjustment_precise(adjustment, false)
-            .map_err(|e| clock_error("set clock rate", &e))
+        self.set_raw(adjustment, false, "set clock rate")
     }
 
     fn reset_frequency(&mut self) -> Result<(), ClockError> {
         // TRUE hands timekeeping back to the OS at the normal rate. The
         // value is ignored in that mode.
-        win32::set_time_adjustment_precise(0, true).map_err(|e| clock_error("reset clock rate", &e))
+        self.set_raw(0, true, "reset clock rate")
     }
 }
 
@@ -502,6 +601,97 @@ mod tests {
         };
         assert_eq!(zero.ppm(), None);
         assert_eq!(zero.granularity_ppm(), None);
+    }
+
+    #[test]
+    fn quantise_agrees_with_the_adjustment_mapping() {
+        // Granularity of NOMINAL is 0.1 ppm, a whole number of nano-ppm.
+        // Steps of 0.05 hit every tie, where the two used to disagree.
+        for i in -20_000..=20_000 {
+            let ppm = f64::from(i) * 0.05;
+            let counts =
+                i128::from(ppm_to_adjustment(Ppm::new(ppm), NOMINAL)) - i128::from(NOMINAL);
+            #[allow(clippy::cast_precision_loss)]
+            let from_mapping = counts as f64 * 0.1;
+            let q = quantise(Ppm::new(ppm), 0.1).value();
+            assert!(
+                (q - from_mapping).abs() < 1e-9,
+                "{ppm}: {q} vs {from_mapping}"
+            );
+        }
+        assert!((quantise(Ppm::new(0.15), 0.1).value() - 0.2).abs() < 1e-12);
+    }
+
+    fn os_err(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn retry_reenables_once_after_privilege_not_held() {
+        let mut calls = 0;
+        let mut enables = 0;
+        let r = with_privilege_retry(
+            || {
+                calls += 1;
+                if calls == 1 { Err(os_err(1314)) } else { Ok(7) }
+            },
+            || {
+                enables += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!((calls, enables), (2, 1));
+    }
+
+    #[test]
+    fn retry_gives_up_after_one_more_try() {
+        let mut calls = 0;
+        let r: std::io::Result<()> = with_privilege_retry(
+            || {
+                calls += 1;
+                Err(os_err(1314))
+            },
+            || Ok(()),
+        );
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(1314));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn retry_reports_a_failed_enable_and_does_not_call_again() {
+        let mut calls = 0;
+        let r: std::io::Result<()> = with_privilege_retry(
+            || {
+                calls += 1;
+                Err(os_err(1314))
+            },
+            || Err(os_err(1300)),
+        );
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(1300));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_leaves_other_errors_and_success_alone() {
+        let mut enables = 0;
+        let r: std::io::Result<()> = with_privilege_retry(
+            || Err(os_err(87)),
+            || {
+                enables += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(87));
+        let ok = with_privilege_retry(
+            || Ok(1),
+            || {
+                enables += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(ok.unwrap(), 1);
+        assert_eq!(enables, 0);
     }
 
     #[test]
