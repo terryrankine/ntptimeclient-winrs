@@ -1,5 +1,14 @@
 # ntptimeclient-winrs configuration. UNSIGNED PREVIEW.
 #
+# WHERE THIS FILE GOES. The service reads a file named config.toml in the
+# SAME folder as ntptimeclient-winrs.exe. It does not read it from the state
+# directory (C:\ProgramData\ntptimeclient-winrs). Copy this file to
+# config.toml from an elevated shell. The folder and the file must be
+# admin-only, because the service loads the file as LocalSystem at every
+# start. Anyone who can write it controls the clock. The exe refuses to run
+# from a folder that is not admin-only, and it refuses a folder with stray
+# files in it, so keep config.toml as the one addition.
+#
 # Every key is optional. An empty file gives the same values as this file.
 # An unknown key is an error, so a typo cannot silently leave a safety
 # setting at its default.
