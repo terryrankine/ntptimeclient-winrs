@@ -17,6 +17,9 @@ ntpc-core = { path = "crates/ntpc-core" }
 ntpc-platform = { path = "crates/ntpc-platform" }
 # OS CSPRNG for the NTP request nonce. On Windows it adds only `cfg-if`.
 getrandom = "0.4"
+# Config file. Parse and serde only, no writer or display code.
+toml = { version = "1.2", default-features = false, features = ["std", "parse", "serde"] }
+serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

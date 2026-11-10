@@ -1,5 +1,6 @@
 //! Service wiring. Config and runtime arrive in later tasks.
 
+pub mod config;
 pub mod proto;
 
 /// Crate name, used by the smoke test.
