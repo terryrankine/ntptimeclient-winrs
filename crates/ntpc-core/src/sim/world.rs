@@ -33,6 +33,8 @@ struct TrueClock {
     applied: f64,
     /// Rate the clock needs to keep true time, in ppm.
     need: f64,
+    /// Clock commands fail while set.
+    broken: bool,
 }
 
 impl TrueClock {
@@ -43,6 +45,15 @@ impl TrueClock {
         self.err += (self.applied - self.need) * 1e-6 * dt;
         self.at = self.at.max(now);
     }
+}
+
+/// What the host knows about adjustment.
+#[derive(Debug, Clone, Copy, Default)]
+struct Host {
+    /// The adjustment level the host last sent.
+    level: bool,
+    /// A clock command failed and the host has not re-armed the engine.
+    latched: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,12 +129,7 @@ pub struct SimWorld {
     /// Latest time the engine has seen.
     seen: Mono,
     network_up: bool,
-    /// The adjustment level the host last sent.
-    level: bool,
-    /// Clock commands fail while set.
-    broken: bool,
-    /// A clock command failed and the host has not re-armed the engine.
-    latched: bool,
+    host: Host,
     next_check: Mono,
     events: Vec<(Mono, u64, SimEvent)>,
     pending: Vec<Pending>,
@@ -145,6 +151,7 @@ impl SimWorld {
                 at: Mono::from_nanos(0),
                 applied: 0.0,
                 need: 0.0,
+                broken: false,
             },
             servers: Vec::new(),
             listed: Vec::new(),
@@ -152,9 +159,7 @@ impl SimWorld {
             now: Mono::from_nanos(0),
             seen: Mono::from_nanos(0),
             network_up: true,
-            level: false,
-            broken: false,
-            latched: false,
+            host: Host::default(),
             next_check: Mono::from_nanos(0),
             events: Vec::new(),
             pending: Vec::new(),
@@ -234,8 +239,8 @@ impl SimWorld {
         self.track();
         if !self.started {
             self.started = true;
-            self.level = true;
-            self.feed(engine, Event::AdjustmentAllowed(self.level));
+            self.host.level = true;
+            self.feed(engine, Event::AdjustmentAllowed(self.host.level));
             let list = self.specs();
             self.feed(engine, Event::SourcesChanged(list));
             self.next_check = later(self.now, LEVEL_CHECK);
@@ -261,7 +266,7 @@ impl SimWorld {
                 self.apply_event(engine);
             } else if self.next_check <= self.now {
                 self.next_check = later(self.now, LEVEL_CHECK);
-                self.feed(engine, Event::AdjustmentAllowed(self.level));
+                self.feed(engine, Event::AdjustmentAllowed(self.host.level));
             } else {
                 self.feed(engine, Event::Tick(self.now));
             }
@@ -330,9 +335,9 @@ impl SimWorld {
             }
             if clock {
                 self.clock_command();
-                if self.broken {
+                if self.clock.broken {
                     failed = true;
-                    self.latched = true;
+                    self.host.latched = true;
                     self.report.clock_failures += 1;
                     results.push(Err(ClockError::Rejected("simulated failure".into())));
                     continue;
@@ -370,7 +375,7 @@ impl SimWorld {
         self.report.clock_commands += 1;
         // After a failure the engine must stay silent until re-armed, even
         // while the host keeps sending `true`.
-        if !self.level || self.latched {
+        if !self.host.level || self.host.latched {
             self.report.commands_while_disabled += 1;
         }
     }
@@ -506,7 +511,7 @@ impl SimWorld {
                 self.lose_in_flight();
                 self.feed(engine, Event::Resumed(self.now));
                 // The host checks `w32time` again after a wake.
-                self.feed(engine, Event::AdjustmentAllowed(self.level));
+                self.feed(engine, Event::AdjustmentAllowed(self.host.level));
             }
             SimEvent::SourcesChanged(labels) => {
                 self.listed = labels
@@ -532,19 +537,19 @@ impl SimWorld {
             }
             SimEvent::W32TimeStarted => {
                 self.clock.applied = 0.0;
-                self.level = false;
+                self.host.level = false;
                 self.feed(engine, Event::AdjustmentAllowed(false));
             }
             SimEvent::W32TimeStopped => {
-                self.level = true;
+                self.host.level = true;
                 self.feed(engine, Event::AdjustmentAllowed(true));
             }
             SimEvent::SetDrift(p) => self.clock.need = p.value(),
-            SimEvent::ClockFails(yes) => self.broken = yes,
+            SimEvent::ClockFails(yes) => self.clock.broken = yes,
             SimEvent::HostRearm => {
-                self.latched = false;
+                self.host.latched = false;
                 self.feed(engine, Event::AdjustmentAllowed(false));
-                self.feed(engine, Event::AdjustmentAllowed(self.level));
+                self.feed(engine, Event::AdjustmentAllowed(self.host.level));
             }
         }
     }
