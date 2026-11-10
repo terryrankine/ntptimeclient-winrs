@@ -22,10 +22,32 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
         return code;
     }
     let mut codes = Vec::new();
+    let mut stopped_ours = false;
+    // R113: a foreign service of our name is left alone, but w32time is
+    // still restored from the record. Exit 31 is reported after that.
+    let foreign = match d.reg.check_ours() {
+        Ok(()) => false,
+        Err(e) => {
+            d.host.say(&format!(
+                "{e}. It is not stopped or removed. w32time is still restored."
+            ));
+            codes.push(exit::FOREIGN_SERVICE);
+            true
+        }
+    };
 
-    match d.reg.stop_service() {
-        Ok(OwnService::Present) => d.host.say("Service stopped."),
+    let stopped = if foreign {
+        Ok(OwnService::Absent)
+    } else {
+        d.reg.stop_service()
+    };
+    match stopped {
+        Ok(OwnService::Present) => {
+            stopped_ours = true;
+            d.host.say("Service stopped.");
+        }
         Ok(OwnService::Absent) => d.host.say("Service is not installed. Continuing."),
+        Ok(OwnService::WasStopped) => d.host.say("Service is installed and was not running."),
         Err(e) => {
             // Keep going. With w32time back, a still running service sees it
             // in its 30 s check and stops adjusting the clock.
@@ -38,14 +60,21 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
 
     let w32time_not_back =
         codes.contains(&exit::RESTORE) || codes.contains(&exit::NO_RECORD_DISABLED);
-    if w32time_not_back {
+    if foreign {
+        // Nothing of ours to start again or remove.
+    } else if w32time_not_back {
         d.host.say(
-            "w32time was not put back, so the service registration is kept (stopped). Put \
-             w32time back by hand, then run uninstall again.",
+            "w32time was not put back, so the service registration is kept. Put w32time back \
+             by hand, then run uninstall again.",
         );
+        if stopped_ours {
+            restart_ours(d);
+        }
     } else {
         match d.reg.unregister() {
-            Ok(OwnService::Present) => d.host.say("Service registration removed."),
+            Ok(OwnService::Present | OwnService::WasStopped) => {
+                d.host.say("Service registration removed.");
+            }
             Ok(OwnService::Absent) => {}
             Err(e) => {
                 d.host
@@ -61,6 +90,7 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
         exit::RECORD_NOT_TRUSTED,
         exit::RECORD_INVALID,
         exit::STATE_DIR,
+        exit::FOREIGN_SERVICE,
         exit::UNREGISTER,
     ]
     .into_iter()
@@ -69,6 +99,23 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
         d.host.say("Uninstalled. The state directory is kept.");
         exit::OK
     })
+}
+
+/// R94 concern: our service was stopped at the start and `w32time` is not
+/// back, so without this the machine has no time service until the next
+/// boot. Only a service this run stopped is started again.
+fn restart_ours(d: &mut Deps<'_>) {
+    match d.reg.start_service() {
+        Ok(()) => d.host.say(
+            "Our service was started again, so this machine keeps time sync until w32time is \
+             put back.",
+        ),
+        Err(e) => d.host.say(&format!(
+            "Our service could not be started again: {e}. This machine has no time sync until \
+             it is started. Start it by hand with: sc.exe start {}",
+            crate::registration::SERVICE_NAME
+        )),
+    }
 }
 
 /// What uninstall says for a refusal while securing. Its own words, not
@@ -142,7 +189,7 @@ fn restore_step(d: &mut Deps<'_>, codes: &mut Vec<u8>) {
             Err(e) => {
                 d.host.say(&format!(
                     "Restoring w32time failed: {e}. The restore record is kept. Run uninstall \
-                     again."
+                     again. {MANUAL_RESTORE}"
                 ));
                 codes.push(exit::RESTORE);
             }

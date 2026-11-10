@@ -8,7 +8,10 @@
 
 pub(crate) mod adapters;
 pub(crate) mod dhcp;
+pub(crate) mod mutex;
 pub(crate) mod scm;
+pub(crate) mod service;
+pub(crate) mod service_query;
 pub(crate) mod thread;
 
 use std::ffi::c_void;
