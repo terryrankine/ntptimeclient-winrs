@@ -12,6 +12,7 @@
 //!   [`Event::Failed`] carries no time. The engine stamps it with the latest
 //!   time it has seen, so send a [`Event::Tick`] first when time has moved.
 //! - Report each clock action, in order, through [`Event::ClockResult`].
+//!   Stop the rest of a batch's clock actions after the first failure.
 //! - [`Event::AdjustmentAllowed`] is a level. Adjustment starts off. Send it
 //!   at start and again whenever the `w32time` or domain-join state is
 //!   checked. A failed clock command turns adjustment off and keeps it
@@ -26,7 +27,7 @@ use std::time::Duration;
 
 use crate::discipline::{Correction, CrossCheck, Discipline, DisciplineConfig, MAX_HOLD};
 use crate::filter::SourceFilter;
-use crate::select::{Selection, SelectionConfig};
+use crate::select::{Selection, SelectionConfig, select};
 use crate::tier::{TierChooser, TierConfig};
 use crate::{
     ClockError, KodCode, Mono, Offset, Ppm, QueryFailure, Sample, SourceId, SourceSpec, Tier,
@@ -244,6 +245,9 @@ struct Source {
     rate_floor: Duration,
     last_query: Option<Mono>,
     prev_query: Option<Mono>,
+    /// Time of the last sample of this source that the loop considered.
+    /// Only later samples may feed it again.
+    fed_until: Option<Mono>,
 }
 
 impl Source {
@@ -255,6 +259,7 @@ impl Source {
             rate_floor: Duration::ZERO,
             last_query: None,
             prev_query: None,
+            fed_until: None,
         }
     }
 
@@ -327,8 +332,6 @@ pub struct Engine {
     /// When the loop last set the frequency. Starts the `MAX_HOLD` window.
     held_since: Option<Mono>,
     holdover: bool,
-    /// Newest sample time that fed the loop. One sample feeds it once.
-    last_used: Option<Mono>,
     /// Set while the loop refuses steps, so the refusal logs once.
     refusing: Option<Mono>,
     last_offset: Option<Offset>,
@@ -370,7 +373,6 @@ impl Engine {
             freq_changed_at: None,
             held_since: None,
             holdover: false,
-            last_used: None,
             refusing: None,
             last_offset: None,
             last_good: None,
@@ -604,17 +606,24 @@ impl Engine {
         self.recheck = [true; 3];
         self.poll = self.cfg.min_poll;
         self.prev_offset = None;
+        // A refusal after the resume is a new episode and is logged.
+        self.refusing = None;
     }
 
     fn on_clock_result(&mut self, result: Result<(), ClockError>, out: &mut Vec<Action>) {
-        let after_step = self.step == StepState::Awaiting;
-        self.step = StepState::Idle;
+        // Only the result right after a step is its outcome. A later result
+        // in the same batch must not clear a failed step. Only a re-enable
+        // clears it.
+        if self.step == StepState::Awaiting {
+            self.step = if result.is_ok() {
+                StepState::Idle
+            } else {
+                StepState::Failed
+            };
+        }
         let Err(error) = result else {
             return;
         };
-        if after_step {
-            self.step = StepState::Failed;
-        }
         out.push(Action::Log(LogEvent::ClockCommandFailed { error }));
         let gate = Gate {
             failed: true,
@@ -642,6 +651,7 @@ impl Engine {
                     self.discipline.note_resume();
                     self.step = StepState::Idle;
                 }
+                self.refusing = None;
                 out.push(Action::Log(LogEvent::AdjustmentEnabled));
             }
             _ => {}
@@ -687,36 +697,66 @@ impl Engine {
         if tier == Tier::Pool {
             return CrossCheck::NotRequired;
         }
-        let mut max_age = self.cfg.selection.max_age.min(self.cfg.tier.reprobe_every);
-        if let Some(changed) = self.freq_changed_at {
-            // `best_fresh` keeps ages up to `max_age`. One nanosecond less
-            // keeps only samples strictly after the change.
-            match self
-                .now
-                .saturating_duration_since(changed)
-                .checked_sub(Duration::from_nanos(1))
-            {
-                Some(since) => max_age = max_age.min(since),
-                None => return CrossCheck::Pending,
-            }
-        }
+        let cap = self.cfg.selection.max_age.min(self.cfg.tier.reprobe_every);
         // Pool servers that cannot agree give no answer, so the step waits.
-        self.select_in(Tier::Pool, max_age)
-            .map_or(CrossCheck::Pending, |p| CrossCheck::Offset(p.sel.offset))
+        self.window(self.freq_changed_at, cap)
+            .and_then(|age| self.select_in(Tier::Pool, age))
+            .map_or(CrossCheck::Pending, |s| CrossCheck::Offset(s.offset))
     }
 
-    fn update(&mut self, tier: Tier, p: &Picked, out: &mut Vec<Action>) {
-        let sel = &p.sel;
+    /// The sample age limit that keeps only samples taken strictly after
+    /// `since`, capped at `cap`. `None` when no such sample can exist yet.
+    fn window(&self, since: Option<Mono>, cap: Duration) -> Option<Duration> {
+        let Some(t) = since else {
+            return Some(cap);
+        };
+        // `best_fresh` keeps ages up to the limit. One nanosecond less keeps
+        // a sample taken at `t` out.
+        self.now
+            .saturating_duration_since(t)
+            .checked_sub(Duration::from_nanos(1))
+            .map(|age| age.min(cap))
+    }
+
+    /// Selection that may feed the loop. Per source, the best sample taken
+    /// after the last one the loop considered and after the last frequency
+    /// change. An older one was already used or measured a clock that has
+    /// moved since, so it can neither feed the loop again nor decide a step.
+    /// Also returns each considered sample, to mark as used.
+    fn select_new(&self, tier: Tier) -> Option<(Selection, Vec<(SourceId, Mono)>)> {
+        let max_age = self.cfg.selection.max_age;
+        let samples: Vec<Sample> = self
+            .sources
+            .values()
+            .filter(|s| s.spec.tier == tier)
+            .filter_map(|s| {
+                let age = self.window(s.fed_until.max(self.freq_changed_at), max_age)?;
+                s.filter.best_fresh(self.now, age)
+            })
+            .collect();
+        let sel = select(&samples, self.now, &self.cfg.selection)?;
+        Some((sel, samples.iter().map(|s| (s.source, s.at)).collect()))
+    }
+
+    /// Feeds the loop from new samples of the active tier, if any.
+    fn feed_loop(&mut self, tier: Tier, out: &mut Vec<Action>) {
+        let Some((sel, used)) = self.select_new(tier) else {
+            return;
+        };
+        for (id, at) in used {
+            if let Some(src) = self.sources.get_mut(&id) {
+                src.fed_until = Some(at);
+            }
+        }
+        self.update(tier, &sel, out);
+    }
+
+    fn update(&mut self, tier: Tier, sel: &Selection, out: &mut Vec<Action>) {
         // `Discipline` returns `Correction::None` for this. Nothing about it
         // is a measurement.
         if !sel.offset.as_secs().is_finite() {
             return;
         }
-        // The same stored sample must not feed the loop twice.
-        if self.last_used.is_some_and(|u| p.newest <= u) {
-            return;
-        }
-        self.last_used = Some(p.newest);
         self.adapt_poll(sel);
         self.last_offset = Some(sel.offset);
         self.last_good = Some(self.now);
@@ -725,13 +765,7 @@ impl Engine {
         if !self.gate.open() {
             return;
         }
-        let measured_since_change = self.freq_changed_at.is_none_or(|c| p.oldest > c);
-        let pool = self.cross_check(tier);
-        let cross = if measured_since_change {
-            pool
-        } else {
-            CrossCheck::Pending
-        };
+        let cross = self.cross_check(tier);
         match self.discipline.update(sel, cross, self.now) {
             Correction::None => {}
             Correction::SetFrequency(f) => {
@@ -756,7 +790,11 @@ impl Engine {
                 }
                 self.refusing = Some(self.now);
                 self.set_frequency(frequency);
-                if pool == CrossCheck::Pending {
+                // A panic refusal stands whatever the pool says.
+                let dcfg = &self.cfg.discipline;
+                let panic = offset.as_secs().abs() > dcfg.panic_threshold.as_secs_f64()
+                    && !dcfg.allow_panic_step;
+                if cross == CrossCheck::Pending && !panic {
                     self.ask_pool_now();
                 }
             }
@@ -891,7 +929,7 @@ impl Engine {
 
 mod rounds;
 
-use rounds::{Picked, Round};
+use rounds::Round;
 
 #[cfg(test)]
 mod tests;

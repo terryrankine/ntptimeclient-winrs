@@ -558,12 +558,32 @@ fn reenable_after_failed_step_allows_another_step() {
     h.feed(Event::AdjustmentAllowed(true));
     h.run(1000);
     assert_eq!(h.steps().len(), 2);
+    // A batch of Step then SetFrequency: the step fails, the frequency
+    // result is Ok. The failure must stay latched.
+    let before = h.steps().len();
+    h.feed(Event::Resumed(h.now));
+    h.run(1300);
+    assert_eq!(h.steps().len(), before + 1);
+    h.feed(Event::ClockResult(Err(ClockError::PermissionDenied)));
+    h.feed(Event::ClockResult(Ok(())));
+    assert!(!h.status().adjustment_allowed);
+    h.feed(Event::AdjustmentAllowed(true));
+    h.run(1600);
+    assert_eq!(h.steps().len(), before + 1, "a level true does not re-open");
+    h.feed(Event::AdjustmentAllowed(false));
+    h.feed(Event::AdjustmentAllowed(true));
+    h.run(2000);
+    assert_eq!(
+        h.steps().len(),
+        before + 2,
+        "re-enable allows the step again"
+    );
     // A step that succeeded is not repeated after a later re-enable.
     h.feed(Event::ClockResult(Ok(())));
     h.feed(Event::AdjustmentAllowed(false));
     h.feed(Event::AdjustmentAllowed(true));
-    h.run(3000);
-    assert_eq!(h.steps().len(), 2);
+    h.run(4000);
+    assert_eq!(h.steps().len(), before + 2);
 }
 
 /// Syncs a pool source, then lets every query time out.
@@ -639,16 +659,24 @@ fn drift_save_allowed_at_exactly_ten_minutes() {
 }
 
 #[test]
-fn stale_lowest_delay_sample_feeds_the_loop_once() {
-    // The first reply has the lowest delay and stays best in the window.
-    let mut h = Harness::new(EngineConfig::default(), steady(0.05));
-    h.delay = Box::new(|_, t| if t == 0 { 0.001 } else { 0.050 });
+fn stale_lowest_delay_sample_is_not_reused() {
+    // The 64 s reply has the lowest delay and stays best in the filter.
+    // Every later round must feed its own new reading instead.
+    let reply: Reply = Box::new(|_, t| Ok(if t == 64 { 0.05 } else { 0.01 }));
+    let mut h = Harness::new(EngineConfig::default(), reply);
+    h.delay = Box::new(|_, t| {
+        if t == 64 {
+            0.001
+        } else {
+            0.040 + 0.002 * f64::from(u8::try_from(t / 64 % 5).unwrap_or(0))
+        }
+    });
     h.feed(Event::AdjustmentAllowed(true));
     h.feed(Event::SourcesChanged(vec![spec(1, Tier::Pool)]));
     h.run(500);
-    // Round 64 uses the 0 s sample. Rounds 128 to 448 bring nothing better.
     let fed: Vec<u64> = h.times(is_freq).into_iter().filter(|&t| t > 0).collect();
-    assert_eq!(fed, vec![64]);
+    assert_eq!(fed[..3], [64, 128, 192], "fed {fed:?}");
+    assert!(h.status().last_offset.is_some_and(|o| near(o, 0.01)));
 }
 
 #[test]
@@ -833,10 +861,11 @@ fn slewed_config_offset_does_not_slip_under_stale_pool_veto() {
 }
 
 #[test]
-fn old_survivor_sample_cannot_decide_a_step() {
-    // Config source 1 answers once. Its sample stays a survivor until it
-    // ages out at 1024 s. It predates the refusal at 64 s, so no step may
-    // rest on it, even when the pool agrees from 900 s.
+fn old_sample_is_left_out_of_step_decision() {
+    // Config source 1 answers once. Its sample stays in the filter until it
+    // ages out at 1024 s. It predates the refusal at 64 s, so it is left out
+    // of every later selection. The step rests on source 3 alone, soon after
+    // the pool agrees from 800 s.
     let n = Rc::new(Cell::new(0_u32));
     let k = Rc::clone(&n);
     let reply: Reply = Box::new(move |s, t| {
@@ -865,7 +894,118 @@ fn old_survivor_sample_cannot_decide_a_step() {
     h.run(3600);
     let steps = h.steps();
     assert_eq!(steps.len(), 1, "steps {steps:?}");
-    assert!(steps[0] > 1024, "step at {}", steps[0]);
+    assert!(
+        (800..=800 + 3 * 64).contains(&steps[0]),
+        "step at {}",
+        steps[0]
+    );
+}
+
+#[test]
+fn two_config_sources_with_varying_delays_step_after_pool_agrees() {
+    // Reviewer probe. The pool misses its first query, then agrees. Config
+    // delays vary per round and per source, so no newest sample is also
+    // the lowest-delay one for long.
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(2) {
+            if t == 0 {
+                Err(QueryFailure::Timeout)
+            } else {
+                Ok(5.05)
+            }
+        } else {
+            Ok(5.0)
+        }
+    });
+    let mut h = Harness::new(EngineConfig::default(), reply);
+    h.rtt = Duration::from_millis(300);
+    h.delay = Box::new(|s, t| {
+        let k = (t / 64 * 7 + u64::from(s.get()) * 3) % 5;
+        0.010 + 0.002 * f64::from(u8::try_from(k).unwrap_or(0))
+    });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![
+        spec(1, Tier::Config),
+        spec(2, Tier::Pool),
+        spec(3, Tier::Config),
+    ]));
+    h.run(3600);
+    let steps = h.steps();
+    assert_eq!(steps.len(), 1, "steps {steps:?}");
+    // Refused at 64 s, pool asked then, step one poll later.
+    assert!(steps[0] <= 64 + 64 + 1, "step at {}", steps[0]);
+}
+
+#[test]
+fn drift_does_not_wind_up_on_an_old_low_delay_sample_of_one_source() {
+    // Two pool sources agree on zero. Source 1's 64 s reply reads 4 ms with
+    // a 1 ms delay and would outweigh everything for eight rounds. Every
+    // later reading is zero, so the drift must not move at all.
+    let reply: Reply = Box::new(|s, t| Ok(if s == id(1) && t == 64 { 0.004 } else { 0.0 }));
+    let mut h = Harness::new(EngineConfig::default(), reply);
+    h.delay = Box::new(|s, t| {
+        if s == id(1) && t == 64 {
+            0.001
+        } else {
+            let k = (t / 64 + u64::from(s.get())) % 5;
+            0.020 + 0.002 * f64::from(u8::try_from(k).unwrap_or(0))
+        }
+    });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![
+        spec(1, Tier::Pool),
+        spec(2, Tier::Pool),
+    ]));
+    h.run(20_000);
+    assert!(h.queries(1).len() >= 20, "rounds {}", h.queries(1).len());
+    assert!(
+        h.status().drift.value().abs() < 1e-12,
+        "drift {:?}",
+        h.status().drift
+    );
+}
+
+#[test]
+fn panic_refusal_does_not_ask_the_pool() {
+    // 2000 s is above the 1000 s panic threshold. The pool cannot help, so
+    // it stays on its reprobe_every schedule.
+    let h = config_and_pool(steady(2000.0), timeout(), 3600);
+    assert_eq!(h.steps(), Vec::<u64>::new());
+    let q = h.queries(2);
+    assert!(gaps(&q).iter().all(|&g| g >= 900), "pool queries {q:?}");
+}
+
+#[test]
+fn refusal_is_logged_again_after_resume_and_reenable() {
+    let refusals = |h: &Harness| h.logs().iter().filter(|(_, l)| refused(l, 5.0)).count();
+    let mut h = config_and_pool(steady(5.0), timeout(), 600);
+    assert_eq!(refusals(&h), 1);
+    h.feed(Event::Resumed(h.now));
+    h.run(1200);
+    assert_eq!(refusals(&h), 2, "new episode after resume");
+    h.feed(Event::AdjustmentAllowed(false));
+    h.feed(Event::AdjustmentAllowed(true));
+    h.run(1800);
+    assert_eq!(refusals(&h), 3, "new episode after re-enable");
+}
+
+#[test]
+fn sample_from_before_a_frequency_change_does_not_feed_the_loop() {
+    // Replies take 40 s, so each lands after its round timed out and is
+    // first seen by the next round. The reply to the 128 s query lands at
+    // 168 s, as the re-enable sets a new frequency. It does not postdate
+    // that change, so round 192 (closed at 222 s) must not use it. Round
+    // 256 feeds again from the 232 s reply.
+    let mut h = Harness::start(vec![spec(1, Tier::Pool)], steady(0.01));
+    h.rtt = Duration::from_secs(40);
+    h.run(169);
+    assert!(h.times(is_freq).contains(&158), "{:?}", h.times(is_freq));
+    h.feed(Event::AdjustmentAllowed(false));
+    h.feed(Event::AdjustmentAllowed(true));
+    h.run(300);
+    assert!(h.queries(1).contains(&192), "{:?}", h.queries(1));
+    let fed: Vec<u64> = h.times(is_freq).into_iter().filter(|&t| t > 168).collect();
+    assert_eq!(fed, vec![286]);
 }
 
 #[test]
