@@ -40,7 +40,7 @@ Probe dependency: `ntp-proto = { version = "=1.9.0", default-features = false, f
 - Not verified: building on a machine with no MSVC at all. This machine has VS 2019 Build Tools, so the `aws-lc` build succeeded here and says nothing about a bare machine. Rust itself needs MSVC `link.exe` for the msvc target, so "no C toolchain" can only mean no C compiler, CMake or NASM.
 - Not verified: runtime behaviour of `rustls` without the `aws-lc` provider. NTS is not used in the parser-only path, so it is not exercised.
 
-Answer: yes. `rustcrypto` with `default-features = false` builds with pure Rust crates only. Use it.
+Answer: yes. `rustcrypto` with `default-features = false` builds with pure Rust crates only for `x86_64-pc-windows-msvc`. Other targets were not checked. Use it.
 
 ## Question 2: build a request and parse a reply
 
@@ -126,7 +126,7 @@ Direct dependencies of `ntp-proto`: `tokio` (`io-util`), `rustls`, `tokio-rustls
 
 ## Baseline: w32tm against pool.ntp.org
 
-Command: `w32tm /stripchart /computer:pool.ntp.org /samples:120 /dataonly`, run unelevated, 2 second interval, server `144.6.227.199`. No w32time or system setting changed. Offset is as w32tm reports it, in seconds, against the local clock.
+Command: `w32tm /stripchart /computer:pool.ntp.org /samples:120 /dataonly`, run unelevated, 2 second interval, `pool.ntp.org` resolved to different servers: idle run `144.6.227.199`, load run `203.14.0.251` (line 1 of each file). No w32time or system setting changed. Offset is as w32tm reports it, in seconds, against the local clock.
 
 | Run | Samples ok | Min | Max | Median | Mean abs |
 |---|---|---|---|---|---|
@@ -134,6 +134,6 @@ Command: `w32tm /stripchart /computer:pool.ntp.org /samples:120 /dataonly`, run 
 | CPU load (24 busy PowerShell jobs, 24 logical cores) | 92 of 120 | -2.4 ms | +20.9 ms | +9.0 ms | 9.0 ms |
 
 - Under load 28 samples returned `error: 0x80072733`. Cause not confirmed. It looks like receive failures or timeouts.
-- One pool path, so network noise is in these numbers. They show the floor we must beat on this host, not a w32time accuracy limit.
+- The two runs hit different pool members, so network path and server differences are mixed into the idle versus load comparison. The gap between them is not purely CPU load. They show the floor we must beat on this host, not a w32time accuracy limit.
 - Burn jobs were stopped afterwards (`Get-Job` count 0).
 - Raw output is committed: [idle](../../../spikes/probe/baseline/w32tm-idle.txt), [under load](../../../spikes/probe/baseline/w32tm-load.txt). The stats script is `spikes/probe/baseline/stats.ps1`.
