@@ -3,9 +3,18 @@
 //! R83: interactive means stdin AND stderr are both consoles. The question
 //! goes to stderr with a newline, so a wrapper that pipes stdout still shows
 //! it, and a wrapper that pipes stderr makes the run non-interactive instead
-//! of blocking on a question nobody sees. The answer read is bounded (M11).
+//! of blocking on a question nobody sees. The answer read is bounded in
+//! bytes (M11) and in time (R93): after [`ANSWER_TIMEOUT`] it counts as no.
+//! Warnings go to stderr too, so redirecting stdout cannot hide them (N6).
+//!
+//! A deployment tool, a scheduled task or a hidden console must pass
+//! `--silent` or `--confirm-domain-joined`. Then no question is asked.
 
-use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::io;
+use std::io::{Read, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[cfg(windows)]
 use super::Host;
@@ -43,11 +52,48 @@ pub fn read_answer(input: &mut impl Read) -> bool {
     matches!(text.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// How long the question waits for an answer (R93).
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The outcome of one bounded question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// `y` or `yes`.
+    Yes,
+    /// Anything else, end of input or a read error.
+    No,
+    /// Nothing arrived within the timeout.
+    TimedOut,
+}
+
+/// Reads one answer on a helper thread and waits at most `timeout`. A
+/// console read cannot be cancelled, so on timeout the helper is never
+/// joined: it stays blocked and the process exits soon after.
+pub fn read_answer_within<R: Read + Send + 'static>(input: R, timeout: Duration) -> Answer {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("answer".to_owned())
+        .spawn(move || {
+            let mut input = input;
+            // The receiver may be gone after a timeout. Nothing to do then.
+            let _ = tx.send(read_answer(&mut input));
+        });
+    if spawned.is_err() {
+        // No thread, no way to bound the wait. Asking nothing is the safe no.
+        return Answer::No;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(true) => Answer::Yes,
+        Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => Answer::No,
+        Err(mpsc::RecvTimeoutError::Timeout) => Answer::TimedOut,
+    }
+}
+
 /// The console with its three streams and what kind each one is.
 #[derive(Debug)]
 pub struct Console<R, O, E> {
-    /// Where answers come from.
-    pub input: R,
+    /// Where answers come from. Taken by the first question.
+    pub input: Option<R>,
     /// Plain lines.
     pub out: O,
     /// The question.
@@ -56,9 +102,11 @@ pub struct Console<R, O, E> {
     pub stdin_console: bool,
     /// stderr is a console.
     pub stderr_console: bool,
+    /// How long a question waits. [`ANSWER_TIMEOUT`] in use, short in tests.
+    pub answer_timeout: Duration,
 }
 
-impl<R: Read, O: Write, E: Write> Console<R, O, E> {
+impl<R: Read + Send + 'static, O: Write, E: Write> Console<R, O, E> {
     /// R83: both stdin and stderr must be consoles.
     #[must_use]
     pub const fn is_interactive(&self) -> bool {
@@ -66,7 +114,7 @@ impl<R: Read, O: Write, E: Write> Console<R, O, E> {
     }
 
     /// Writes the question to stderr with a newline, then reads a bounded
-    /// answer. Default no.
+    /// answer within `answer_timeout`. Default no.
     pub fn ask_yes_no(&mut self, question: &str) -> bool {
         if writeln!(self.err, "{question} [y/N]")
             .and_then(|()| self.err.flush())
@@ -75,7 +123,26 @@ impl<R: Read, O: Write, E: Write> Console<R, O, E> {
             // Nobody can see the question, so nobody can say yes.
             return false;
         }
-        read_answer(&mut self.input)
+        let Some(input) = self.input.take() else {
+            return false;
+        };
+        match read_answer_within(input, self.answer_timeout) {
+            Answer::Yes => true,
+            Answer::No => false,
+            Answer::TimedOut => {
+                let _ = writeln!(
+                    self.err,
+                    "No answer within {} s. Counted as no.",
+                    self.answer_timeout.as_secs()
+                );
+                false
+            }
+        }
+    }
+
+    /// One warning line to stderr, next to the question.
+    pub fn warn(&mut self, line: &str) {
+        let _ = writeln!(self.err, "{line}");
     }
 
     /// One plain line to stdout. A write error is ignored: there is nowhere
@@ -103,9 +170,10 @@ impl ConsoleHost {
         Self(Console {
             stdin_console: io::stdin().is_terminal(),
             stderr_console: io::stderr().is_terminal(),
-            input: io::stdin(),
+            input: Some(io::stdin()),
             out: io::stdout(),
             err: io::stderr(),
+            answer_timeout: ANSWER_TIMEOUT,
         })
     }
 }
@@ -134,12 +202,15 @@ impl Host for ConsoleHost {
     fn say(&mut self, line: &str) {
         self.0.say(line);
     }
+    fn warn(&mut self, line: &str) {
+        self.0.warn(line);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
 
     fn console(
         input: &[u8],
@@ -147,11 +218,12 @@ mod tests {
         stderr: bool,
     ) -> Console<Cursor<Vec<u8>>, Vec<u8>, Vec<u8>> {
         Console {
-            input: Cursor::new(input.to_vec()),
+            input: Some(Cursor::new(input.to_vec())),
             out: Vec::new(),
             err: Vec::new(),
             stdin_console: stdin,
             stderr_console: stderr,
+            answer_timeout: Duration::from_secs(5),
         }
     }
 
@@ -241,12 +313,76 @@ mod tests {
     #[test]
     fn an_unwritable_stderr_is_a_no_even_with_yes_waiting() {
         let mut c = Console {
-            input: Cursor::new(b"y\n".to_vec()),
+            input: Some(Cursor::new(b"y\n".to_vec())),
             out: Vec::new(),
             err: Broken,
             stdin_console: true,
             stderr_console: true,
+            answer_timeout: Duration::from_secs(5),
         };
         assert!(!c.ask_yes_no("Take over?"));
+    }
+
+    /// Blocks until its sender is dropped, like a console nobody types into.
+    struct Silent(mpsc::Receiver<()>);
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn no_answer_within_the_timeout_is_a_no_and_says_so() {
+        let (keep, rx) = mpsc::channel::<()>();
+        let mut c = Console {
+            input: Some(Silent(rx)),
+            out: Vec::new(),
+            err: Vec::new(),
+            stdin_console: true,
+            stderr_console: true,
+            answer_timeout: Duration::from_millis(50),
+        };
+        let t0 = std::time::Instant::now();
+        assert!(!c.ask_yes_no("Take over?"));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        let err = String::from_utf8(c.err).unwrap();
+        assert!(err.contains("Counted as no"), "{err}");
+        // The helper thread stays blocked until this sender goes.
+        drop(keep);
+    }
+
+    #[test]
+    fn read_answer_within_returns_the_answer_before_the_timeout() {
+        let d = Duration::from_secs(5);
+        assert_eq!(
+            read_answer_within(Cursor::new(b"yes\n".to_vec()), d),
+            Answer::Yes
+        );
+        assert_eq!(
+            read_answer_within(Cursor::new(b"n\n".to_vec()), d),
+            Answer::No
+        );
+        assert_eq!(read_answer_within(io::empty(), d), Answer::No);
+    }
+
+    #[test]
+    fn the_default_timeout_is_120_seconds() {
+        assert_eq!(ANSWER_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_second_question_has_no_input_and_is_a_no() {
+        let mut c = console(b"y\n", true, true);
+        assert!(c.ask_yes_no("first"));
+        assert!(!c.ask_yes_no("second"));
+    }
+
+    #[test]
+    fn warnings_go_to_stderr_with_the_question() {
+        let mut c = console(b"", true, true);
+        c.warn("domain joined");
+        assert_eq!(c.err, b"domain joined\n");
+        assert_eq!(c.out, Vec::<u8>::new());
     }
 }

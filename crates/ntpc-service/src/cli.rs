@@ -28,11 +28,16 @@
 //!    removed again (M8).
 //! 7. Register our service (Task 14 hook). On failure `w32time` is put back.
 //!
-//! Uninstall: stop our service (hook), secure the state directory and read
-//! the record with the provenance checks (R86), restore `w32time` from it,
-//! remove the registration (hook). A directory or record that cannot be
-//! trusted leaves `w32time` alone (exit 17) with a manual restore hint that
-//! guesses no start type. It restores even if our service is
+//! Uninstall (`cli/uninstall.rs`): stop our service (hook), secure the state
+//! directory and read the record with the provenance checks (R86), restore
+//! `w32time` from it, and only then remove the registration (hook, R94). A
+//! directory or record that cannot be trusted leaves `w32time` alone (exit
+//! 17) with a manual restore hint that guesses no start type. No usable
+//! record while `w32time` is disabled is exit 18 (R92).
+//!
+//! The domain question waits at most [`ANSWER_TIMEOUT`] (120 s), then counts
+//! as no (R93). A deployment tool, a scheduled task or a hidden console must
+//! pass `--silent` or `--confirm-domain-joined`, so no question is asked. It restores even if our service is
 //! missing. Without a record `w32time` is left as it is: guessing a start
 //! type could undo an administrator's choice. The state directory stays.
 //!
@@ -52,11 +57,15 @@ use thiserror::Error;
 
 mod console;
 mod record_file;
+mod uninstall;
 
 #[cfg(windows)]
 pub use console::ConsoleHost;
-pub use console::{Console, MAX_ANSWER_BYTES, read_answer};
+pub use console::{
+    ANSWER_TIMEOUT, Answer, Console, MAX_ANSWER_BYTES, read_answer, read_answer_within,
+};
 pub use record_file::{FileRecordStore, RECORD_FILE_NAME, RECORD_TEMP_NAME};
+pub use uninstall::uninstall;
 
 /// Process exit codes. Stable: the packaging scripts read them.
 pub mod exit {
@@ -80,11 +89,11 @@ pub mod exit {
     /// The `w32time` takeover failed. The message says what changed. The
     /// record stays so uninstall can restore.
     pub const TAKEOVER: u8 = 8;
-    /// Our service registration is not built yet: install refused before
-    /// any change. Or registering failed after the takeover: `w32time` was
-    /// put back (the message says whether that worked).
+    /// Our service registration is not built yet (not ready). Install
+    /// refused before any change.
     pub const REGISTER: u8 = 9;
-    /// Uninstall could not restore `w32time`. The record stays.
+    /// Uninstall could not restore `w32time`. The record and our service
+    /// registration stay (R94).
     pub const RESTORE: u8 = 10;
     /// Uninstall could not stop or remove our service registration.
     pub const UNREGISTER: u8 = 11;
@@ -109,9 +118,15 @@ pub mod exit {
     /// Install or uninstall: the state directory or the restore record could
     /// not be trusted (R86). `w32time` was left alone.
     pub const RECORD_NOT_TRUSTED: u8 = 17;
+    /// Uninstall: no usable restore record and `w32time` is still disabled
+    /// (R92). `w32time` was left alone and our registration is kept.
+    pub const NO_RECORD_DISABLED: u8 = 18;
+    /// Install: registering our service failed after the takeover. The
+    /// message says whether `w32time` was put back (R95).
+    pub const REGISTER_FAILED: u8 = 19;
 
     /// Every code, for tests.
-    pub const ALL: [u8; 17] = [
+    pub const ALL: [u8; 19] = [
         OK,
         USAGE,
         NOT_ELEVATED,
@@ -129,6 +144,8 @@ pub mod exit {
         CARRY_FAILED,
         BAD_STATE_PATH,
         RECORD_NOT_TRUSTED,
+        NO_RECORD_DISABLED,
+        REGISTER_FAILED,
     ];
 }
 
@@ -198,10 +215,14 @@ pub trait Host {
     /// Whether a question can be asked and seen: stdin and stderr are both
     /// consoles (R83).
     fn is_interactive(&self) -> bool;
-    /// Asks a yes or no question on stderr. Anything but yes is no.
+    /// Asks a yes or no question on stderr. Anything but yes is no. No
+    /// answer within [`ANSWER_TIMEOUT`] is a no (R93).
     fn ask_yes_no(&mut self, question: &str) -> bool;
     /// Prints one line for the user.
     fn say(&mut self, line: &str);
+    /// Prints a warning on stderr, the stream the question uses, so
+    /// redirecting stdout cannot hide it (N6).
+    fn warn(&mut self, line: &str);
 }
 
 /// Why a record could not be loaded. Holds no file text and no path.
@@ -323,8 +344,21 @@ pub const MANUAL_RESTORE: &str = "To put w32time back by hand: open Services (se
      open Windows Time, set the startup type it had before this tool was installed, and start \
      it if it was running before.";
 
+/// Whether the state directory is there, checked without creating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirState {
+    /// Something is at the path. `secure` decides whether it is usable.
+    Present,
+    /// Nothing at the path, and its parent exists.
+    Missing,
+    /// The parent folder does not exist either.
+    ParentMissing,
+}
+
 /// Where the restore record lives.
 pub trait RecordStore {
+    /// Looks at the state directory without changing anything.
+    fn dir_state(&self) -> DirState;
     /// Secures the state directory before the record is read or written.
     /// A dropped record is a refusal.
     ///
@@ -417,7 +451,7 @@ pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
 }
 
 /// `None` when elevated. Else says why and gives the exit code.
-fn require_elevated(host: &mut dyn Host, verb: &str) -> Option<u8> {
+pub(crate) fn require_elevated(host: &mut dyn Host, verb: &str) -> Option<u8> {
     match host.is_elevated() {
         Ok(true) => None,
         Ok(false) => {
@@ -448,12 +482,12 @@ fn domain_rule(opts: InstallOptions, host: &mut dyn Host) -> Option<u8> {
         UNKNOWN_WARNING
     };
     if opts.confirm_domain_joined {
-        host.say(&format!(
+        host.warn(&format!(
             "{warning} Proceeding: --confirm-domain-joined was given."
         ));
         None
     } else if !opts.silent && host.is_interactive() {
-        host.say(warning);
+        host.warn(warning);
         if host.ask_yes_no("Take over from w32time on this machine?") {
             None
         } else {
@@ -461,7 +495,7 @@ fn domain_rule(opts: InstallOptions, host: &mut dyn Host) -> Option<u8> {
             Some(exit::DECLINED)
         }
     } else {
-        host.say(&format!(
+        host.warn(&format!(
             "{warning} No question can be asked here (silent, or stdin or stderr is not a \
              console). Install stops. Nothing changed. To install anyway pass \
              --confirm-domain-joined to the exe, or -ConfirmDomainJoined to the install script."
@@ -472,6 +506,14 @@ fn domain_rule(opts: InstallOptions, host: &mut dyn Host) -> Option<u8> {
 
 /// Install steps 4 to 7, after the checks that change nothing.
 fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
+    if d.store.dir_state() == DirState::ParentMissing {
+        d.host.say(
+            "Install refused: state directory unavailable, its parent folder does not exist. \
+             Create the parent folder or fix state_dir in the config file. w32time was not \
+             changed.",
+        );
+        return exit::STATE_DIR;
+    }
     if let Err(e) = d.store.secure() {
         d.host.say(&format!(
             "Install refused: {e}. {} w32time was not changed.",
@@ -539,16 +581,16 @@ fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
         ));
         match restore(&mut *d.scm, &record) {
             Ok(_) => match d.store.remove() {
-                Ok(()) => d.host.say("w32time is back as it was."),
+                Ok(()) => d.host.say("w32time was put back as it was."),
                 Err(e) => d.host.say(&format!(
-                    "w32time is back as it was. The restore record could not be removed ({e})."
+                    "w32time was put back as it was. The restore record could not be removed ({e})."
                 )),
             },
             Err(e) => d.host.say(&format!(
-                "Putting w32time back failed: {e}. The restore record is kept. Run uninstall."
+                "w32time was NOT put back: {e}. The restore record is kept. Run uninstall."
             )),
         }
-        return exit::REGISTER;
+        return exit::REGISTER_FAILED;
     }
     d.host.say("Installed.");
     exit::OK
@@ -575,7 +617,8 @@ fn disabled_original_rule(opts: InstallOptions, d: &mut Deps<'_>) -> Option<u8> 
         "w32time is already disabled and there is no restore record. An earlier record may \
          have been lost, and recording disabled now would make uninstall leave w32time \
          disabled. w32time was not changed. Set its start type by hand and run install again, \
-         or pass --accept-disabled-original if disabled really is the original.",
+         or pass --accept-disabled-original to the exe if disabled really is the original. \
+         The install script needs its -AcceptDisabledOriginal switch for that.",
     );
     Some(exit::DISABLED_ORIGINAL)
 }
@@ -603,116 +646,6 @@ fn report_failed_takeover(e: &TakeoverError, record_is_new: bool, d: &mut Deps<'
         Err(re) => d.host.say(&format!(
             "Nothing on w32time changed. The new restore record could not be removed ({re})."
         )),
-    }
-}
-
-/// Runs the uninstall steps. Returns an [`exit`] code. Later steps run even
-/// when an earlier one failed. The code is the most important failure:
-/// `w32time` problems first.
-pub fn uninstall(d: &mut Deps<'_>) -> u8 {
-    if let Some(code) = require_elevated(d.host, "Uninstall") {
-        return code;
-    }
-    let mut codes = Vec::new();
-
-    match d.reg.stop_service() {
-        Ok(OwnService::Present) => d.host.say("Service stopped."),
-        Ok(OwnService::Absent) => d.host.say("Service is not installed. Continuing."),
-        Err(e) => {
-            // Keep going. With w32time back, a still running service sees it
-            // in its 30 s check and stops adjusting the clock.
-            d.host.say(&format!("Stopping the service failed: {e}."));
-            codes.push(exit::UNREGISTER);
-        }
-    }
-
-    match d.store.secure() {
-        Ok(()) => restore_from_record(d, &mut codes),
-        Err(e) => {
-            d.host.say(&format!(
-                "{e}. The restore record cannot be trusted. w32time is left as it is. {} {MANUAL_RESTORE}",
-                e.advice()
-            ));
-            codes.push(exit::RECORD_NOT_TRUSTED);
-        }
-    }
-
-    match d.reg.unregister() {
-        Ok(OwnService::Present) => d.host.say("Service registration removed."),
-        Ok(OwnService::Absent) => {}
-        Err(e) => {
-            d.host
-                .say(&format!("Removing the service registration failed: {e}."));
-            codes.push(exit::UNREGISTER);
-        }
-    }
-
-    // Most important first: w32time, then our files, then our service.
-    [
-        exit::RESTORE,
-        exit::RECORD_NOT_TRUSTED,
-        exit::RECORD_INVALID,
-        exit::STATE_DIR,
-        exit::UNREGISTER,
-    ]
-    .into_iter()
-    .find(|c| codes.contains(c))
-    .unwrap_or_else(|| {
-        d.host.say("Uninstalled. The state directory is kept.");
-        exit::OK
-    })
-}
-
-/// Uninstall step: read the record from the secured directory and restore
-/// `w32time` from it. Pushes failure codes.
-fn restore_from_record(d: &mut Deps<'_>, codes: &mut Vec<u8>) {
-    match d.store.load() {
-        Ok(Some(record)) => match restore(&mut *d.scm, &record) {
-            Ok(out) => {
-                d.host.say(&format!(
-                    "w32time start type set back to {}.",
-                    record.start_type().as_str()
-                ));
-                if out.started {
-                    d.host.say("w32time started.");
-                } else if out.start_skipped_disabled {
-                    d.host
-                        .say("w32time was running but its original start type is disabled. Left stopped.");
-                }
-                if let Err(e) = d.store.remove() {
-                    d.host
-                        .say(&format!("The restore record could not be removed ({e})."));
-                    codes.push(exit::STATE_DIR);
-                }
-            }
-            Err(e) => {
-                d.host.say(&format!(
-                    "Restoring w32time failed: {e}. The restore record is kept. Run uninstall again."
-                ));
-                codes.push(exit::RESTORE);
-            }
-        },
-        Ok(None) => d.host.say(
-            "Found no restore record. w32time is left as it is. If it is disabled, set its \
-             start type in the Services console.",
-        ),
-        Err(LoadError::Invalid(e)) => {
-            d.host.say(&format!(
-                "The w32time restore record is not valid ({e}). w32time is left as it is. \
-                 Check its start type by hand, then delete the record file."
-            ));
-            codes.push(exit::RECORD_INVALID);
-        }
-        Err(e @ LoadError::NotTrusted(_)) => {
-            d.host.say(&format!(
-                "{e}. w32time is left as it is. {MANUAL_RESTORE} Then delete the record file."
-            ));
-            codes.push(exit::RECORD_NOT_TRUSTED);
-        }
-        Err(e) => {
-            d.host.say(&format!("{e}. w32time is left as it is."));
-            codes.push(exit::RESTORE);
-        }
     }
 }
 
