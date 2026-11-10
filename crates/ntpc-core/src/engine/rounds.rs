@@ -20,14 +20,6 @@ pub(super) struct Round {
     pub(super) stale: bool,
 }
 
-/// A selection with the time span of the samples behind it.
-#[derive(Debug, Clone)]
-pub(super) struct Picked {
-    pub(super) sel: Selection,
-    pub(super) oldest: Mono,
-    pub(super) newest: Mono,
-}
-
 impl Engine {
     pub(super) fn round_of(&self, id: SourceId) -> Option<&Round> {
         self.rounds
@@ -100,8 +92,10 @@ impl Engine {
                 });
             }
         }
-        // A tier with nothing to ask is judged at once. No sources means
-        // unusable.
+        // A tier with nothing to ask is judged at once from its stored
+        // fresh samples. With no sources it has none and is unusable. With
+        // every source silenced by KoD or held by a RATE floor, its stored
+        // samples may still make it usable.
         let empty = waiting.is_empty();
         self.rounds[i] = Some(Round {
             started: now,
@@ -152,11 +146,8 @@ impl Engine {
         }
         // A switch made by observe-only samples does not feed the clock. The
         // next regular round of the tier does.
-        if !round.observe_only
-            && self.tiers.active() == Some(tier)
-            && let Some(p) = picked
-        {
-            self.update(tier, &p, out);
+        if !round.observe_only && self.tiers.active() == Some(tier) {
+            self.feed_loop(tier, out);
         }
     }
 
@@ -174,27 +165,14 @@ impl Engine {
         }
     }
 
-    /// Selection inside one tier only. Tiers are never mixed. Returns the
-    /// oldest and newest sample time among the survivors too.
-    pub(super) fn select_in(&self, tier: Tier, max_age: Duration) -> Option<Picked> {
+    /// Selection inside one tier only. Tiers are never mixed.
+    pub(super) fn select_in(&self, tier: Tier, max_age: Duration) -> Option<Selection> {
         let samples: Vec<Sample> = self
             .sources
             .values()
             .filter(|s| s.spec.tier == tier)
             .filter_map(|s| s.filter.best_fresh(self.now, max_age))
             .collect();
-        let sel = select(&samples, self.now, &self.cfg.selection)?;
-        let times = || {
-            samples
-                .iter()
-                .filter(|s| sel.survivors.contains(&s.source))
-                .map(|s| s.at)
-        };
-        let (oldest, newest) = (times().min()?, times().max()?);
-        Some(Picked {
-            sel,
-            oldest,
-            newest,
-        })
+        select(&samples, self.now, &self.cfg.selection)
     }
 }
