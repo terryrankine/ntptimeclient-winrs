@@ -14,8 +14,9 @@
 //! - Report each clock action, in order, through [`Event::ClockResult`].
 //! - [`Event::AdjustmentAllowed`] is a level. Adjustment starts off. Send it
 //!   at start and again whenever the `w32time` or domain-join state is
-//!   checked. A clock failure stops adjustment until the host sends `false`
-//!   and then `true`.
+//!   checked. A failed clock command turns adjustment off and keeps it
+//!   off. Sending `true` again does not turn it back on. Only
+//!   `AdjustmentAllowed(false)` followed by `AdjustmentAllowed(true)` does.
 //! - [`ClockError`] text reaches the log. It must not carry file paths.
 //! - Send [`Event::Tick`] at [`Engine::next_wake`].
 
@@ -725,8 +726,9 @@ impl Engine {
             return;
         }
         let measured_since_change = self.freq_changed_at.is_none_or(|c| p.oldest > c);
+        let pool = self.cross_check(tier);
         let cross = if measured_since_change {
-            self.cross_check(tier)
+            pool
         } else {
             CrossCheck::Pending
         };
@@ -754,7 +756,21 @@ impl Engine {
                 }
                 self.refusing = Some(self.now);
                 self.set_frequency(frequency);
+                if pool == CrossCheck::Pending {
+                    self.ask_pool_now();
+                }
             }
+        }
+    }
+
+    /// A step waits on a missing or stale pool reading. Ask the pool now
+    /// rather than at `reprobe_every`, at most once per poll interval.
+    fn ask_pool_now(&mut self) {
+        let i = slot(Tier::Pool);
+        let recent =
+            self.last_round[i].is_some_and(|l| self.now.saturating_duration_since(l) < self.poll);
+        if self.tiers.active() != Some(Tier::Pool) && !recent {
+            self.recheck[i] = true;
         }
     }
 

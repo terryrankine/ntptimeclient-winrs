@@ -712,13 +712,19 @@ fn config_and_pool(config: Reply, pool: Reply, until: u64) -> Harness {
 
 #[test]
 fn refuses_step_when_pool_cross_check_disagrees() {
-    // The pool disagrees first, then agrees from its 900 s round. An
-    // always-Pending check would never step. No check would step at once.
+    // The pool disagrees first, then agrees from 800 s. An always-Pending
+    // check would never step. No check would step at once.
     let pool: Reply = Box::new(|_, t| Ok(if t < 800 { 0.0 } else { 5.05 }));
     let h = config_and_pool(steady(5.0), pool, 3600);
     let steps = h.steps();
     assert_eq!(steps.len(), 1, "steps {steps:?}");
-    assert!(steps[0] > 900, "step at {}", steps[0]);
+    // Each refusal on a stale pool reading asks the pool again within one
+    // poll, so the step follows the first agreeing reply.
+    assert!(
+        (800..=800 + 2 * 64).contains(&steps[0]),
+        "step at {}",
+        steps[0]
+    );
     let refusals: Vec<u64> = h
         .logs()
         .iter()
@@ -726,7 +732,7 @@ fn refuses_step_when_pool_cross_check_disagrees() {
         .map(|(t, _)| *t)
         .collect();
     assert_eq!(refusals.len(), 1, "logged on change only: {refusals:?}");
-    assert!(refusals[0] < 900);
+    assert!(refusals[0] < 800);
     assert!(h.times(is_freq).len() > 3);
 }
 
@@ -765,6 +771,46 @@ fn slews_only_when_no_pool_cross_check_sample_exists_yet() {
             .iter()
             .any(|(_, a)| matches!(a, Action::SetFrequency(f) if f.value() > 100.0))
     );
+}
+
+#[test]
+fn large_start_offset_steps_soon_after_pool_answers() {
+    // The pool misses its first query. The refusal at 64 s asks it again at
+    // once, so the step comes one poll later, not after reprobe_every.
+    let pool: Reply = Box::new(|_, t| {
+        if t == 0 {
+            Err(QueryFailure::Timeout)
+        } else {
+            Ok(5.05)
+        }
+    });
+    let h = config_and_pool(steady(5.0), pool, 1000);
+    assert_eq!(h.queries(2)[..2], [0, 64]);
+    assert_eq!(h.steps(), vec![128]);
+}
+
+#[test]
+fn vetoed_step_asks_pool_at_most_once_per_poll() {
+    let h = config_and_pool(steady(5.0), timeout(), 3600);
+    assert_eq!(h.steps(), Vec::<u64>::new());
+    let q = h.queries(2);
+    assert!(q.len() > 20, "pool asked again: {q:?}");
+    assert!(gaps(&q).iter().all(|&g| g >= 64), "pool queries {q:?}");
+    assert!(h.queries(2).len() <= h.queries(1).len());
+}
+
+#[test]
+fn pool_ask_is_deduped_within_one_poll() {
+    // Refusals come once per config round, so only the guard itself can be
+    // driven twice inside one poll.
+    let mut h = config_and_pool(steady(5.0), timeout(), 200);
+    let pool = slot(Tier::Pool);
+    assert!(!h.e.recheck[pool]);
+    h.e.ask_pool_now();
+    assert!(!h.e.recheck[pool], "pool was asked less than a poll ago");
+    h.e.now = later(h.e.now, h.e.poll);
+    h.e.ask_pool_now();
+    assert!(h.e.recheck[pool]);
 }
 
 #[test]
