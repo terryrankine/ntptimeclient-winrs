@@ -24,6 +24,17 @@ use crate::{Mono, Offset, Ppm};
 /// also keeps the linear range gentle: a 128 ms offset asks for 62.5 ppm.
 const PHASE_TIME_CONSTANT_SECS: f64 = 2048.0;
 
+/// Longest time a frequency from this loop stays valid without a new update.
+///
+/// Equal to the phase time constant. A held phase term removes the offset
+/// at a fixed rate, so it reaches zero after one phase constant. Holding it
+/// longer pushes the clock past zero. In steady state the drift taught on
+/// the same round adds up to 1/8 of the offset at a 1024 s poll, so the
+/// overshoot within this window stays under 12.5 % of the offset. The
+/// engine must call [`Discipline::free_run`] if no update arrives within
+/// this window.
+pub const MAX_HOLD: Duration = Duration::from_secs(2048);
+
 /// Time constant of the drift integrator.
 ///
 /// Twice the phase constant gives a damping ratio of 1. That is the fastest
@@ -81,25 +92,45 @@ pub enum CrossCheck {
 }
 
 /// What the host must do to the clock after one update.
+///
+/// Every variant except `None` carries a frequency. It is absolute from
+/// nominal, includes the learned drift and is clamped to `max_slew`. The
+/// host applies it and the platform quantises it. A frequency is valid for
+/// at most [`MAX_HOLD`]. If no update arrives within that window the engine
+/// must call [`Discipline::free_run`] and apply its frequency.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Correction {
-    /// Nothing to apply. The loop never returns it today. The engine may use
-    /// it for rounds that do not reach the loop.
+    /// Nothing to apply. Returned when the selected offset is not finite.
+    /// The engine keeps the last frequency, within [`MAX_HOLD`].
     None,
-    /// Set the frequency, absolute from nominal. It already includes the
-    /// learned drift. The host applies it and the platform quantises it.
+    /// Set the frequency. Valid for at most [`MAX_HOLD`].
     SetFrequency(Ppm),
-    /// Move the clock by this offset. A positive offset moves it forward.
-    /// The frequency stays as it was until the next update.
-    Step(Offset),
-    /// A step was needed but is not safe. Either the offset is above the
-    /// panic threshold or the pool cross-check is pending or disagrees.
+    /// Move the clock by `offset`, then set `frequency`. A positive offset
+    /// moves the clock forward. The frequency is the learned drift alone,
+    /// because the step removes the phase.
+    Step {
+        /// Amount to move the clock.
+        offset: Offset,
+        /// Frequency to set after the step.
+        frequency: Ppm,
+    },
+    /// A step was needed but is not safe. Do not move the clock. Set
+    /// `frequency`.
     ///
-    /// The engine must not touch the clock. It should log the refusal and
-    /// keep the last frequency. The loop changes no state on this round:
-    /// the step stays available, the drift is not taught and the update
-    /// time is not recorded. The next round with a safe answer may step.
-    RefuseStep(Offset),
+    /// Panic refusal: the offset is above the panic threshold. The loop
+    /// changes no state. `frequency` is the learned drift alone, so the
+    /// clock is not slewed toward a source that may be badly wrong.
+    ///
+    /// Cross-check veto: the pool is pending or disagrees. `frequency` is
+    /// the normal slew toward the selected offset. The step stays
+    /// available, so a later round with an agreeing pool may still step.
+    /// The drift is not taught, because the offset is above the threshold.
+    RefuseStep {
+        /// The offset that was not stepped.
+        offset: Offset,
+        /// Frequency to set on this round.
+        frequency: Ppm,
+    },
 }
 
 /// Phase and frequency locked loop for one clock.
@@ -140,15 +171,34 @@ impl Discipline {
     /// offset is slewed through the frequency, clamped to `max_slew`.
     pub fn update(&mut self, sel: &Selection, cross_check: CrossCheck, now: Mono) -> Correction {
         let x = sel.offset.as_secs();
+        // `Offset` asserts finiteness in debug builds only. A release build
+        // must still never feed NaN or infinity into the loop state.
+        if !x.is_finite() {
+            return Correction::None;
+        }
         let threshold = self.cfg.step_threshold.as_secs_f64();
 
         if self.step_allowed && x.abs() > threshold {
-            if self.step_unsafe(x, cross_check) {
-                return Correction::RefuseStep(sel.offset);
+            if self.panics(x) {
+                return Correction::RefuseStep {
+                    offset: sel.offset,
+                    frequency: self.clamp(self.drift_ppm),
+                };
+            }
+            if self.pool_vetoes(x, cross_check) {
+                // Slew while the pool decides. The step stays allowed.
+                self.last_update = Some(now);
+                return Correction::RefuseStep {
+                    offset: sel.offset,
+                    frequency: self.slew(x),
+                };
             }
             self.step_allowed = false;
             self.last_update = Some(now);
-            return Correction::Step(sel.offset);
+            return Correction::Step {
+                offset: sel.offset,
+                frequency: self.clamp(self.drift_ppm),
+            };
         }
         self.step_allowed = false;
 
@@ -160,11 +210,21 @@ impl Discipline {
         }
         self.last_update = Some(now);
 
-        // A large offset uses the same law. The clamp turns it into a full
-        // rate slew above about 1 s, and the phase constant keeps it from
+        // A large offset after the first sync uses the same law. This is the
+        // spec's "slewed at a capped rate", not a flat `max_slew`. The clamp
+        // gives full rate above about 1 s. The phase constant keeps it from
         // overshooting below that.
+        //
+        // An offset above the panic threshold is slewed here too. That is
+        // the spec's reading. It is inconsistent with the refusal at start,
+        // which never acts on such an offset. The owner must decide.
+        Correction::SetFrequency(self.slew(x))
+    }
+
+    /// Normal slew law: drift plus phase term, clamped.
+    fn slew(&self, x: f64) -> Ppm {
         let phase_ppm = x / PHASE_TIME_CONSTANT_SECS * PPM_PER_UNIT;
-        Correction::SetFrequency(self.clamp(self.drift_ppm + phase_ppm))
+        self.clamp(self.drift_ppm + phase_ppm)
     }
 
     /// No source is usable. Keeps the clock at its learned rate.
@@ -190,17 +250,27 @@ impl Discipline {
         Ppm::new(self.drift_ppm)
     }
 
-    fn step_unsafe(&self, x: f64, cross_check: CrossCheck) -> bool {
-        let panic = x.abs() > self.cfg.panic_threshold.as_secs_f64() && !self.cfg.allow_panic_step;
-        let threshold = self.cfg.step_threshold.as_secs_f64();
-        let pool_vetoes = match cross_check {
-            CrossCheck::NotRequired => false,
-            CrossCheck::Pending => true,
-            CrossCheck::Offset(o) => (o.as_secs() - x).abs() > threshold,
-        };
-        panic || pool_vetoes
+    fn panics(&self, x: f64) -> bool {
+        x.abs() > self.cfg.panic_threshold.as_secs_f64() && !self.cfg.allow_panic_step
     }
 
+    fn pool_vetoes(&self, x: f64, cross_check: CrossCheck) -> bool {
+        let threshold = self.cfg.step_threshold.as_secs_f64();
+        match cross_check {
+            CrossCheck::NotRequired => false,
+            CrossCheck::Pending => true,
+            // A difference exactly at the threshold agrees, as offsets
+            // exactly at the threshold slew rather than step.
+            CrossCheck::Offset(o) => (o.as_secs() - x).abs() > threshold,
+        }
+    }
+
+    /// Teaches the drift from one offset in the linear range.
+    ///
+    /// `error_bound` is not used. A wide-bound sample teaches at full gain.
+    /// Accepted for v1: selection already drops falsetickers. One sample at
+    /// the 128 ms threshold moves the drift by at most 0.5 ppm at a 64 s poll
+    /// and 7.8 ppm at 1024 s, and the loop pulls it back.
     fn learn(&mut self, x: f64, now: Mono) {
         let Some(last) = self.last_update else {
             return;
@@ -248,22 +318,29 @@ mod tests {
         }
     }
 
-    fn step(c: Correction) -> f64 {
+    /// Offset and frequency of a `Step`.
+    fn step(c: Correction) -> (f64, f64) {
         match c {
-            Correction::Step(o) => o.as_secs(),
+            Correction::Step { offset, frequency } => (offset.as_secs(), frequency.value()),
             other => panic!("expected Step, got {other:?}"),
         }
     }
 
-    fn refused(c: Correction) -> f64 {
+    /// Offset and frequency of a `RefuseStep`.
+    fn refused(c: Correction) -> (f64, f64) {
         match c {
-            Correction::RefuseStep(o) => o.as_secs(),
+            Correction::RefuseStep { offset, frequency } => (offset.as_secs(), frequency.value()),
             other => panic!("expected RefuseStep, got {other:?}"),
         }
     }
 
     fn fresh() -> Discipline {
         Discipline::new(DisciplineConfig::default(), None)
+    }
+
+    /// Phase term the loop asks for, in ppm.
+    fn phase_ppm(x: f64) -> f64 {
+        x / PHASE_TIME_CONSTANT_SECS * PPM_PER_UNIT
     }
 
     /// A clock that needs `need_ppm` of correction to keep true time,
@@ -311,12 +388,15 @@ mod tests {
             let measured = self.phase + self.noise();
             let c = d.update(&sel(measured), CrossCheck::NotRequired, at(self.now));
             match c {
-                Correction::Step(o) => {
-                    self.phase -= o.as_secs();
+                Correction::Step { offset, frequency } => {
+                    self.phase -= offset.as_secs();
+                    self.freq_ppm = frequency.value();
                     self.steps += 1;
                 }
-                Correction::SetFrequency(p) => self.freq_ppm = p.value(),
-                Correction::None | Correction::RefuseStep(_) => {}
+                Correction::SetFrequency(p) | Correction::RefuseStep { frequency: p, .. } => {
+                    self.freq_ppm = p.value();
+                }
+                Correction::None => {}
             }
             #[allow(clippy::cast_precision_loss)]
             let secs = poll as f64;
@@ -346,10 +426,17 @@ mod tests {
     #[test]
     fn first_large_offset_steps_once_then_slews() {
         let mut d = fresh();
-        let s = step(d.update(&sel(0.5), CrossCheck::NotRequired, at(0)));
+        let (s, _) = step(d.update(&sel(0.5), CrossCheck::NotRequired, at(0)));
         assert!((s - 0.5).abs() < 1e-12);
         let f = freq(d.update(&sel(0.5), CrossCheck::NotRequired, at(POLL)));
         assert!(f > 0.0, "slews forward, got {f}");
+    }
+
+    #[test]
+    fn step_carries_drift_as_frequency() {
+        let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(7.0)));
+        let (_, f) = step(d.update(&sel(0.5), CrossCheck::NotRequired, at(0)));
+        assert!((f - 7.0).abs() < 1e-12, "got {f}");
     }
 
     #[test]
@@ -375,7 +462,7 @@ mod tests {
     #[test]
     fn negative_offset_steps_then_slews_backwards() {
         let mut d = fresh();
-        let s = step(d.update(&sel(-0.7), CrossCheck::NotRequired, at(0)));
+        let (s, _) = step(d.update(&sel(-0.7), CrossCheck::NotRequired, at(0)));
         assert!((s + 0.7).abs() < 1e-12);
         let f = freq(d.update(&sel(-0.05), CrossCheck::NotRequired, at(POLL)));
         assert!(f < 0.0, "slows the clock, got {f}");
@@ -447,6 +534,60 @@ mod tests {
     }
 
     #[test]
+    fn max_hold_equals_phase_time_constant() {
+        assert!((MAX_HOLD.as_secs_f64() - PHASE_TIME_CONSTANT_SECS).abs() < 1e-12);
+    }
+
+    #[test]
+    fn skipped_poll_within_max_hold_does_not_cross_zero() {
+        // A 1024 s poll is skipped, so one frequency is held for `hold`
+        // seconds. The drift is right, so the only error is the phase.
+        // `prior` adds an update 1024 s before, which uses up the start step
+        // and lets a linear offset teach the drift on the held round.
+        fn held(x0: f64, prior: bool, hold: u64) -> f64 {
+            let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(20.0)));
+            let mut sim = Sim::new(x0, 20.0, 0.0);
+            sim.freq_ppm = 20.0;
+            if prior {
+                freq(d.update(&sel(0.0), CrossCheck::NotRequired, at(0)));
+                sim.now = 1024;
+            }
+            sim.poll(&mut d, hold);
+            sim.phase
+        }
+        let hold = MAX_HOLD.as_secs();
+
+        // Phase term alone: a first sync in the linear range, or a large
+        // offset after the first sync. Neither teaches the drift.
+        for (x0, prior) in [
+            (0.01, false),
+            (0.128, false),
+            (-0.1, false),
+            (0.5, true),
+            (5.0, true),
+            (-5.0, true),
+        ] {
+            let p = held(x0, prior, hold);
+            assert!(p * x0.signum() >= -1e-12, "x0 {x0}: crossed to {p}");
+        }
+
+        // Steady state: the integral term adds gap * hold / T_i^2 = 1/8 of
+        // the offset on top of the phase term. The overshoot stays within
+        // 12.5 % of the offset.
+        for x0 in [0.01, 0.1, 0.128, -0.1] {
+            let p = held(x0, true, hold);
+            assert!(
+                p * x0.signum() >= -0.125 * x0.abs() - 1e-12,
+                "x0 {x0}: overshot to {p}"
+            );
+        }
+
+        // Holding twice as long crosses far. The window is what matters.
+        let p = held(0.1, false, 2 * hold);
+        assert!(p < -0.05, "expected a crossing, got {p}");
+    }
+
+    #[test]
     fn free_run_uses_saved_drift() {
         let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(12.5)));
         assert!((d.drift().value() - 12.5).abs() < 1e-12);
@@ -498,11 +639,17 @@ mod tests {
 
     #[test]
     fn large_offset_during_normal_operation_slews_at_max_rate() {
-        let mut d = fresh();
+        let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(3.0)));
         freq(d.update(&sel(0.001), CrossCheck::NotRequired, at(0)));
-        let f = freq(d.update(&sel(10.0), CrossCheck::NotRequired, at(POLL)));
+        let drift = d.drift().value();
+        // The spec's "capped rate" is the clamped slew law, not a flat
+        // max_slew. 0.2 s asks for about 97.7 ppm on top of the drift.
+        let f = freq(d.update(&sel(0.2), CrossCheck::NotRequired, at(POLL)));
+        assert!((f - (drift + phase_ppm(0.2))).abs() < 1e-9, "got {f}");
+        assert!((phase_ppm(0.2) - 97.656_25).abs() < 1e-9 && f < 500.0);
+        let f = freq(d.update(&sel(10.0), CrossCheck::NotRequired, at(2 * POLL)));
         assert!((f - 500.0).abs() < 1e-9, "got {f}");
-        let f = freq(d.update(&sel(-10.0), CrossCheck::NotRequired, at(2 * POLL)));
+        let f = freq(d.update(&sel(-10.0), CrossCheck::NotRequired, at(3 * POLL)));
         assert!((f + 500.0).abs() < 1e-9, "got {f}");
     }
 
@@ -519,9 +666,11 @@ mod tests {
 
     #[test]
     fn step_above_panic_threshold_is_refused() {
-        let mut d = fresh();
-        let r = refused(d.update(&sel(2000.0), CrossCheck::NotRequired, at(0)));
+        let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(4.0)));
+        let (r, f) = refused(d.update(&sel(2000.0), CrossCheck::NotRequired, at(0)));
         assert!((r - 2000.0).abs() < 1e-9);
+        // Hold the learned rate. Do not slew toward a panic offset.
+        assert!((f - 4.0).abs() < 1e-12, "got {f}");
         // The refusal does not use up the step.
         refused(d.update(&sel(-1500.0), CrossCheck::NotRequired, at(POLL)));
         step(d.update(&sel(-0.5), CrossCheck::NotRequired, at(2 * POLL)));
@@ -540,8 +689,25 @@ mod tests {
     #[test]
     fn refused_round_keeps_step_and_drift() {
         let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(7.0)));
-        refused(d.update(&sel(0.5), CrossCheck::Pending, at(0)));
+        let (_, f) = refused(d.update(&sel(0.5), CrossCheck::Pending, at(0)));
+        assert!((f - (7.0 + phase_ppm(0.5))).abs() < 1e-9, "got {f}");
         assert!((d.drift().value() - 7.0).abs() < 1e-12);
+        step(d.update(&sel(0.5), CrossCheck::NotRequired, at(POLL)));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn non_finite_offset_returns_none() {
+        // Release only: a debug build asserts in `Offset::from_secs`.
+        let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(5.0)));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                d.update(&sel(bad), CrossCheck::NotRequired, at(0)),
+                Correction::None
+            );
+        }
+        assert!((d.drift().value() - 5.0).abs() < 1e-12);
+        // No state changed, so the start step is still there.
         step(d.update(&sel(0.5), CrossCheck::NotRequired, at(POLL)));
     }
 
@@ -560,20 +726,27 @@ mod tests {
 
     #[test]
     fn drift_is_clamped_to_max_slew() {
-        // The oscillator is worse than the loop can correct.
-        let mut sim = Sim::new(0.0, 800.0, 0.0);
-        let mut d = fresh();
-        for _ in 0..500 {
+        // The clock needs 520 ppm, past the 500 ppm limit. The offset grows
+        // slowly enough to stay in the linear range, so the drift is taught.
+        // It must climb to the limit and stop there.
+        let mut sim = Sim::new(0.0, 520.0, 0.0);
+        let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(495.0)));
+        for _ in 0..100 {
             sim.poll(&mut d, 64);
             assert!(d.drift().value().abs() <= 500.0);
             assert!(sim.freq_ppm.abs() <= 500.0);
         }
+        assert!(
+            (d.drift().value() - 500.0).abs() < f64::EPSILON,
+            "got {}",
+            d.drift().value()
+        );
     }
 
     #[test]
     fn pending_cross_check_refuses_step() {
         let mut d = fresh();
-        let r = refused(d.update(&sel(0.5), CrossCheck::Pending, at(0)));
+        let (r, _) = refused(d.update(&sel(0.5), CrossCheck::Pending, at(0)));
         assert!((r - 0.5).abs() < 1e-12);
     }
 
@@ -592,17 +765,55 @@ mod tests {
     }
 
     #[test]
+    fn cross_check_difference_exactly_at_threshold_agrees() {
+        // 0.125 s, 0.375 s and 0.5 s are exact in binary, so the difference
+        // is exactly the threshold.
+        let cfg = DisciplineConfig {
+            step_threshold: Duration::from_millis(125),
+            ..DisciplineConfig::default()
+        };
+        let mut d = Discipline::new(cfg, None);
+        step(d.update(
+            &sel(0.5),
+            CrossCheck::Offset(Offset::from_secs(0.375)),
+            at(0),
+        ));
+        let mut d = Discipline::new(cfg, None);
+        refused(d.update(
+            &sel(0.5),
+            CrossCheck::Offset(Offset::from_secs(0.374)),
+            at(0),
+        ));
+    }
+
+    #[test]
     fn not_required_cross_check_allows_step() {
         let mut d = fresh();
         step(d.update(&sel(0.5), CrossCheck::NotRequired, at(0)));
     }
 
     #[test]
+    fn pending_veto_slews_at_full_rate_and_keeps_step() {
+        let mut d = fresh();
+        let (r, f) = refused(d.update(&sel(10.0), CrossCheck::Pending, at(0)));
+        assert!((r - 10.0).abs() < 1e-12);
+        assert!((f - 500.0).abs() < 1e-9, "got {f}");
+        let pool = CrossCheck::Offset(Offset::from_secs(9.95));
+        let (s, _) = step(d.update(&sel(9.9), pool, at(POLL)));
+        assert!((s - 9.9).abs() < 1e-12);
+    }
+
+    #[test]
     fn cross_check_never_blocks_slew() {
         let mut d = fresh();
-        freq(d.update(&sel(0.05), CrossCheck::Pending, at(0)));
+        // Step allowed, pool pending: the veto round still slews.
+        let (_, f) = refused(d.update(&sel(0.5), CrossCheck::Pending, at(0)));
+        assert!((f - phase_ppm(0.5)).abs() < 1e-9 && f > 0.0, "got {f}");
+        // A small offset never needs a step, so the pending pool is moot.
+        freq(d.update(&sel(0.05), CrossCheck::Pending, at(POLL)));
+        // After the first sync a disagreeing pool cannot stop a slew.
         let pool = CrossCheck::Offset(Offset::from_secs(-3.0));
-        let f = freq(d.update(&sel(5.0), pool, at(POLL)));
+        let f = freq(d.update(&sel(5.0), pool, at(2 * POLL)));
         assert!((f - 500.0).abs() < 1e-9);
     }
 }
