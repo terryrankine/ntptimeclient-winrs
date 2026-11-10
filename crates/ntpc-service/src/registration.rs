@@ -598,15 +598,15 @@ impl Registration for ScmRegistration<'_> {
         }
     }
 
-    /// Starts the service and waits for `RUNNING` (R109). `StartService`
-    /// returns once the process connects, so a service that fails while
-    /// building its adapters is seen only here.
     fn park(&mut self) -> Result<(), String> {
         self.scm
             .park(SERVICE_NAME)
             .map_err(|(step, e)| format!("setting the {step} failed: {e}"))
     }
 
+    /// Starts the service and waits for `RUNNING` (R109). `StartService`
+    /// returns once the process connects, so a service that fails while
+    /// building its adapters is seen only here.
     fn start_service(&mut self) -> Result<(), String> {
         match self.scm.start(SERVICE_NAME) {
             Ok(()) | Err(ScmError::AlreadyRunning) => {}
@@ -633,7 +633,8 @@ impl Registration for ScmRegistration<'_> {
                 }
                 Ok(_) if running_for.is_some() => {
                     return Err(format!(
-                        "the service left the running state right after it started. The                          Application event log, source {SERVICE_NAME}, says why"
+                        "the service left the running state right after it started. The \
+                         Application event log, source {SERVICE_NAME}, says why"
                     ));
                 }
                 Ok(_) => {}

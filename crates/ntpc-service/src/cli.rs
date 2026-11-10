@@ -41,13 +41,14 @@
 //! started again so the machine keeps a time service (R94 concern). A
 //! directory or record that cannot be trusted leaves `w32time` alone (exit
 //! 17) with a manual restore hint that guesses no start type. No usable
-//! record while `w32time` is disabled is exit 18 (R92).
+//! record while `w32time` is disabled is exit 18 (R92). Uninstall restores
+//! even if our service is missing. Without a record `w32time` is left as it
+//! is: guessing a start type could undo an administrator's choice. The state
+//! directory stays.
 //!
 //! The domain question waits at most [`ANSWER_TIMEOUT`] (120 s), then counts
 //! as no (R93). A deployment tool, a scheduled task or a hidden console must
-//! pass `--silent` or `--confirm-domain-joined`, so no question is asked. It restores even if our service is
-//! missing. Without a record `w32time` is left as it is: guessing a start
-//! type could undo an administrator's choice. The state directory stays.
+//! pass `--silent` or `--confirm-domain-joined`, so no question is asked.
 //!
 //! Messages carry no paths, machine names, user names or domain names.
 
