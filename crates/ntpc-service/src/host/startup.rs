@@ -64,7 +64,13 @@ pub(super) fn secure_state_dir(state_dir: &dyn super::StateDir, logger: &dyn Log
             logger.log(Level::Info, "state_dir", "state directory secured");
             true
         }
+        SecureOutcome::Replaced => {
+            logger.log(Level::Info, "state_dir", "state directory secured");
+            log_replaced(logger);
+            true
+        }
         SecureOutcome::RestoreDropped => {
+            log_replaced(logger);
             logger.log(
                 Level::Warn,
                 "state_dir",
@@ -85,6 +91,15 @@ pub(super) fn secure_state_dir(state_dir: &dyn super::StateDir, logger: &dyn Log
             false
         }
     }
+}
+
+/// R108: once per start that replaced the directory.
+fn log_replaced(logger: &dyn Logger) {
+    logger.log(
+        Level::Warn,
+        "state_dir",
+        "state directory replaced: previous log, drift and status were discarded",
+    );
 }
 
 /// Loads the saved drift and logs the note.

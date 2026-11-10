@@ -8,6 +8,12 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+mod per_adapter;
+
+pub use per_adapter::{
+    AdapterKey, AdapterLease, LeaseOptions, merged_servers, read_lease_servers_per_adapter,
+};
+
 /// Most servers one option, or one read across adapters, may yield.
 /// RFC 2132 allows up to 63 in one option. The resolver keeps 8 per tier.
 pub const MAX_SERVERS: usize = 16;
@@ -99,30 +105,14 @@ fn os_code(e: &std::io::Error) -> i32 {
 /// # Errors
 /// [`DhcpError::Unsupported`] off Windows. On Windows an error only when
 /// the adapter list or API start fails, or every adapter request fails.
+///
+/// Since Task 14c this is [`read_lease_servers_per_adapter`] with nothing
+/// skipped, merged by [`merged_servers`]. Same adapters, order, caps and
+/// errors as before.
 #[cfg(windows)]
 pub fn read_lease_servers() -> Result<Vec<Ipv4Addr>, DhcpError> {
-    use crate::win32::dhcp::{DhcpApi, list_adapters};
-    let adapters =
-        select_adapters(list_adapters().map_err(|e| DhcpError::AdapterList(os_code(&e)))?);
-    if adapters.is_empty() {
-        return Ok(Vec::new());
-    }
-    let api = DhcpApi::start().map_err(|e| DhcpError::ApiStart(os_code(&e)))?;
-    let mut lists = Vec::with_capacity(adapters.len());
-    let mut first_error = None;
-    for a in &adapters {
-        match api.request_option42(&a.name) {
-            Ok(Some(data)) => lists.push(parse_option42(&data)),
-            Ok(None) => lists.push(Vec::new()),
-            Err(e) => {
-                first_error.get_or_insert(os_code(&e));
-            }
-        }
-    }
-    match (lists.is_empty(), first_error) {
-        (true, Some(code)) => Err(DhcpError::Request(code)),
-        _ => Ok(merge_servers(lists)),
-    }
+    read_lease_servers_per_adapter(&std::collections::HashSet::new())
+        .map(|leases| merged_servers(&leases))
 }
 
 /// Off Windows there is no DHCP reader in version one.
@@ -351,6 +341,9 @@ pub(crate) struct AdapterInfo {
     pub if_type: u32,
     /// A non-zero `Dhcpv4Server`: the adapter holds a lease.
     pub has_lease: bool,
+    /// The `Dhcpv4Server` address, the lease server. Half of the
+    /// per-adapter negative cache key (R82).
+    pub lease_server: Option<Ipv4Addr>,
 }
 
 /// Keeps adapters that are up, DHCP enabled, leased, and not loopback or
@@ -426,17 +419,18 @@ pub(crate) fn adapter_name_wide(name: &[u8]) -> Option<Vec<u16>> {
     Some(w)
 }
 
-/// True when `sa` holds a `SOCKADDR_IN` (family `AF_INET` = 2, little
-/// endian) with a non-zero address. That is how a lease shows in
-/// `Dhcpv4Server`.
+/// The address of a `SOCKADDR_IN` (family `AF_INET` = 2, little endian),
+/// `None` for another family, a short buffer or the zero address. A
+/// non-zero `Dhcpv4Server` is how a lease shows.
 #[must_use]
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn sockaddr_in_is_set(sa: &[u8]) -> bool {
+pub(crate) fn sockaddr_in_addr(sa: &[u8]) -> Option<Ipv4Addr> {
     // SOCKADDR_IN: family u16, port u16, address 4 bytes, zero padding 8.
-    if sa.len() < 16 {
-        return false;
+    if sa.len() < 16 || u16::from_le_bytes([sa[0], sa[1]]) != 2 {
+        return None;
     }
-    u16::from_le_bytes([sa[0], sa[1]]) == 2 && sa[4..8] != [0, 0, 0, 0]
+    let a = Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]);
+    (!a.is_unspecified()).then_some(a)
 }
 
 #[cfg(test)]
@@ -580,6 +574,7 @@ mod buffer_tests {
             dhcp_enabled: true,
             if_type: 6,
             has_lease: true,
+            lease_server: Some(Ipv4Addr::new(192, 0, 2, 67)),
         }
     }
 
@@ -671,19 +666,19 @@ mod buffer_tests {
     }
 
     #[test]
-    fn sockaddr_in_is_set_reads_family_and_address() {
+    fn sockaddr_in_addr_reads_family_and_address() {
         let mut sa = [0u8; 16];
         sa[0] = 2;
         sa[4..8].copy_from_slice(&[192, 0, 2, 1]);
-        assert!(sockaddr_in_is_set(&sa));
-        assert!(!sockaddr_in_is_set(&sa[..15]), "truncated");
+        assert_eq!(sockaddr_in_addr(&sa), Some(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(sockaddr_in_addr(&sa[..15]), None, "truncated");
         let mut zero = sa;
         zero[4..8].copy_from_slice(&[0; 4]);
-        assert!(!sockaddr_in_is_set(&zero));
+        assert_eq!(sockaddr_in_addr(&zero), None);
         let mut v6 = sa;
         v6[0] = 23;
-        assert!(!sockaddr_in_is_set(&v6));
-        assert!(!sockaddr_in_is_set(&[]));
+        assert_eq!(sockaddr_in_addr(&v6), None);
+        assert_eq!(sockaddr_in_addr(&[]), None);
     }
 
     #[test]
@@ -703,7 +698,7 @@ mod buffer_tests {
                 assert!(!s.contains(&0));
             }
             let _ = adapter_name_wide(&buf);
-            let _ = sockaddr_in_is_set(&buf);
+            let _ = sockaddr_in_addr(&buf);
             let p = usize::try_from(next()).unwrap_or(0);
             let n = usize::try_from(next() % 4096).unwrap_or(0);
             if let Some(o) = offset_in(4096, 1024, p, n) {

@@ -242,11 +242,18 @@ pub fn read_adjustment() -> Result<AdjustmentState, ClockError> {
     })
 }
 
+/// A `FILETIME` value (100 ns units since 1601-01-01 UTC) as Unix
+/// nanoseconds. Pure integer arithmetic, exact for every u64.
+#[must_use]
+pub fn filetime_to_unix_ns(filetime: u64) -> i128 {
+    (i128::from(filetime) - UNIX_EPOCH_AS_FILETIME) * 100
+}
+
 /// Wall time in Unix nanoseconds from `GetSystemTimePreciseAsFileTime`.
 #[cfg(windows)]
 #[must_use]
 pub fn wall_now_ns() -> i128 {
-    (i128::from(win32::system_time_precise()) - UNIX_EPOCH_AS_FILETIME) * 100
+    filetime_to_unix_ns(win32::system_time_precise())
 }
 
 /// Awake time from `QueryUnbiasedInterruptTimePrecise`. Sleep does not count
@@ -521,6 +528,32 @@ mod tests {
 
     fn filetime_of(unix_ns: i128) -> u64 {
         u64::try_from(unix_ns / 100 + UNIX_EPOCH_AS_FILETIME).unwrap()
+    }
+
+    #[test]
+    fn filetime_converts_to_unix_nanoseconds() {
+        // Hand constants, worked out apart from the code: 1970-01-01 is
+        // 11 644 473 600 s after 1601-01-01, and 2026-01-01T00:00:00Z is
+        // Unix 1 767 225 600 s (56 years, 14 of them leap years).
+        assert_eq!(filetime_to_unix_ns(116_444_736_000_000_000), 0);
+        assert_eq!(
+            filetime_to_unix_ns(134_116_992_000_000_000),
+            1_767_225_600_000_000_000
+        );
+        assert_eq!(
+            filetime_to_unix_ns(134_116_992_000_000_001),
+            1_767_225_600_000_000_100
+        );
+        assert_eq!(filetime_to_unix_ns(0), -11_644_473_600_000_000_000);
+        assert_eq!(
+            filetime_to_unix_ns(u64::MAX),
+            (i128::from(u64::MAX) - 116_444_736_000_000_000) * 100
+        );
+        // The step path goes the other way. They must agree.
+        assert_eq!(
+            step_target_filetime(1_767_225_600_000_000_000, Offset::from_secs(0.0)),
+            Ok(134_116_992_000_000_000)
+        );
     }
 
     #[test]

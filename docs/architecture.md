@@ -109,13 +109,13 @@ Task 11 facts. Each line names its source. "Measured" means read on the builder'
 - Residual race: someone able to rename an ancestor between the check and the open could swap it. That needs write access to the ancestor's parent.
 - Owner and DACL are read and written through the open handle (`GetSecurityInfo`, `SetSecurityInfo`), not by name. A swap after the open cannot redirect them.
 - The owner must be SYSTEM or BUILTIN\Administrators. Any other owner is refused. The owner of an object can always rewrite its DACL, so re-ACLing a foreign-owned directory would not secure it. A foreign-owned directory is refused, not replaced. Replacement (quarantine and recreate, below) is only for a trusted-owned directory.
-- Target DACL, SDDL `D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`: protected (no inheritance from the parent), SYSTEM and Administrators full control, inherited by child files and folders, nothing for Users. The directory holds only service state (drift, the w32time restore record, status). Nobody else needs to read it.
+- Target DACL, SDDL `D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`: protected (no inheritance from the parent), SYSTEM and Administrators full control, inherited by child files and folders, nothing for Users. The directory holds only service state (drift, the w32time restore record, status, the service log). Nobody else needs to read it.
 - A new directory is created with that DACL in the `CreateDirectoryW` security attributes, so it is never open in between. Only the last component is created. The parent must exist.
 - Before creating, the token's default owner (`TokenOwner`) must be SYSTEM or Administrators. Otherwise nothing is created and the call returns `UntrustedOwner`. Measured on the builder's machine: a plain user that creates the directory with this DACL can no longer delete it by path (`RemoveDirectoryW` and `std::fs::remove_dir` both got access denied). Why is not confirmed. A directory this call created and then failed to secure is removed, best effort.
 - Owner: the code tries to set the owner to Administrators. If the token cannot assign it (`ERROR_INVALID_OWNER`) it keeps the current owner. It then checks the owner is SYSTEM or Administrators.
 - Guarantee on Ok: the path names a directory, not a link, owned by SYSTEM or Administrators, with exactly the protected secure DACL. Its only children are plain single-link files from `KNOWN_CHILDREN`, owned by SYSTEM or Administrators.
-- Known names (`KNOWN_CHILDREN`, R80): `drift.txt` and `drift.txt.tmp` (drift store, Task 10), `restore.json` and `restore.json.tmp` (w32time takeover record, Task 12), `status.json` and `status.json.tmp` (status output, later task). Any other name refuses.
-- Result: `secure_state_dir(path: &Path) -> Result<Secured, AclError>`, where `Secured { restore_record: RestoreRecord }` and `RestoreRecord` is `Kept`, `Dropped` or `Absent`. `Kept`: `restore.json` is in the secured directory, kept on the fast path or carried. `Dropped`: it existed but failed a provenance check, so it was not carried and stays in the quarantine. Install must treat the record as lost. `Absent`: there was none, also for a newly created directory.
+- Known names (`KNOWN_CHILDREN`, R80): `drift.txt` and `drift.txt.tmp` (drift store, Task 10), `restore.json` and `restore.json.tmp` (w32time takeover record, Task 12), `status.json` and `status.json.tmp` (status output, Task 14), `service.log` and `service.log.1` (service log and its one rotated copy, Task 14c, R100). Any other name refuses. Log files are not carried on quarantine and their size is never checked.
+- Result: `secure_state_dir(path: &Path) -> Result<Secured, AclError>`, where `Secured { restore_record: RestoreRecord, replaced: bool }` (`replaced` is true when the quarantine path ran, R108) and `RestoreRecord` is `Kept`, `Dropped` or `Absent`. `Kept`: `restore.json` is in the secured directory, kept on the fast path or carried. `Dropped`: it existed but failed a provenance check, so it was not carried and stays in the quarantine. Install must treat the record as lost. `Absent`: there was none, also for a newly created directory.
 - Existing directory, every start: the children are listed through the directory handle (`GetFileInformationByHandleEx(FileFullDirectoryInfo)`). Each known file is opened without following a reparse point, and its kind, link count (`GetFileInformationByHandle`) and owner are read from that handle. A pure rule then decides:
   - Unknown name, directory, any reparse point, or a link count other than 1: refuse with `UnexpectedChild`. Persistence is off.
   - DACL exact and every child owned by SYSTEM or Administrators: keep the directory as it is (fast path).
@@ -259,6 +259,20 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 - The OS buffers are walked with bounds checks. Every pointer the OS returns must lie inside the buffer we passed, or the record is skipped. The adapter name must be a plain GUID string of at most 255 ASCII characters before it is widened.
 - Error text holds Win32 error codes only. No address, adapter name or GUID.
 
+### Per-adapter reads (`read_lease_servers_per_adapter`, R82)
+
+- Takes a skip set of `AdapterKey` values. A key is the adapter GUID plus the lease server (`Dhcpv4Server`), as `<GUID>/<address>`. A new lease from another server is a new key.
+- An adapter in the skip set is not asked. No DHCPINFORM goes out for it. When every leased adapter is skipped the DHCP client API is not started at all.
+- Each leased adapter appears once in the result, in the reader order above, with one outcome: `Servers`, `NoOption42` (no option, or an empty or malformed one), `Skipped`, or `Failed(code)`. The host negative-caches `NoOption42` only. A failure is not a "no 42" answer.
+- `Err(Request)` only when every adapter that was asked failed. Skipped adapters do not count.
+- `read_lease_servers` is now this read with nothing skipped, merged by `merged_servers`. Same adapters, order, caps and errors as before.
+- Keys hold a GUID and an address. They are for the cache only and are never logged.
+
+### Buffer walks (shared, `win32::adapters`)
+
+- One fetch helper for `GetAdaptersAddresses` (16 KiB first buffer, at most 1 MiB, four tries) serves the DHCP reader (`AF_INET`) and the own-address list (`AF_UNSPEC`).
+- One chain walker for every OS list. A node must lie wholly inside the buffer and be aligned for its type. The walk stops at a null or bad pointer, at a node it has seen already (a cyclic `Next`), and after 1024 nodes. Crafted-buffer tests cover a cyclic `Next`, a self loop, a pointer outside the buffer, a misaligned node, a short `Length` and a sockaddr outside the buffer (Task 13 review M7).
+
 ### Parser rules (`parse_option42`)
 
 - Input is the option data only (no code or length byte), as `DhcpRequestParams` returns it.
@@ -275,3 +289,38 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 - `wait(timeout)` blocks until a change, the timeout or a cancel. Bursts coalesce into one change. `WatchCanceller` wakes a blocked `wait` from another thread.
 - Drop: cancels waiters, then calls `CancelMibChangeNotify2`. Learn says the cancel must not run on the callback thread, else deadlock. That only makes sense if the cancel waits for a running callback. So the context is freed after the cancel returns. Inference, not stated outright. If the cancel fails, the context is leaked on purpose (a few bytes) and never freed under a live callback. The callback only takes a short mutex and never blocks, so the cancel cannot hang on it.
 - `LeaseTracker`: the first list counts as a change. The same set in another order is not a change, because the resolver keys sources by address and the reader's order is already deterministic. Any add or remove is a change. All removed is a change to empty. On a read error the host keeps the last good list. An error is not a lost lease.
+
+## Platform: own addresses and thread priority (Task 14c)
+
+### Own addresses (`net::own_addresses`)
+
+- `GetAdaptersAddresses(AF_UNSPEC)` with anycast, multicast, DNS servers and friendly names skipped. Read only, no packet.
+- Every unicast address of every adapter, IPv4 and IPv6, also of adapters that are down. The resolver drops these from every source list, so a superset is the safe side.
+- Parsed from `SOCKADDR_IN` and `SOCKADDR_IN6` bytes after the bounds checks above. Unknown families and the unspecified address are dropped. The IPv6 scope id is dropped.
+- Sorted, deduplicated and capped at 256, so the result is the same whatever order the OS lists adapters in.
+- Error text holds a Win32 code only. Nothing logs or prints an address.
+
+### Thread priority (`thread::set_current_thread_priority`)
+
+- `SetThreadPriority` and `GetThreadPriority` on the `GetCurrentThread` pseudo handle. Only the calling thread is touched. No process priority class, no other thread.
+- Query workers use `THREAD_PRIORITY_ABOVE_NORMAL` (1). The API offers `Normal` and `AboveNormal` only. Not time critical: a busy worker must not starve the machine.
+- The guard restores the previous level on drop, on the same thread (the guard is not `Send`). A short worker thread may `keep` the level for the rest of its life.
+
+### Hard link count (`file_link_count`)
+
+- `GetFileInformationByHandle` on a duplicate of an open `File`. Works on read and append handles (tested). Stable `std` cannot read it on Windows. The host's log file sink uses it to refuse a file with more than one link (R75).
+
+## Service: Windows adapters (`ntpc-service::winimpl`, Task 14c-A)
+
+- `windows_deps(cfg, sinks)` builds the host's `HostDeps`, its `Inbox` and `HostControl`, the resume hook and the persistence flag. It does not start the loop. `HostDeps` holds boxed traits without `Send`, so call it on the thread that runs the host.
+- Start order: secure the state directory first, then build the log, then open the clock. The log file (`service.log`, rotated to `service.log.1`) is added only when the directory is secured. A log handle opened in a weak directory would block its replacement (R78). The host's own `StateDir::secure` returns the outcome of that one call.
+- `SecureOutcome`: not replaced is `Ok`, replaced with the record `Kept` or `Absent` is `Replaced`, `Dropped` is `RestoreDropped` (it only happens on replacement), every `AclError` is `Refused` with a fixed reason class and no path. On `Replaced` and `RestoreDropped` the host logs once at Warn that the previous log, drift and status were discarded (R108). On `Refused` it runs with persistence off.
+- Refusals before anything is touched: an empty `sinks` list (`NoSinks`, the refusal line would be lost), and a process token whose default owner is not SYSTEM or Administrators (`UntrustedAccount`, `AccountUnreadable`, R106). Any other owner makes every file the service writes a wrong-owned child, so every second start would replace the directory and lose the log and the drift.
+- Clock: `WindowsClock` behind `ClockControl`, every call passed through once. Opening it is the only fatal step.
+- Time: monotonic is the unbiased interrupt time (awake only), wall is the precise system time.
+- `w32time` monitor: query rights only, true on any error or a missing service (R85).
+- DHCP: the per-adapter read. Only a real "no option 42" goes to the host's negative cache, never a failed adapter.
+- Network events: a watcher thread waits on the address subscription, sets a flag and wakes the loop. The host reads and clears the flag each turn.
+- Resume: the service control handler calls `ResumeNotifier::notify_resumed` on both `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND`. It sets the flag the host reads and wakes the loop. Notifications within 5 s of the last counted one are one resume (R107). The window is measured in wall time, because monotonic time stops during sleep. A wall clock that went back counts as a new resume.
+- Log file failure: the first time `service.log` cannot be written, the other sinks get one Error line saying so. Later failures only count.
+- Query workers raise their own thread to above normal before each query.
