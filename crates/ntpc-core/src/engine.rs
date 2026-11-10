@@ -5,9 +5,19 @@
 //! events. The engine reads no clock and draws no random numbers, so the
 //! simulator can replay it exactly.
 //!
-//! Host contract. Answer every [`Action::Query`] with exactly one
-//! [`Event::Sample`] or [`Event::Failed`]. Report each clock action through
-//! [`Event::ClockResult`]. Send [`Event::Tick`] at [`Engine::next_wake`].
+//! Host contract:
+//! - Answer every [`Action::Query`] with exactly one [`Event::Sample`] or
+//!   [`Event::Failed`]. Time a query out in well under 30 s. The engine
+//!   closes a round after 30 s and a later reply then counts for nothing.
+//!   [`Event::Failed`] carries no time. The engine stamps it with the latest
+//!   time it has seen, so send a [`Event::Tick`] first when time has moved.
+//! - Report each clock action, in order, through [`Event::ClockResult`].
+//! - [`Event::AdjustmentAllowed`] is a level. Adjustment starts off. Send it
+//!   at start and again whenever the `w32time` or domain-join state is
+//!   checked. A clock failure stops adjustment until the host sends `false`
+//!   and then `true`.
+//! - [`ClockError`] text reaches the log. It must not carry file paths.
+//! - Send [`Event::Tick`] at [`Engine::next_wake`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -71,12 +81,14 @@ pub enum Event {
 /// Output for the host.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// Query one source. `observe_only` marks a probe or a pool cross-check.
-    /// Its sample never feeds the clock.
+    /// Query one source.
     Query {
         /// The source to query.
         source: SourceId,
-        /// True when the source is outside the active tier.
+        /// True when the source's tier is not active as the query is sent:
+        /// a probe, a pool cross-check, or any query while no tier is active.
+        /// The reply never triggers a clock update. It may switch the tier.
+        /// Once its tier is active a later round may still select it.
         observe_only: bool,
     },
     /// Set the clock frequency, absolute from nominal.
@@ -187,6 +199,10 @@ const TIERS: [Tier; 3] = [Tier::Config, Tier::Dhcp, Tier::Pool];
 /// Global Constraints: `DENY` and `RSTR` silence a source for one hour.
 const KOD_QUIET: Duration = Duration::from_secs(3600);
 
+/// Longest interval `RATE` can push a source to. A server that keeps asking
+/// is still heard from once a day.
+const KOD_RATE_MAX: Duration = Duration::from_secs(24 * 3600);
+
 /// Fewer writes to the drift store. A lost save costs at most ten minutes of
 /// learning.
 const DRIFT_SAVE_EVERY: Duration = Duration::from_secs(600);
@@ -194,6 +210,14 @@ const DRIFT_SAVE_EVERY: Duration = Duration::from_secs(600);
 /// A round still open after this long is closed. A lost reply must not stall
 /// its tier, because a tier runs one round at a time.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Smallest offset movement that counts as jitter. A LAN path can give an
+/// error bound well under a millisecond, while Windows timestamps and
+/// scheduling still move a reading by a few milliseconds. Below this floor
+/// that noise would pin the poll at its minimum.
+const JITTER_FLOOR: Duration = Duration::from_millis(5);
+
+const PPM_PER_UNIT: f64 = 1e-6;
 
 fn slot(tier: Tier) -> usize {
     match tier {
@@ -218,6 +242,7 @@ struct Source {
     /// Raised by `RATE`. Shortest gap between two queries of this source.
     rate_floor: Duration,
     last_query: Option<Mono>,
+    prev_query: Option<Mono>,
 }
 
 impl Source {
@@ -228,6 +253,7 @@ impl Source {
             quiet_until: None,
             rate_floor: Duration::ZERO,
             last_query: None,
+            prev_query: None,
         }
     }
 
@@ -245,9 +271,36 @@ impl Source {
 struct Round {
     started: Mono,
     waiting: Vec<SourceId>,
-    /// A new sample arrived. Without one the round only judges the tier,
-    /// or the loop would be fed the same offset twice.
-    fresh: bool,
+    /// Sent while the tier was not active. Such a round may switch the
+    /// tier but never feeds the clock.
+    observe_only: bool,
+    /// Sent before a resume. Its replies hold the sleep and are dropped.
+    stale: bool,
+}
+
+/// Who may move the clock. The host's wish is a level. A clock failure is a
+/// latch that only a host `false` clears, so a re-sent `true` cannot retry a
+/// command that just failed.
+#[derive(Debug, Clone, Copy, Default)]
+struct Gate {
+    host: bool,
+    failed: bool,
+}
+
+impl Gate {
+    fn open(self) -> bool {
+        self.host && !self.failed
+    }
+}
+
+/// Whether the last step reached the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepState {
+    Idle,
+    /// A step was sent. The next clock result is its outcome.
+    Awaiting,
+    /// The step failed. A re-enable allows one more.
+    Failed,
 }
 
 /// The NTP client engine.
@@ -259,20 +312,37 @@ pub struct Engine {
     sources: BTreeMap<SourceId, Source>,
     rounds: [Option<Round>; 3],
     last_round: [Option<Mono>; 3],
+    /// When each tier was last observed. The chooser measures its reprobe
+    /// interval from here, so `next_wake` must too.
+    last_observed: [Option<Mono>; 3],
     /// Start a round of this tier at the next chance.
     recheck: [bool; 3],
+    /// Tiers that failed since the idle poll last doubled.
+    idle_failed: [bool; 3],
     /// Latest time seen. It never goes back.
     now: Mono,
     started: bool,
     /// Poll interval of the active tier, or of every tier while none is.
     poll: Duration,
-    prev_offset: Option<Offset>,
-    allowed: bool,
+    /// Previous selected offset and when it was taken.
+    prev_offset: Option<(Offset, Mono)>,
+    gate: Gate,
+    step: StepState,
     /// A frequency the host has not been sent yet.
     pending_frequency: Option<Ppm>,
+    /// Slew part of the frequency in effect, in ppm. Zero while the clock
+    /// is not steered.
+    slew_ppm: f64,
+    /// When the frequency last changed. Samples from before it measured a
+    /// clock that has moved since, so they cannot decide a step.
+    freq_changed_at: Option<Mono>,
     /// When the loop last set the frequency. Starts the `MAX_HOLD` window.
     held_since: Option<Mono>,
     holdover: bool,
+    /// Newest sample time that fed the loop. One sample feeds it once.
+    last_used: Option<Mono>,
+    /// Set while the loop refuses steps, so the refusal logs once.
+    refusing: Option<Mono>,
     last_offset: Option<Offset>,
     last_good: Option<Mono>,
     saved_drift: Ppm,
@@ -283,33 +353,40 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// A new engine. `drift` is the saved drift, if any. The first event
-    /// sets the clock frequency to it.
+    /// A new engine. `drift` is the saved drift, if any. Adjustment starts
+    /// off. `AdjustmentAllowed(true)` sets the frequency to the drift.
     #[must_use]
     pub fn new(mut cfg: EngineConfig, drift: Option<Ppm>) -> Self {
         // A zero poll would query without pause.
         cfg.min_poll = cfg.min_poll.max(Duration::from_secs(1));
         cfg.max_poll = cfg.max_poll.max(cfg.min_poll);
         let discipline = Discipline::new(cfg.discipline, drift);
-        let start = discipline.drift();
+        let saved_drift = discipline.drift();
         Self {
             tiers: TierChooser::new(cfg.tier),
             discipline,
             sources: BTreeMap::new(),
             rounds: [None, None, None],
             last_round: [None; 3],
+            last_observed: [None; 3],
             recheck: [false; 3],
+            idle_failed: [false; 3],
             now: Mono::from_nanos(0),
             started: false,
             poll: cfg.min_poll,
             prev_offset: None,
-            allowed: true,
-            pending_frequency: Some(start),
+            gate: Gate::default(),
+            step: StepState::Idle,
+            pending_frequency: None,
+            slew_ppm: 0.0,
+            freq_changed_at: None,
             held_since: None,
             holdover: false,
+            last_used: None,
+            refusing: None,
             last_offset: None,
             last_good: None,
-            saved_drift: start,
+            saved_drift,
             saved_at: None,
             resumed_at: None,
             single_logged: None,
@@ -335,12 +412,14 @@ impl Engine {
             Event::Failed(id, why) => self.on_failed(id, why, &mut out),
             Event::SourcesChanged(specs) => self.on_sources(specs, &mut out),
             Event::Resumed(at) => self.on_resumed(at),
-            Event::AdjustmentAllowed(yes) => self.on_allowed(yes, &mut out),
-            Event::ClockResult(Ok(())) => {}
-            Event::ClockResult(Err(error)) => {
-                out.push(Action::Log(LogEvent::ClockCommandFailed { error }));
-                self.disable(DisableReason::ClockFailed, &mut out);
+            Event::AdjustmentAllowed(yes) => {
+                // A host `false` also clears a clock failure. That is how
+                // the host re-arms the engine.
+                let failed = self.gate.failed && yes;
+                let gate = Gate { host: yes, failed };
+                self.set_gate(gate, DisableReason::Host, &mut out);
             }
+            Event::ClockResult(result) => self.on_clock_result(result, &mut out),
         }
         self.maintain(&mut out);
         out
@@ -355,6 +434,7 @@ impl Engine {
         if !self.started {
             return Some(now);
         }
+        let reprobe = self.cfg.tier.reprobe_every;
         let mut wake: Vec<Option<Mono>> = vec![now.checked_add(self.cfg.max_poll)];
         for round in self.rounds.iter().flatten() {
             wake.push(round.started.checked_add(ROUND_TIMEOUT));
@@ -365,19 +445,20 @@ impl Engine {
                 wake.push(self.due_at(active, self.poll));
                 let probe = self.tiers.due_probe(now);
                 for t in TIERS.into_iter().filter(|&t| t < active) {
-                    let every = if probe == Some(t) {
-                        self.cfg.min_poll
-                    } else {
-                        self.cfg.tier.reprobe_every
-                    };
-                    wake.push(self.due_at(t, every));
+                    if probe == Some(t) {
+                        wake.push(self.due_at(t, self.cfg.min_poll));
+                    } else if self.rounds[slot(t)].is_none() {
+                        // Same clock as `due_probe`: the last observation.
+                        let seen = self.last_observed[slot(t)];
+                        wake.push(seen.map_or(Some(now), |s| s.checked_add(reprobe)));
+                    }
                 }
                 if active != Tier::Pool {
-                    wake.push(self.due_at(Tier::Pool, self.cfg.tier.reprobe_every));
+                    wake.push(self.due_at(Tier::Pool, reprobe));
                 }
             }
         }
-        if self.allowed {
+        if self.gate.open() {
             wake.push(self.held_since.and_then(|t| t.checked_add(MAX_HOLD)));
         }
         if self.discipline.drift() != self.saved_drift {
@@ -403,7 +484,7 @@ impl Engine {
                 .last_good
                 .map(|t| self.now.saturating_duration_since(t)),
             holdover: self.holdover,
-            adjustment_allowed: self.allowed,
+            adjustment_allowed: self.gate.open(),
         }
     }
 
@@ -411,35 +492,52 @@ impl Engine {
         self.now = self.now.max(at);
     }
 
+    fn round_of(&self, id: SourceId) -> Option<&Round> {
+        self.rounds
+            .iter()
+            .flatten()
+            .find(|r| r.waiting.contains(&id))
+    }
+
     fn on_sample(&mut self, s: Sample, out: &mut Vec<Action>) {
         self.advance(s.at);
-        // A reply measured before a resume holds the suspend error.
-        if self.resumed_at.is_some_and(|r| s.at < r) {
+        if !self.sources.contains_key(&s.source) {
             return;
         }
-        let Some(src) = self.sources.get_mut(&s.source) else {
-            return;
-        };
-        src.filter.push(s);
-        self.answered(s.source, true, out);
+        // A reply measured across a sleep holds the suspend error.
+        let stale = self.resumed_at.is_some_and(|r| s.at < r)
+            || self.round_of(s.source).is_some_and(|r| r.stale);
+        if !stale && let Some(src) = self.sources.get_mut(&s.source) {
+            src.filter.push(s);
+        }
+        // Dropped or kept, the reply ends its wait.
+        self.answered(s.source, out);
     }
 
     fn on_failed(&mut self, id: SourceId, why: QueryFailure, out: &mut Vec<Action>) {
-        let now = self.now;
-        let Some(src) = self.sources.get_mut(&id) else {
+        let Some(tier) = self.sources.get(&id).map(|s| s.spec.tier) else {
             return;
         };
-        if let QueryFailure::KissOfDeath(code) = why {
+        let scheduled = self.interval_of(tier);
+        if let QueryFailure::KissOfDeath(code) = why
+            && let Some(src) = self.sources.get_mut(&id)
+        {
             let wait = match code {
                 KodCode::Deny | KodCode::Rstr => {
-                    src.quiet_until = Some(later(now, KOD_QUIET));
+                    src.quiet_until = Some(later(self.now, KOD_QUIET));
                     KOD_QUIET
                 }
                 // An unknown code is treated as RATE. Slowing down is the
                 // safe answer to a server that complains.
                 KodCode::Rate | KodCode::Other => {
-                    let doubled = src.rate_floor.max(self.poll).saturating_mul(2);
-                    src.rate_floor = doubled.min(self.cfg.max_poll);
+                    // The source's own last interval. A probe or a cross-check
+                    // runs slower than the engine poll.
+                    let own = match (src.prev_query, src.last_query) {
+                        (Some(p), Some(l)) => l.saturating_duration_since(p),
+                        _ => scheduled,
+                    };
+                    let doubled = own.max(src.rate_floor).saturating_mul(2);
+                    src.rate_floor = doubled.min(KOD_RATE_MAX);
                     src.rate_floor
                 }
             };
@@ -449,7 +547,18 @@ impl Engine {
                 wait,
             }));
         }
-        self.answered(id, false, out);
+        self.answered(id, out);
+    }
+
+    /// The interval at which the engine queries a tier now.
+    fn interval_of(&self, tier: Tier) -> Duration {
+        match self.tiers.active() {
+            None => self.poll,
+            Some(a) if a == tier => self.poll,
+            // Below the active tier only the pool cross-check runs.
+            Some(a) if tier > a => self.cfg.tier.reprobe_every,
+            Some(_) => self.cfg.min_poll,
+        }
     }
 
     fn on_sources(&mut self, specs: Vec<SourceSpec>, out: &mut Vec<Action>) {
@@ -490,7 +599,7 @@ impl Engine {
         for t in TIERS {
             self.recheck[slot(t)] |= changed[slot(t)];
         }
-        if self.tiers.active().is_some_and(|a| changed[slot(a)]) {
+        if self.tiers.active().is_none_or(|a| changed[slot(a)]) {
             self.poll = self.cfg.min_poll;
         }
         self.log_dhcp_difference(out);
@@ -505,33 +614,56 @@ impl Engine {
         for src in self.sources.values_mut() {
             src.filter = SourceFilter::new();
         }
-        self.rounds = [None, None, None];
+        // Open rounds stay open so their replies still end a wait. Their
+        // samples are dropped and a new round follows each one.
+        for round in self.rounds.iter_mut().flatten() {
+            round.stale = true;
+        }
         self.last_round = [None; 3];
         self.recheck = [true; 3];
         self.poll = self.cfg.min_poll;
         self.prev_offset = None;
     }
 
-    fn on_allowed(&mut self, yes: bool, out: &mut Vec<Action>) {
-        if yes == self.allowed {
+    fn on_clock_result(&mut self, result: Result<(), ClockError>, out: &mut Vec<Action>) {
+        let after_step = self.step == StepState::Awaiting;
+        self.step = StepState::Idle;
+        let Err(error) = result else {
             return;
+        };
+        if after_step {
+            self.step = StepState::Failed;
         }
-        if yes {
-            self.allowed = true;
-            // The loop did not steer the clock meanwhile. Start from the
-            // learned drift, not from a stale phase term.
-            self.pending_frequency = Some(self.free_run());
-            self.held_since = None;
-            out.push(Action::Log(LogEvent::AdjustmentEnabled));
-        } else {
-            self.disable(DisableReason::Host, out);
-        }
+        out.push(Action::Log(LogEvent::ClockCommandFailed { error }));
+        let gate = Gate {
+            failed: true,
+            ..self.gate
+        };
+        self.set_gate(gate, DisableReason::ClockFailed, out);
     }
 
-    fn disable(&mut self, reason: DisableReason, out: &mut Vec<Action>) {
-        if self.allowed {
-            self.allowed = false;
-            out.push(Action::Log(LogEvent::AdjustmentDisabled { reason }));
+    fn set_gate(&mut self, gate: Gate, reason: DisableReason, out: &mut Vec<Action>) {
+        let was = self.gate.open();
+        self.gate = gate;
+        match (was, gate.open()) {
+            (true, false) => {
+                self.slew_ppm = 0.0;
+                out.push(Action::Log(LogEvent::AdjustmentDisabled { reason }));
+            }
+            (false, true) => {
+                // The loop did not steer the clock meanwhile. Start from the
+                // learned drift, not from a stale phase term.
+                let f = self.free_run();
+                self.change_frequency(f);
+                self.held_since = None;
+                if self.step == StepState::Failed {
+                    // The step never reached the clock. Allow it again.
+                    self.discipline.note_resume();
+                    self.step = StepState::Idle;
+                }
+                out.push(Action::Log(LogEvent::AdjustmentEnabled));
+            }
+            _ => {}
         }
     }
 
@@ -550,7 +682,7 @@ impl Engine {
         self.check_hold(out);
         self.save_drift(out);
         self.log_single_source(out);
-        if self.allowed {
+        if self.gate.open() {
             out.extend(self.pending_frequency.take().map(Action::SetFrequency));
         }
     }
@@ -610,6 +742,7 @@ impl Engine {
         let mut waiting = Vec::new();
         for src in self.sources.values_mut() {
             if src.spec.tier == tier && src.may_query(now) {
+                src.prev_query = src.last_query;
                 src.last_query = Some(now);
                 waiting.push(src.spec.id);
                 out.push(Action::Query {
@@ -624,14 +757,15 @@ impl Engine {
         self.rounds[i] = Some(Round {
             started: now,
             waiting,
-            fresh: false,
+            observe_only,
+            stale: false,
         });
         if empty {
             self.close_round(tier, out);
         }
     }
 
-    fn answered(&mut self, id: SourceId, fresh: bool, out: &mut Vec<Action>) {
+    fn answered(&mut self, id: SourceId, out: &mut Vec<Action>) {
         for t in TIERS {
             let Some(round) = self.rounds[slot(t)].as_mut() else {
                 continue;
@@ -640,7 +774,6 @@ impl Engine {
                 continue;
             };
             round.waiting.swap_remove(pos);
-            round.fresh |= fresh;
             if round.waiting.is_empty() {
                 self.close_round(t, out);
             }
@@ -652,19 +785,43 @@ impl Engine {
         let Some(round) = self.rounds[slot(tier)].take() else {
             return;
         };
-        let sel = self.select_tier(tier);
+        if round.stale {
+            // The resume set a recheck, so a fresh round follows.
+            return;
+        }
+        let picked = self.select_in(tier, self.cfg.selection.max_age);
         let before = self.tiers.active();
         // Lower tiers are never observed. The pool cross-check is such a
         // tier. Its samples only veto steps.
         if before.is_none_or(|a| tier <= a) {
-            self.tiers.observe(tier, sel.is_some(), self.now);
+            self.tiers.observe(tier, picked.is_some(), self.now);
+            self.last_observed[slot(tier)] = Some(self.now);
             self.note_tier_change(before, out);
+            if before.is_none() && self.tiers.active().is_none() {
+                self.back_off_idle(tier, picked.is_some());
+            }
         }
-        if round.fresh
+        // A switch made by observe-only samples does not feed the clock. The
+        // next regular round of the tier does.
+        if !round.observe_only
             && self.tiers.active() == Some(tier)
-            && let Some(sel) = sel
+            && let Some(p) = picked
         {
-            self.update(tier, &sel, out);
+            self.update(tier, &p, out);
+        }
+    }
+
+    /// While no tier works, every tier failing in turn doubles the poll, so
+    /// an offline machine does not query every minute forever.
+    fn back_off_idle(&mut self, tier: Tier, usable: bool) {
+        if usable {
+            self.idle_failed = [false; 3];
+            return;
+        }
+        self.idle_failed[slot(tier)] = true;
+        if self.idle_failed.iter().all(|&f| f) {
+            self.poll = self.poll.saturating_mul(2).min(self.cfg.max_poll);
+            self.idle_failed = [false; 3];
         }
     }
 
@@ -677,46 +834,95 @@ impl Engine {
             }));
             self.poll = self.cfg.min_poll;
             self.prev_offset = None;
+            self.idle_failed = [false; 3];
         }
     }
 
-    /// Selection inside one tier only. Tiers are never mixed.
-    fn select_tier(&self, tier: Tier) -> Option<Selection> {
-        let max_age = self.cfg.selection.max_age;
+    /// Selection inside one tier only. Tiers are never mixed. Returns the
+    /// oldest and newest sample time among the survivors too.
+    fn select_in(&self, tier: Tier, max_age: Duration) -> Option<Picked> {
         let samples: Vec<Sample> = self
             .sources
             .values()
             .filter(|s| s.spec.tier == tier)
             .filter_map(|s| s.filter.best_fresh(self.now, max_age))
             .collect();
-        select(&samples, self.now, &self.cfg.selection)
+        let sel = select(&samples, self.now, &self.cfg.selection)?;
+        let times = || {
+            samples
+                .iter()
+                .filter(|s| sel.survivors.contains(&s.source))
+                .map(|s| s.at)
+        };
+        let (oldest, newest) = (times().min()?, times().max()?);
+        Some(Picked {
+            sel,
+            oldest,
+            newest,
+        })
     }
 
+    /// Pool samples taken since the last frequency change and within
+    /// `reprobe_every`. Older ones measured a clock that has moved since.
     fn cross_check(&self, tier: Tier) -> CrossCheck {
         if tier == Tier::Pool {
             return CrossCheck::NotRequired;
         }
+        let mut max_age = self.cfg.selection.max_age.min(self.cfg.tier.reprobe_every);
+        if let Some(changed) = self.freq_changed_at {
+            // `best_fresh` keeps ages up to `max_age`. One nanosecond less
+            // keeps only samples strictly after the change.
+            match self
+                .now
+                .saturating_duration_since(changed)
+                .checked_sub(Duration::from_nanos(1))
+            {
+                Some(since) => max_age = max_age.min(since),
+                None => return CrossCheck::Pending,
+            }
+        }
         // Pool servers that cannot agree give no answer, so the step waits.
-        self.select_tier(Tier::Pool)
-            .map_or(CrossCheck::Pending, |s| CrossCheck::Offset(s.offset))
+        self.select_in(Tier::Pool, max_age)
+            .map_or(CrossCheck::Pending, |p| CrossCheck::Offset(p.sel.offset))
     }
 
-    fn update(&mut self, tier: Tier, sel: &Selection, out: &mut Vec<Action>) {
+    fn update(&mut self, tier: Tier, p: &Picked, out: &mut Vec<Action>) {
+        let sel = &p.sel;
+        // `Discipline` returns `Correction::None` for this. Nothing about it
+        // is a measurement.
+        if !sel.offset.as_secs().is_finite() {
+            return;
+        }
+        // The same stored sample must not feed the loop twice.
+        if self.last_used.is_some_and(|u| p.newest <= u) {
+            return;
+        }
+        self.last_used = Some(p.newest);
         self.adapt_poll(sel);
         self.last_offset = Some(sel.offset);
         self.last_good = Some(self.now);
         self.holdover = false;
         // Measure only. The loop would learn from offsets it never corrects.
-        if !self.allowed {
+        if !self.gate.open() {
             return;
         }
-        let cross = self.cross_check(tier);
+        let measured_since_change = self.freq_changed_at.is_none_or(|c| p.oldest > c);
+        let cross = if measured_since_change {
+            self.cross_check(tier)
+        } else {
+            CrossCheck::Pending
+        };
         match self.discipline.update(sel, cross, self.now) {
             Correction::None => {}
-            Correction::SetFrequency(f) => self.set_frequency(f),
+            Correction::SetFrequency(f) => {
+                self.refusing = None;
+                self.set_frequency(f);
+            }
             Correction::Step { offset, frequency } => {
                 out.push(Action::Step(offset));
                 out.push(Action::Log(LogEvent::StepTaken { offset }));
+                self.step = StepState::Awaiting;
+                self.refusing = None;
                 self.set_frequency(frequency);
                 // Every stored sample predates the step and is now wrong by it.
                 for src in self.sources.values_mut() {
@@ -725,30 +931,46 @@ impl Engine {
                 self.prev_offset = None;
             }
             Correction::RefuseStep { offset, frequency } => {
-                out.push(Action::Log(LogEvent::StepRefused { offset }));
+                if self.refusing.is_none() {
+                    out.push(Action::Log(LogEvent::StepRefused { offset }));
+                }
+                self.refusing = Some(self.now);
                 self.set_frequency(frequency);
             }
         }
     }
 
     /// Poll fast while the offset moves more than its error bound explains.
-    /// Double the interval while it holds still.
+    /// Double the interval while it holds still. The slew the engine applied
+    /// since the last reading is expected movement, not jitter.
     fn adapt_poll(&mut self, sel: &Selection) {
         let x = sel.offset.as_secs();
         let big = x.abs() > self.cfg.discipline.step_threshold.as_secs_f64();
-        let jumpy = self
-            .prev_offset
-            .is_some_and(|p| (x - p.as_secs()).abs() > sel.error_bound.as_secs_f64());
+        let limit = sel.error_bound.max(JITTER_FLOOR).as_secs_f64();
+        let jumpy = self.prev_offset.is_some_and(|(prev, at)| {
+            let dt = self.now.saturating_duration_since(at).as_secs_f64();
+            // A positive slew closes a positive offset.
+            let expected = prev.as_secs() - self.slew_ppm * PPM_PER_UNIT * dt;
+            (x - expected).abs() > limit
+        });
         if big || jumpy {
             self.poll = self.cfg.min_poll;
         } else if self.prev_offset.is_some() {
             self.poll = self.poll.saturating_mul(2).min(self.cfg.max_poll);
         }
-        self.prev_offset = Some(sel.offset);
+        self.prev_offset = Some((sel.offset, self.now));
+    }
+
+    fn change_frequency(&mut self, f: Ppm) {
+        self.pending_frequency = Some(f);
+        self.freq_changed_at = Some(self.now);
+        // The drift part only holds the clock's own error. The rest moves
+        // the offset.
+        self.slew_ppm = f.value() - self.discipline.drift().value();
     }
 
     fn set_frequency(&mut self, f: Ppm) {
-        self.pending_frequency = Some(f);
+        self.change_frequency(f);
         self.held_since = Some(self.now);
     }
 
@@ -763,11 +985,11 @@ impl Engine {
         let expired = self
             .held_since
             .is_some_and(|t| self.now.saturating_duration_since(t) >= MAX_HOLD);
-        if !self.allowed || !expired {
+        if !self.gate.open() || !expired {
             return;
         }
         let frequency = self.free_run();
-        self.pending_frequency = Some(frequency);
+        self.change_frequency(frequency);
         self.held_since = None;
         self.holdover = true;
         out.push(Action::Log(LogEvent::HoldoverStarted { frequency }));
@@ -818,7 +1040,8 @@ impl Engine {
                 .map(|s| s.spec.id)
                 .collect()
         };
-        let diff = (!dhcp.is_empty() && config != dhcp)
+        // With no config servers there is nothing to differ from.
+        let diff = (!config.is_empty() && !dhcp.is_empty() && config != dhcp)
             .then(|| (only(Tier::Dhcp, &config), only(Tier::Config, &dhcp)));
         if diff != self.dhcp_logged {
             if let Some((dhcp_only, config_only)) = diff.clone() {
@@ -830,6 +1053,14 @@ impl Engine {
             self.dhcp_logged = diff;
         }
     }
+}
+
+/// A selection with the time span of the samples behind it.
+#[derive(Debug, Clone)]
+struct Picked {
+    sel: Selection,
+    oldest: Mono,
+    newest: Mono,
 }
 
 #[cfg(test)]
