@@ -7,9 +7,27 @@
 //! The ignored tests stop, disable and restore the real `w32time`. Run them
 //! only on a throwaway VM, elevated, with `NTPC_ALLOW_SERVICE_TESTS=1` and
 //! `NTPC_I_AM_ON_A_VM=1`. A drop guard puts the original start type and run
-//! state back, also when a test panics.
+//! state back, also when a test panics. A shared lock serialises them: the
+//! lock is taken before the original state is read and released after the
+//! guard has restored it, so parallel test threads cannot see each other's
+//! changes.
+//!
+//! Owner VM checklist: do not press Ctrl+C during a test (the guard does not
+//! run on a killed process). Run once from each of three starting states:
+//! Manual stopped, Manual running, `AutomaticDelayed` running. Compare the
+//! output of `sc qc w32time` and `sc query w32time` before and after.
 
 use super::*;
+
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Serialises the mutating tests (N1).
+static SCM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Poison tolerant: a panicked test already ran its guard.
+fn scm_lock() -> MutexGuard<'static, ()> {
+    SCM_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[test]
 fn live_query_of_w32time_is_sane_or_a_clean_error() {
@@ -81,6 +99,8 @@ impl Drop for Guard {
 #[ignore = "stops and disables the real w32time: throwaway VM only"]
 fn admin_take_over_and_restore_round_trip() {
     require_vm_and_admin();
+    // Declared first, so it drops last: after the guard restored w32time.
+    let _lock = scm_lock();
     let mut ctl = ScmControl;
     let before = ctl.query(W32TIME).unwrap();
     let _guard = Guard(before);
@@ -112,6 +132,8 @@ fn admin_take_over_and_restore_round_trip() {
 #[ignore = "changes the real w32time start type: throwaway VM only"]
 fn admin_every_start_type_round_trips() {
     require_vm_and_admin();
+    // Declared first, so it drops last: after the guard restored w32time.
+    let _lock = scm_lock();
     let mut ctl = ScmControl;
     let before = ctl.query(W32TIME).unwrap();
     let _guard = Guard(before);

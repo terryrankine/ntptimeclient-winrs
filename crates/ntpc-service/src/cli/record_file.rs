@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use ntpc_platform::w32time::Restore;
 
-use super::{LoadError, RecordStore, SecureRefusal, TrustFailure};
+use super::{DirState, LoadError, RecordStore, SecureRefusal, TrustFailure};
 use crate::safe_open;
 
 /// Name of the restore record in the state directory.
@@ -110,18 +110,39 @@ fn check_provenance(file: &fs::File, check_owner: bool) -> Result<(), LoadError>
     }
 }
 
+/// The fate of the restore record after securing (N2). A record existed and
+/// failed the provenance checks: it sits in the quarantine, and nobody may
+/// act as if there were no record (R86).
+///
+/// # Errors
+/// [`SecureRefusal::RecordDropped`] for [`ntpc_platform::RestoreRecord::Dropped`].
+#[cfg(windows)]
+pub fn check_secured(r: ntpc_platform::RestoreRecord) -> Result<(), SecureRefusal> {
+    use ntpc_platform::RestoreRecord;
+    match r {
+        RestoreRecord::Dropped => Err(SecureRefusal::RecordDropped),
+        RestoreRecord::Kept | RestoreRecord::Absent => Ok(()),
+    }
+}
+
 impl RecordStore for FileRecordStore {
+    /// No create, no follow: `symlink_metadata` on the path and its parent.
+    /// Any answer but "not found" is `Present`, so `secure` decides.
+    fn dir_state(&self) -> DirState {
+        match fs::symlink_metadata(&self.dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match self.dir.parent() {
+                Some(parent) if fs::symlink_metadata(parent).is_err() => DirState::ParentMissing,
+                _ => DirState::Missing,
+            },
+            _ => DirState::Present,
+        }
+    }
+
     #[cfg(windows)]
     fn secure(&mut self) -> Result<(), SecureRefusal> {
-        use ntpc_platform::RestoreRecord;
         let secured = ntpc_platform::secure_state_dir(&self.dir)
             .map_err(|e| super::classify_acl_error(&e))?;
-        match secured.restore_record {
-            // A record existed and failed the provenance checks. It sits in
-            // the quarantine. Install must not record a new original (R86).
-            RestoreRecord::Dropped => Err(SecureRefusal::RecordDropped),
-            RestoreRecord::Kept | RestoreRecord::Absent => Ok(()),
-        }
+        check_secured(secured.restore_record)
     }
 
     #[cfg(not(windows))]
@@ -389,5 +410,36 @@ mod tests {
             FileRecordStore::without_owner_check(&d.0).load(),
             Err(LoadError::NotTrusted(TrustFailure::TooLarge))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn check_secured_refuses_only_a_dropped_record() {
+        use ntpc_platform::RestoreRecord;
+        assert_eq!(check_secured(RestoreRecord::Kept), Ok(()));
+        assert_eq!(check_secured(RestoreRecord::Absent), Ok(()));
+        assert_eq!(
+            check_secured(RestoreRecord::Dropped),
+            Err(SecureRefusal::RecordDropped)
+        );
+    }
+
+    #[test]
+    fn dir_state_tells_present_missing_and_parent_missing_apart() {
+        let d = TempDir::new("dirstate");
+        assert_eq!(FileRecordStore::new(&d.0).dir_state(), DirState::Present);
+        let missing = d.0.join("state");
+        assert_eq!(
+            FileRecordStore::new(&missing).dir_state(),
+            DirState::Missing
+        );
+        let deep = d.0.join("no-parent").join("state");
+        assert_eq!(
+            FileRecordStore::new(&deep).dir_state(),
+            DirState::ParentMissing
+        );
+        // Looking created nothing.
+        assert!(!missing.exists());
+        assert!(!d.0.join("no-parent").exists());
     }
 }
