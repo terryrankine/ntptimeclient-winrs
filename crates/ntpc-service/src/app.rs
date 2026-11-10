@@ -51,12 +51,15 @@ pub mod exit {
     pub const RUN_FAILED: u8 = 28;
     /// `service`: the dispatcher failed for another reason.
     pub const SERVICE_FAILED: u8 = 29;
-    /// `run`: our service is running (or its state cannot be read). Two
-    /// instances must never adjust one clock.
+    /// `run`: another instance holds the instance lock (R111), or our
+    /// service is running, or its state cannot be read. Two instances must
+    /// never adjust one clock.
     pub const RUN_CONFLICT: u8 = 30;
+    /// `run`: the config file can be changed by a non-administrator (I1).
+    pub const RUN_LOCATION: u8 = 32;
 
     /// Every code here, for tests.
-    pub const ALL: [u8; 9] = [
+    pub const ALL: [u8; 10] = [
         STATUS_MISSING,
         STATUS_INVALID,
         STATUS_DENIED,
@@ -66,6 +69,7 @@ pub mod exit {
         RUN_FAILED,
         SERVICE_FAILED,
         RUN_CONFLICT,
+        RUN_LOCATION,
     ];
 }
 

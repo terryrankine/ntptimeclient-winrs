@@ -495,14 +495,21 @@ fn install_starts_our_service_after_registering() {
 }
 
 #[test]
-fn a_failed_start_keeps_the_install_and_says_so() {
+fn a_failed_start_puts_w32time_back_and_keeps_the_registration() {
+    // R109: the service never reached RUNNING, so this machine would have
+    // no time sync. w32time comes back, our registration stays.
     let mut w = World::new(JoinState::Workgroup);
-    w.reg.start_error = Some("access denied".to_owned());
+    w.reg.start_error = Some(
+        "the service stopped right after it started (exit code 1066, service exit code 8)"
+            .to_owned(),
+    );
     assert_eq!(w.install(SILENT), exit::START_FAILED);
-    // Installed: registration kept, w32time stays taken over.
     assert!(w.reg.registered);
-    assert_eq!(w.w32time(), taken_over());
-    assert!(w.host.text().contains("next boot"), "{}", w.host.text());
+    assert_eq!(w.w32time(), original());
+    assert_eq!(w.store.saved(), None, "record removed after the put back");
+    let t = w.host.text();
+    assert!(t.contains("service exit code 8"), "{t}");
+    assert!(t.contains("w32time was put back"), "{t}");
 }
 
 #[test]
@@ -511,4 +518,18 @@ fn a_register_failure_never_starts_anything() {
     w.reg.register_error = Some("create failed".to_owned());
     assert_eq!(w.install(SILENT), exit::REGISTER_FAILED);
     assert_eq!(w.reg.start_calls, 0);
+}
+
+#[test]
+fn a_foreign_service_or_untrusted_owner_refuses_before_any_change() {
+    for (foreign, owner, code) in [
+        (true, false, exit::FOREIGN_SERVICE),
+        (false, true, exit::TOKEN_OWNER),
+    ] {
+        let mut w = World::new(JoinState::Workgroup);
+        w.reg.foreign = foreign;
+        w.reg.bad_owner = owner;
+        assert_eq!(w.install(SILENT), code);
+        assert!(w.untouched());
+    }
 }

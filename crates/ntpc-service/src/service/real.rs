@@ -2,11 +2,14 @@
 //! `service.rs` and tested there with fakes. Nothing here runs in a test,
 //! because a test process is not started by the SCM.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
 use ntpc_platform::service_host::{RawStatus, StatusHandle, register_handler, set_status};
 
-use super::{Controller, Report, ServiceRun, StatusApi, Timing, new_core, raw, run_service};
+use super::{
+    Controller, Report, ServiceRun, StatusApi, Timing, new_core, raw, run_service, service_exit,
+};
 use crate::registration::SERVICE_NAME;
 
 /// `SetServiceStatus` through the handle the handler registration gave.
@@ -41,15 +44,46 @@ pub fn service_main(make: impl FnOnce() -> ServiceRun) {
         s.get()
             .map_or(raw::NO_ERROR, |c| c.handle(control, event_type))
     });
-    let Ok(handle) = register_handler(SERVICE_NAME, handler) else {
-        // No status handle: nothing can be reported. Returning lets the
-        // dispatcher end, and the SCM sees the process exit.
-        return;
+    let handle = match register_handler(SERVICE_NAME, handler) {
+        Ok(h) => h,
+        Err(e) => {
+            // M1: no status handle, so no STOPPED can be reported. Say why
+            // in the Event Log. Returning lets the dispatcher end, and the
+            // SCM sees the process exit (a crash for the failure actions).
+            report_direct(&format!(
+                "cannot start: registering the service control handler failed with OS error \
+                 {}",
+                e.raw_os_error().unwrap_or(-1)
+            ));
+            return;
+        }
     };
     let core = new_core(Arc::new(ScmStatus(handle)), Timing::default());
     let _ = slot.set(core.controller.clone());
     core.reporter.start_pending();
-    let run = make();
-    // The code went out with SERVICE_STOPPED. Nothing more may run.
-    let _ = run_service(core, run);
+    let reporter = core.reporter.clone();
+    // M1: a panic while building the run or inside it must still end in
+    // one STOPPED report with a code, not in a silent hang.
+    if let Ok(run) = catch_unwind(AssertUnwindSafe(make)) {
+        if catch_unwind(AssertUnwindSafe(|| run_service(core, run))).is_err() {
+            report_direct("the service wrapper panicked while running");
+            reporter.stopped(service_exit::INTERNAL);
+        }
+    } else {
+        report_direct("cannot start: building the service run panicked");
+        reporter.stopped(service_exit::INTERNAL);
+    }
+}
+
+/// One Event Log line written straight through the API, for the paths
+/// where the normal logger does not exist.
+fn report_direct(text: &str) {
+    if let Ok(api) = crate::event_log::RealEventApi::open() {
+        use crate::event_log::EventApi;
+        let _ = api.report(
+            crate::event_log::TYPE_ERROR,
+            crate::event_log::ID_ERROR,
+            &crate::event_log::event_text(text),
+        );
+    }
 }

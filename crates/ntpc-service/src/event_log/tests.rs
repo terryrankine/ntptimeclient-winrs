@@ -65,7 +65,7 @@ fn levels_map_to_types_and_ids_and_debug_is_dropped() {
 
 #[test]
 fn event_ids_are_in_the_message_file_range() {
-    for id in [ID_INFO, ID_WARN, ID_ERROR, ID_SERVICE] {
+    for id in [ID_INFO, ID_WARN, ID_ERROR] {
         assert!((1..=1000).contains(&id), "{id}");
     }
 }
@@ -94,7 +94,7 @@ fn sink_writes_through_the_api_on_its_thread() {
     let sink = EventLogSink::start(Box::new(api)).unwrap();
     sink.write_line(LINE_WARN);
     sink.write_line("2026-11-10T12:34:56.789Z DEBUG nope");
-    sink.event(TYPE_INFORMATION, ID_SERVICE, "service running");
+    sink.write_line("2026-11-10T12:34:56.789Z INFO  service running");
     assert!(sink.drain(Duration::from_secs(5)));
     let e = events.lock().unwrap().clone();
     assert_eq!(
@@ -105,7 +105,7 @@ fn sink_writes_through_the_api_on_its_thread() {
                 ID_WARN,
                 "a source sent kiss-of-death RATE".to_owned()
             ),
-            (TYPE_INFORMATION, ID_SERVICE, "service running".to_owned()),
+            (TYPE_INFORMATION, ID_INFO, "service running".to_owned()),
         ]
     );
     assert_eq!(sink.counts().written.load(Ordering::Relaxed), 2);
