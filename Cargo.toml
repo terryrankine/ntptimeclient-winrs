@@ -15,6 +15,9 @@ publish = false
 thiserror = "2"
 ntpc-core = { path = "crates/ntpc-core" }
 ntpc-platform = { path = "crates/ntpc-platform" }
+# Packet parser only. Every public item sits behind `__internal-api`, so the
+# exact pin forces a review of each bump (Task 1 note).
+ntp-proto = { version = "=1.9.0", default-features = false, features = ["rustcrypto", "__internal-api"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
