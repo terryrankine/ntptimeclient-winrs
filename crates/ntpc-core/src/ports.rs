@@ -21,6 +21,10 @@ pub trait Clock {
     /// Sets the clock frequency. The value is absolute from nominal, not
     /// relative to the previous setting.
     ///
+    /// A positive [`Ppm`] makes the local clock run faster. A positive
+    /// [`Offset`] (remote minus local) is therefore closed by a positive
+    /// [`Ppm`].
+    ///
     /// # Errors
     /// Returns [`ClockError`] if the frequency cannot be set.
     fn set_frequency(&mut self, ppm: Ppm) -> Result<(), ClockError>;
