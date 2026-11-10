@@ -82,7 +82,17 @@ fn check_single_link(file: &fs::File) -> Result<(), LoadError> {
 impl RecordStore for FileRecordStore {
     #[cfg(windows)]
     fn secure(&mut self) -> Result<(), String> {
-        ntpc_platform::secure_state_dir(&self.dir).map_err(|e| e.to_string())
+        // A dropped restore record means the previous directory held a record we
+        // could not trust. Install must refuse then: recording the current
+        // (stopped and disabled) state as the original would lose the real one.
+        // Task 12 part 2 refines this with a distinct exit code (R86).
+        match ntpc_platform::secure_state_dir(&self.dir).map_err(|e| e.to_string())? {
+            ntpc_platform::Secured {
+                restore_record: ntpc_platform::RestoreRecord::Dropped,
+                ..
+            } => Err("the previous restore record could not be trusted and was dropped".to_owned()),
+            _ => Ok(()),
+        }
     }
 
     #[cfg(not(windows))]

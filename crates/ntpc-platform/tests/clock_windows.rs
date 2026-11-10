@@ -189,13 +189,15 @@ fn kill_child_helper() {
     eprintln!("child: 100 ppm set, waiting to be killed");
     // No reset guard here on purpose: the parent kills this process. The
     // parent's ChildGuard resets the rate afterwards. If the parent died
-    // first, stop by itself after about 60 s, leaving the rate set: the
-    // owner's recovery step resets it.
+    // first, reset the rate itself and stop after about 60 s.
     let end = Instant::now() + Duration::from_secs(60);
     while Instant::now() < end {
         std::thread::sleep(Duration::from_secs(1));
     }
-    eprintln!("child: no kill within 60 s, exiting");
+    match c.reset_frequency() {
+        Ok(()) => eprintln!("child: no kill within 60 s, rate reset, exiting"),
+        Err(e) => eprintln!("CHILD RESET FAILED, fix the rate by hand: {e}"),
+    }
 }
 
 fn spawn_child() -> ChildGuard {
