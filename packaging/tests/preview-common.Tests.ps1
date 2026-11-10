@@ -1,6 +1,6 @@
 # Pester tests for the pure helpers in preview-common.ps1.
 # They never run install.ps1 or uninstall.ps1 and never call a service API.
-# Written in the legacy "Should Be" form so Pester 3 and Pester 5 both run it.
+# Legacy "Should Be" form, run with Pester 3.4 only. Pester 5 needs BeforeAll for the shared variables, so it is not run in CI.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here '..\preview-common.ps1')
 
