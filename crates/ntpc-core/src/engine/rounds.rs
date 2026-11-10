@@ -16,7 +16,8 @@ pub(super) struct Round {
     /// Sent while the tier was not active. Such a round may switch the
     /// tier but never feeds the clock.
     pub(super) observe_only: bool,
-    /// Sent before a resume. Its replies hold the sleep and are dropped.
+    /// Sent before a resume or a step. Its replies measured the clock
+    /// before that and are dropped.
     pub(super) stale: bool,
 }
 
@@ -129,7 +130,7 @@ impl Engine {
             return;
         };
         if round.stale {
-            // The resume set a recheck, so a fresh round follows.
+            // The resume or step set a recheck, so a fresh round follows.
             return;
         }
         let picked = self.select_now(tier);
