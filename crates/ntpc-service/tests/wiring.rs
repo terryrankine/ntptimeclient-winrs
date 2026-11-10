@@ -790,3 +790,114 @@ fn stuck_lookups_are_capped_at_three() {
     // Let the stuck threads end.
     rig.lookup.hang.store(false, Ordering::SeqCst);
 }
+
+// ------------------------------------------------------------ fix round 2
+
+#[test]
+fn failed_hand_back_is_retried_while_w32time_runs() {
+    // R102: the first two resets fail, the third works.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    lock(&rig.world).fail_reset = 2;
+    rig.run(3 * HOUR);
+    let resets: Vec<(f64, bool)> = rig
+        .commands()
+        .iter()
+        .filter(|c| c.1 == Cmd::Reset)
+        .map(|c| (as_secs(c.0), c.2))
+        .collect();
+    assert_eq!(resets.len(), 3, "{resets:?}");
+    assert_eq!(
+        resets.iter().map(|r| r.1).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    let p = LEVEL_PERIOD.as_secs_f64();
+    assert!(resets[0].0 >= 3600.0 && resets[0].0 <= 3600.0 + p);
+    assert!((resets[1].0 - resets[0].0 - p).abs() < 1.0, "{resets:?}");
+    assert!((resets[2].0 - resets[1].0 - p).abs() < 1.0, "{resets:?}");
+    assert!(rig.log_has("could not hand the clock rate back: clock change rejected"));
+}
+
+#[test]
+fn hand_back_pending_at_stop_still_resets() {
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    lock(&rig.world).fail_reset = 1_000;
+    rig.run(2 * HOUR);
+    let resets = times_of(&rig, Cmd::Reset);
+    // Every check while w32time runs, plus one at stop.
+    assert!(resets.len() > 100, "{}", resets.len());
+    assert!(*resets.last().expect("some") >= 7199.0);
+}
+
+#[test]
+fn no_clock_command_after_w32time_is_seen_running() {
+    // M1: the monitor call itself takes long enough for the hold limit to
+    // pass. A tick in front of the false level would run holdover's
+    // frequency command after w32time was seen running.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    rig.monitor_advance_s = 2100;
+    rig.run(3 * HOUR);
+    let calls = lock(&rig.monitor_calls).clone();
+    let seen = calls
+        .iter()
+        .map(|t| as_secs(*t))
+        .find(|t| *t >= 3600.0)
+        .expect("a running check");
+    let after: Vec<_> = clock_cmds(&rig)
+        .into_iter()
+        .filter(|c| as_secs(c.0) >= seen)
+        .collect();
+    assert!(after.is_empty(), "{after:?}");
+}
+
+#[test]
+fn slow_failed_frequency_command_runs_nothing_before_the_rearm() {
+    // M4: a failing SetFrequency that takes past the hold limit. A tick in
+    // front of its ClockResult would run holdover's SetFrequency at once.
+    let mut rig = Rig::new(0.050, 20.0);
+    {
+        let mut w = lock(&rig.world);
+        w.fail_numbers.insert(5);
+        w.fail_advance_s = 2100;
+    }
+    rig.run(4 * HOUR);
+    let cmds = clock_cmds(&rig);
+    let i = cmds.iter().position(|c| !c.2).expect("the failure");
+    assert!(matches!(cmds[i].1, Cmd::Freq(_)), "{cmds:?}");
+    let gap = cmds[i + 1].0.saturating_duration_since(cmds[i].0);
+    assert!(
+        gap >= Duration::from_secs(2100) + REARM_FIRST,
+        "next command {gap:?} after the failure"
+    );
+}
+
+#[test]
+fn a_panicking_log_sink_at_stop_does_not_skip_the_reset() {
+    // M3: the loop panics, then the sink panics on the panic log line.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_panic_at = Some(600.0);
+    rig.sink_panic_on = Some("the host loop panicked");
+    let r = rig.try_run(HOUR);
+    assert!(
+        matches!(r, Err(ntpc_service::host::HostError::Panicked(_))),
+        "{r:?}"
+    );
+    assert_eq!(times_of(&rig, Cmd::Reset).len(), 1);
+}
+
+#[test]
+fn queries_that_cannot_start_answer_after_the_batch() {
+    // M2: with no thread for queries, the host answers each one as
+    // unreachable itself, after the batch. It keeps running, and nothing
+    // moves the clock but the enable's drift frequency.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.no_spawn = true;
+    rig.run(HOUR);
+    assert!(rig.log_has("could not start a query thread"));
+    let r = lock(&rig.reports).last().cloned().expect("report").1;
+    assert!(r.counters.unreachable >= 4, "{:?}", r.counters);
+    assert_eq!(r.counters.samples, 0);
+    assert!(clock_cmds(&rig).iter().all(|c| matches!(c.1, Cmd::Freq(_))));
+}
