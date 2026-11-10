@@ -4,7 +4,8 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::{Command, HELP, USAGE, default_config_path, exit, load_config, status_command};
@@ -13,15 +14,14 @@ use crate::config::Config;
 use crate::event_log::{DiscardSink, EventLogSink, RealEventApi, RealRegistry};
 use crate::logging::{ConsoleSink, LineLogger, LogSink, Logger};
 use crate::registration::{ExeLocator, RealExeLocator, RealScm, SERVICE_NAME, ScmRegistration};
-use crate::service::{
-    DepsLauncher, JobError, Launcher, ServiceRun, real::service_main, run_console,
-};
+use crate::service::{DepsLauncher, JobError, Launcher, ServiceRun, Started, real::service_main};
 use crate::transport::StdTimeSource;
 
 /// The host launcher.
 ///
-/// MERGE (Task 14c-A): replace the body with
-/// `DepsLauncher::new(Arc::new(|cfg| <winimpl>::windows_deps(cfg)))`.
+/// MERGE (Task 14c-A): replace the body with `DepsLauncher::new(...)` over
+/// `windows_deps(cfg, sinks)` and `host::run`. The outline is in
+/// `service/launcher.rs`. `windows_deps` is called once per process.
 /// Until then `install` refuses (exit 9) and `run` and `service` stop
 /// with "host not built".
 fn launcher() -> DepsLauncher {
@@ -133,15 +133,18 @@ fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
         let _ = writeln!(err, "Cannot run: {e}.");
         return exit::HOST_NOT_BUILT;
     }
-    let logger: Arc<dyn Logger> = Arc::new(LineLogger::new(
-        Box::new(ConsoleSink::new()),
-        Arc::new(StdTimeSource::new()),
-    ));
-    let (control, inbox) = crate::host::channel();
+    // The host's control exists only once the launcher built it, so the
+    // Ctrl+C handler reads it from a slot. A Ctrl+C before that sets a flag
+    // that the hand-over checks, so the host never starts.
+    let slot: Arc<OnceLock<crate::host::HostControl>> = Arc::new(OnceLock::new());
+    let early = Arc::new(AtomicBool::new(false));
     let done = Arc::new((Mutex::new(false), Condvar::new()));
-    let d = done.clone();
+    let (h_slot, h_early, d) = (slot.clone(), early.clone(), done.clone());
     let handler = move |ctrl: u32| {
-        control.shutdown();
+        h_early.store(true, Ordering::SeqCst);
+        if let Some(c) = h_slot.get() {
+            c.shutdown();
+        }
         // CTRL_CLOSE_EVENT, LOGOFF and SHUTDOWN end the process when the
         // handler returns (Learn, HandlerRoutine). Wait for the host to
         // reset the clock rate first, inside the 5 s close timeout.
@@ -156,13 +159,25 @@ fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
     if let Err(e) = ntpc_platform::service_host::set_console_handler(Box::new(handler)) {
         let _ = writeln!(
             err,
-            "Cannot install the Ctrl+C handler (OS error {}). Not starting: Ctrl+C would skip \
-             the clock rate reset.",
+            "Cannot install the Ctrl+C handler (OS error {}). Not starting: Ctrl+C would skip              the clock rate reset.",
             e.raw_os_error().unwrap_or(-1)
         );
         return exit::RUN_FAILED;
     }
-    let result = run_console(&launcher, cfg, logger, inbox);
+    let started = move |s: Started| {
+        let _ = slot.set(s.control);
+        if early.load(Ordering::SeqCst) {
+            if let Some(c) = slot.get() {
+                c.shutdown();
+            }
+            return false;
+        }
+        true
+    };
+    // No power events in a console: resumes reach the host only in service
+    // mode. The console sink is the host's only sink.
+    let sinks: Vec<Arc<dyn LogSink>> = vec![Arc::new(ConsoleSink::new())];
+    let result = launcher.run(cfg, sinks, &started);
     {
         let (lock, cv) = &*done;
         *lock
@@ -190,12 +205,16 @@ fn service(err: &mut dyn Write) -> u8 {
             .and_then(|api| EventLogSink::start(Box::new(api)))
             .ok()
             .map(Arc::new);
-        let sink: Box<dyn LogSink> = match &event_sink {
-            Some(s) => Box::new(s.clone()),
-            None => Box::new(DiscardSink::default()),
+        // 14c-A refuses an empty sink list, so a failed Event Log open
+        // still passes a sink. The service then runs without a log.
+        let sink: Arc<dyn LogSink> = match &event_sink {
+            Some(s) => s.clone(),
+            None => Arc::new(DiscardSink::default()),
         };
-        let logger: Arc<dyn Logger> =
-            Arc::new(LineLogger::new(sink, Arc::new(StdTimeSource::new())));
+        let logger: Arc<dyn Logger> = Arc::new(LineLogger::new(
+            Box::new(sink.clone()),
+            Arc::new(StdTimeSource::new()),
+        ));
         let drain: Box<dyn Fn(Duration) + Send + Sync> = match event_sink {
             Some(s) => Box::new(move |d| {
                 let _ = s.drain(d);
@@ -206,6 +225,7 @@ fn service(err: &mut dyn Write) -> u8 {
             config,
             launcher: Arc::new(launcher()),
             logger,
+            sinks: vec![sink],
             drain,
         }
     };

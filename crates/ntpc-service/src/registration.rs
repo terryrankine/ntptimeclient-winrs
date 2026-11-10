@@ -52,7 +52,8 @@ pub const RESTART_DELAYS_MS: [u32; 3] = [60_000, 60_000, 300_000];
 /// 60 s again.
 pub const FAILURE_RESET_S: u32 = 86_400;
 
-/// `SERVICE_SID_TYPE_NONE`. A restricted SID would make the token
+/// `SERVICE_SID_TYPE_NONE`. R106: NONE or UNRESTRICTED only, never
+/// RESTRICTED. A restricted SID would make the token
 /// write-restricted, and the state directory DACL does not name the service
 /// SID, so every write would fail. Revisit with the state directory ACL.
 pub const SID_TYPE_NONE: u32 = 0;
@@ -501,10 +502,10 @@ fn raw_spec(spec: &ServiceSpec) -> ntpc_platform::service_host::RawServiceSpec {
 #[cfg(windows)]
 impl ScmApi for RealScm {
     fn create(&mut self, spec: &ServiceSpec) -> Result<(), ScmError> {
-        // The FFI always passes a null account (LocalSystem) and no
-        // dependencies. Refuse a spec that asks for anything else rather
-        // than silently ignore it.
-        if spec.account.is_some() || !spec.dependencies.is_empty() {
+        // R106: LocalSystem only. The FFI always passes a null account
+        // (LocalSystem) and no dependencies. Refuse a spec that asks for
+        // anything else, or for a restricted SID, rather than ignore it.
+        if spec.account.is_some() || !spec.dependencies.is_empty() || spec.sid_type == 3 {
             return Err(ScmError::Os {
                 op: "create (unsupported account or dependencies)",
                 code: -1,
