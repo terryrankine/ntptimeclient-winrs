@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use crate::discipline::{Correction, CrossCheck, Discipline, DisciplineConfig, MAX_HOLD};
 use crate::filter::SourceFilter;
-use crate::select::{Selection, SelectionConfig, select};
+use crate::select::{Selection, SelectionConfig};
 use crate::tier::{TierChooser, TierConfig};
 use crate::{
     ClockError, KodCode, Mono, Offset, Ppm, QueryFailure, Sample, SourceId, SourceSpec, Tier,
@@ -222,12 +222,12 @@ const JITTER_FLOOR: Duration = Duration::from_millis(5);
 /// A new sample this many times slower than the source's best of its last
 /// eight is a delay spike. Queuing on such a path skews the offset, and the
 /// skew is not symmetric, so the loop must not follow it.
-const POPCORN_RATIO: f64 = 3.0;
+pub(super) const POPCORN_RATIO: f64 = 3.0;
 
 /// Below this delay a spike is ignored. A LAN path at 0.3 ms that reads 1 ms
 /// once is still far better than any internet path, and its offset error is
 /// bounded by half that delay.
-const POPCORN_FLOOR: Duration = Duration::from_millis(10);
+pub(super) const POPCORN_FLOOR: Duration = Duration::from_millis(10);
 
 const PPM_PER_UNIT: f64 = 1e-6;
 
@@ -741,93 +741,6 @@ impl Engine {
             .saturating_duration_since(t)
             .checked_sub(Duration::from_nanos(1))
             .map(|age| age.min(cap))
-    }
-
-    /// Selection that may feed the loop. Per source, the best sample taken
-    /// after the last one the loop considered and after the last frequency
-    /// change. An older one was already used or measured a clock that has
-    /// moved since, so it can neither feed the loop again nor decide a step.
-    /// A delay spike is left out (see [`POPCORN_RATIO`]). It still counts
-    /// for tier usability. Returns the kept samples and whether any new
-    /// sample was dropped as a spike.
-    fn new_samples(&self, tier: Tier) -> (Vec<Sample>, bool) {
-        let max_age = self.cfg.selection.max_age;
-        let mut spiked = false;
-        let mut kept = Vec::new();
-        for s in self.sources.values().filter(|s| s.spec.tier == tier) {
-            let Some(age) = self.window(s.fed_until.max(self.freq_changed_at), max_age) else {
-                continue;
-            };
-            let Some(new) = s.filter.best_fresh(self.now, age) else {
-                continue;
-            };
-            // The best of the last eight includes `new`, so a source with
-            // one sample, or a path that stays slow for eight samples, is
-            // never a spike.
-            let best = s.filter.best().map_or(new.delay, |b| b.delay).as_secs();
-            let d = new.delay.as_secs();
-            if d > POPCORN_RATIO * best && d > POPCORN_FLOOR.as_secs_f64() {
-                spiked = true;
-            } else {
-                kept.push(new);
-            }
-        }
-        (kept, spiked)
-    }
-
-    /// Feeds the loop from new samples of the active tier, if any.
-    ///
-    /// The new samples feed the loop only if every one of their survivors
-    /// also survives a vote of the whole tier. In that vote each source
-    /// casts its new sample if it has one, else its best fresh sample.
-    /// Without the vote, sources with nothing new (lost reply, timeout,
-    /// kiss-of-death) would leave a falseticker to win alone. A source's
-    /// own new sample is used rather than its best of eight, so a source
-    /// that has just turned false cannot vote with an old good sample, and
-    /// one that has just turned good is not held back by an old bad one.
-    /// When the vote refuses, nothing is fed and the samples stay unused.
-    fn feed_loop(&mut self, tier: Tier, out: &mut Vec<Action>) {
-        let (kept, spiked) = self.new_samples(tier);
-        if kept.is_empty() {
-            // Every new reading was a spike. Poll fast so a path that has
-            // really turned slow is learned in eight short polls, not eight
-            // long ones.
-            if spiked {
-                self.poll = self.cfg.min_poll;
-            }
-            return;
-        }
-        let Some(sel) = select(&kept, self.now, &self.cfg.selection) else {
-            return;
-        };
-        let max_age = self.cfg.selection.max_age;
-        let vote: Vec<Sample> = self
-            .sources
-            .values()
-            .filter(|s| s.spec.tier == tier)
-            .filter_map(|s| {
-                kept.iter()
-                    .find(|k| k.source == s.spec.id)
-                    .copied()
-                    .or_else(|| s.filter.best_fresh(self.now, max_age))
-            })
-            .collect();
-        let Some(tier_vote) = select(&vote, self.now, &self.cfg.selection) else {
-            return;
-        };
-        if !sel
-            .survivors
-            .iter()
-            .all(|id| tier_vote.survivors.contains(id))
-        {
-            return;
-        }
-        for k in &kept {
-            if let Some(src) = self.sources.get_mut(&k.source) {
-                src.fed_until = Some(k.at);
-            }
-        }
-        self.update(tier, &sel, out);
     }
 
     fn update(&mut self, tier: Tier, sel: &Selection, out: &mut Vec<Action>) {
