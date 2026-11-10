@@ -65,6 +65,16 @@ pub enum AclError {
     /// Only absolute local drive paths with plain components are accepted.
     #[error("state directory path must be an absolute local drive path")]
     BadPath,
+    /// A path component ends in a dot or a space. Windows strips those, so
+    /// the name checked would not be the name opened.
+    #[error("state directory path has a component ending in a dot or space")]
+    TrailingDotOrSpace,
+    /// The drive is not a fixed local disk (`DRIVE_FIXED`).
+    #[error("state directory must be on a fixed local drive")]
+    NotFixedDrive,
+    /// The path no longer names the directory that was secured.
+    #[error("state directory changed while it was being secured")]
+    PathChanged,
     /// The directory itself is a symlink or junction.
     #[error("state directory is a link or junction")]
     Link,
@@ -115,15 +125,69 @@ fn os(op: &'static str, e: &io::Error) -> AclError {
 /// best effort. It is empty and ours, and a half-secured directory must not
 /// be left behind.
 ///
+/// Parents are checked for links and for their owner, not for their DACL
+/// (R74). A parent owned by SYSTEM, Administrators or `TrustedInstaller` whose
+/// DACL still grants Users `FILE_DELETE_CHILD` would let them remove the
+/// state directory. That is an administrator misconfiguration and out of
+/// scope here.
+///
 /// # Errors
 /// [`AclError`] says which check failed.
 pub fn secure_state_dir(path: &Path) -> Result<(), AclError> {
+    secure_state_dir_with(path, &OS_PROBE)
+}
+
+/// OS reads that tests replace, so the parent rules can be checked inside a
+/// user-owned temp tree.
+struct Probe {
+    /// The owner of an open object.
+    owner: fn(&OwnedHandle) -> io::Result<Option<Principal>>,
+    /// `GetDriveTypeW` of a drive root.
+    drive_type: fn(&Path) -> u32,
+}
+
+const OS_PROBE: Probe = Probe {
+    owner: os_owner,
+    drive_type: win32::drive_type,
+};
+
+fn os_owner(h: &OwnedHandle) -> io::Result<Option<Principal>> {
+    win32::read_security(h).map(|s| s.owner)
+}
+
+/// `DRIVE_FIXED`.
+const DRIVE_FIXED: u32 = 3;
+
+fn drive_ok(drive_type: u32) -> Result<(), AclError> {
+    if drive_type == DRIVE_FIXED {
+        Ok(())
+    } else {
+        Err(AclError::NotFixedDrive)
+    }
+}
+
+fn secure_state_dir_with(path: &Path, probe: &Probe) -> Result<(), AclError> {
     let ancestors = ancestors(path)?;
+    drive_ok((probe.drive_type)(&drive_root(path)?))?;
     for (i, a) in ancestors.iter().enumerate() {
         // Index 0 is the drive root, which is exempt from the owner check.
-        check_ancestor(a, i > 0)?;
+        check_ancestor(a, i > 0, probe)?;
     }
     secure_final(path)
+}
+
+/// `X:\` for the drive of `path`, also for a `\\?\X:\` path, because
+/// `GetDriveTypeW` wants the plain form.
+fn drive_root(path: &Path) -> Result<PathBuf, AclError> {
+    match path.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                Ok(PathBuf::from(format!("{}:\\", char::from(letter))))
+            }
+            _ => Err(AclError::BadPath),
+        },
+        _ => Err(AclError::BadPath),
+    }
 }
 
 /// Everything after the parent checks. Split out so tests inside a
@@ -154,6 +218,9 @@ fn ancestors(path: &Path) -> Result<Vec<PathBuf>, AclError> {
     if rest.is_empty() || !rest.iter().all(|c| matches!(c, Component::Normal(_))) {
         return Err(AclError::BadPath);
     }
+    if rest.iter().any(|c| ends_in_dot_or_space(c.as_os_str())) {
+        return Err(AclError::TrailingDotOrSpace);
+    }
     let mut out = Vec::with_capacity(rest.len());
     let mut current: PathBuf = path.components().take(2).collect();
     out.push(current.clone());
@@ -164,10 +231,20 @@ fn ancestors(path: &Path) -> Result<Vec<PathBuf>, AclError> {
     Ok(out)
 }
 
+/// Windows drops a trailing dot or space from a name, so `state.` opens
+/// `state`. Refuse such names rather than reason about it.
+fn ends_in_dot_or_space(name: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    matches!(
+        name.encode_wide().last(),
+        Some(u) if u == u16::from(b'.') || u == u16::from(b' ')
+    )
+}
+
 /// Checks one parent through a single no-follow handle: not a link, a
 /// directory, and with `check_owner` a trusted owner. The owner is read
 /// from the same handle, so no second path lookup can be raced.
-fn check_ancestor(path: &Path, check_owner: bool) -> Result<(), AclError> {
+fn check_ancestor(path: &Path, check_owner: bool, probe: &Probe) -> Result<(), AclError> {
     let h = win32::open_no_follow(path, FILE_READ_ATTRIBUTES | READ_CONTROL)
         .map_err(|e| os("parent check", &e))?;
     let tag = win32::attribute_tag(&h).map_err(|e| os("parent check", &e))?;
@@ -178,8 +255,8 @@ fn check_ancestor(path: &Path, check_owner: bool) -> Result<(), AclError> {
         return Err(AclError::NotADirectory);
     }
     if check_owner {
-        let sec = win32::read_security(&h).map_err(|e| os("parent check", &e))?;
-        if !parent_owner_trusted(sec.owner) {
+        let owner = (probe.owner)(&h).map_err(|e| os("parent check", &e))?;
+        if !parent_owner_trusted(owner) {
             return Err(AclError::UntrustedParent);
         }
     }
@@ -296,17 +373,50 @@ fn secure_open_dir(h: &OwnedHandle, path: &Path, created: bool) -> Result<(), Ac
         if !dacl_is_secure(&after) {
             return Err(AclError::DaclNotApplied);
         }
+        // Before the DACL landed, Users may still have had create rights and
+        // planted a file after the clean-up listing. Now nobody unprivileged
+        // can add an entry, so this listing is authoritative. Refuse, delete
+        // nothing.
+        require_empty(h)?;
     }
-    Ok(())
+    same_object(h, path)
+}
+
+/// Refuses unless the directory behind `dir` is empty.
+fn require_empty(dir: &OwnedHandle) -> Result<(), AclError> {
+    if win32::list_dir(dir).map_err(|e| os("list", &e))?.is_empty() {
+        Ok(())
+    } else {
+        Err(AclError::UnexpectedChild)
+    }
+}
+
+/// Refuses if `path` no longer names the object behind `h`, for example
+/// after a rename swap while it was being secured. Compares volume serial
+/// and file index.
+fn same_object(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+    let again = win32::open_no_follow(path, FILE_READ_ATTRIBUTES).map_err(|e| os("reopen", &e))?;
+    let a = win32::link_info(h).map_err(|e| os("identify", &e))?;
+    let b = win32::link_info(&again).map_err(|e| os("identify", &e))?;
+    if a.same_file(&b) {
+        Ok(())
+    } else {
+        Err(AclError::PathChanged)
+    }
 }
 
 /// The only names the drift store writes.
 const KNOWN_CHILDREN: [&str; 2] = ["drift.txt", "drift.txt.tmp"];
 
 /// Deletes `drift.txt` and `drift.txt.tmp` from a directory whose DACL is
-/// about to be fixed. Refuses, deleting nothing, if any other entry exists
-/// or a known name is a directory, a link of any kind or has more than one
-/// hard link.
+/// about to be fixed.
+///
+/// - Any other entry, or a known name that is a directory, a link of any
+///   kind or has more than one hard link: `UnexpectedChild`, nothing deleted.
+/// - An OS error while listing, opening or checking: `Os`, nothing deleted.
+/// - An OS error on the second delete after the first worked: `Os`, and the
+///   first file is gone. That partial delete only removes our own drift
+///   file, which the next save writes again.
 ///
 /// The listing goes through `dir`. Each known child is opened by its path
 /// without following a reparse point, checked on that handle and deleted
@@ -478,6 +588,9 @@ mod tests {
             AclError::UntrustedOwner,
             AclError::UntrustedParent,
             AclError::UnexpectedChild,
+            AclError::TrailingDotOrSpace,
+            AclError::NotFixedDrive,
+            AclError::PathChanged,
             AclError::DaclNotApplied,
             os("open", &io::Error::from_raw_os_error(5)),
         ];
@@ -605,8 +718,8 @@ mod tests {
             eprintln!("skip: no C:\\Windows");
             return;
         }
-        assert_eq!(check_ancestor(windows, true), Ok(()));
-        assert_eq!(check_ancestor(Path::new(r"C:\"), false), Ok(()));
+        assert_eq!(check_ancestor(windows, true, &OS_PROBE), Ok(()));
+        assert_eq!(check_ancestor(Path::new(r"C:\"), false, &OS_PROBE), Ok(()));
     }
 
     // The tests below run inside a user-owned scratch tree, which the parent
@@ -650,9 +763,39 @@ mod tests {
             return;
         }
         // The reparse check comes before the owner check.
-        assert_eq!(check_ancestor(&link, true), Err(AclError::ParentLink));
-        assert_eq!(check_ancestor(&link, false), Err(AclError::ParentLink));
-        // The full call refuses too, and creates nothing through the link.
+        assert_eq!(
+            check_ancestor(&link, true, &OS_PROBE),
+            Err(AclError::ParentLink)
+        );
+        assert_eq!(
+            check_ancestor(&link, false, &OS_PROBE),
+            Err(AclError::ParentLink)
+        );
+        // End to end, with every parent owner reported as trusted, the
+        // junction itself is what refuses.
+        assert_eq!(
+            secure_state_dir_with(&link.join("state"), &TRUSTED),
+            Err(AclError::ParentLink)
+        );
+        assert_eq!(
+            secure_state_dir_with(&link.join("new"), &TRUSTED),
+            Err(AclError::ParentLink)
+        );
+        assert!(!real.join("new").exists());
+    }
+
+    #[test]
+    fn real_call_under_a_junction_in_a_user_tree_refuses_and_creates_nothing() {
+        // With the real owner probe the user-owned scratch parent refuses
+        // first. This proves only that nothing is created through the link.
+        let s = Scratch::new("parentreal");
+        let real = s.0.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = s.0.join("link");
+        if !junction(&link, &real) {
+            eprintln!("skip: mklink /J failed");
+            return;
+        }
         assert!(secure_state_dir(&link.join("new")).is_err());
         assert!(!real.join("new").exists());
     }
@@ -685,11 +828,160 @@ mod tests {
     }
 
     #[test]
-    fn missing_parent_is_an_error_and_creates_nothing() {
+    fn missing_parent_fails_the_parent_check_and_creates_nothing() {
         let s = Scratch::new("noparent");
+        let dir = s.0.join("missing").join("state");
+        let r = secure_state_dir_with(&dir, &TRUSTED);
+        assert!(
+            matches!(
+                r,
+                Err(AclError::Os {
+                    op: "parent check",
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        assert!(!s.0.join("missing").exists());
+    }
+
+    #[test]
+    fn missing_dir_under_an_untrusted_token_creates_nothing() {
+        // `secure_final` alone: the parent exists, the directory does not.
+        let s = Scratch::new("nodir");
         let dir = s.0.join("missing").join("state");
         assert!(secure_final(&dir).is_err());
         assert!(!s.0.join("missing").exists());
+    }
+
+    // The signature must match `Probe::owner`, so the `Result` stays.
+    #[allow(clippy::unnecessary_wraps)]
+    fn trusted_owner(_: &OwnedHandle) -> io::Result<Option<Principal>> {
+        Ok(Some(Principal::System))
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn untrusted_owner(_: &OwnedHandle) -> io::Result<Option<Principal>> {
+        Ok(Some(Principal::Other))
+    }
+
+    fn fixed(_: &Path) -> u32 {
+        DRIVE_FIXED
+    }
+
+    fn removable(_: &Path) -> u32 {
+        2
+    }
+
+    /// Every parent reported as owned by SYSTEM, every drive as fixed.
+    const TRUSTED: Probe = Probe {
+        owner: trusted_owner,
+        drive_type: fixed,
+    };
+
+    #[test]
+    fn injected_owner_decides_the_parent_check() {
+        let s = Scratch::new("inject");
+        let untrusted = Probe {
+            owner: untrusted_owner,
+            drive_type: fixed,
+        };
+        assert_eq!(check_ancestor(&s.0, true, &TRUSTED), Ok(()));
+        assert_eq!(
+            check_ancestor(&s.0, true, &untrusted),
+            Err(AclError::UntrustedParent)
+        );
+        // The root is exempt: no owner is read.
+        assert_eq!(check_ancestor(&s.0, false, &untrusted), Ok(()));
+    }
+
+    #[test]
+    fn only_fixed_drives_pass() {
+        assert_eq!(drive_ok(DRIVE_FIXED), Ok(()));
+        // Unknown, no root, removable, remote, CD-ROM, RAM disk.
+        for t in [0, 1, 2, 4, 5, 6] {
+            assert_eq!(drive_ok(t), Err(AclError::NotFixedDrive), "{t}");
+        }
+        let probe = Probe {
+            owner: trusted_owner,
+            drive_type: removable,
+        };
+        assert_eq!(
+            secure_state_dir_with(Path::new(r"C:\ProgramData\ntpc"), &probe),
+            Err(AclError::NotFixedDrive)
+        );
+    }
+
+    #[test]
+    fn a_real_non_fixed_drive_is_refused() {
+        // Read only: GetDriveTypeW on each letter until one is not fixed.
+        // No file is opened on that drive, the drive check comes first.
+        let Some(root) = (b'D'..=b'Z')
+            .map(|l| PathBuf::from(format!("{}:\\", char::from(l))))
+            .find(|r| win32::drive_type(r) != DRIVE_FIXED)
+        else {
+            eprintln!("skip: every drive letter is a fixed disk");
+            return;
+        };
+        assert_eq!(
+            secure_state_dir(&root.join("ntpc-state")),
+            Err(AclError::NotFixedDrive)
+        );
+    }
+
+    #[test]
+    fn drive_root_handles_plain_and_verbatim_paths() {
+        assert_eq!(
+            drive_root(Path::new(r"C:\x\y")).unwrap(),
+            PathBuf::from(r"C:\")
+        );
+        assert_eq!(
+            drive_root(Path::new(r"\\?\D:\x")).unwrap(),
+            PathBuf::from(r"D:\")
+        );
+        assert_eq!(drive_root(Path::new(r"x\y")), Err(AclError::BadPath));
+    }
+
+    #[test]
+    fn components_ending_in_dot_or_space_are_refused() {
+        for p in [
+            r"C:\ProgramData\ntpc.",
+            r"C:\ProgramData\ntpc ",
+            r"C:\ProgramData.\ntpc",
+            r"C:\Program Data \ntpc",
+            r"C:\a\b...",
+        ] {
+            assert_eq!(
+                ancestors(Path::new(p)),
+                Err(AclError::TrailingDotOrSpace),
+                "{p}"
+            );
+        }
+        for p in [r"C:\Program Data\ntpc", r"C:\a.b\c", r"C:\.hidden\x"] {
+            assert!(ancestors(Path::new(p)).is_ok(), "{p}");
+        }
+    }
+
+    #[test]
+    fn post_dacl_check_refuses_a_planted_file_and_deletes_nothing() {
+        let s = Scratch::new("planted");
+        let dir = state_dir(&s);
+        let h = listing_handle(&dir);
+        assert_eq!(require_empty(&h), Ok(()));
+        std::fs::write(dir.join("drift.txt"), b"9.9").unwrap();
+        assert_eq!(require_empty(&h), Err(AclError::UnexpectedChild));
+        assert!(dir.join("drift.txt").exists(), "must not delete");
+    }
+
+    #[test]
+    fn identity_check_spots_a_rename_swap() {
+        let s = Scratch::new("swap");
+        let dir = state_dir(&s);
+        let h = listing_handle(&dir);
+        assert_eq!(same_object(&h, &dir), Ok(()));
+        std::fs::rename(&dir, s.0.join("moved")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(same_object(&h, &dir), Err(AclError::PathChanged));
     }
 
     #[test]

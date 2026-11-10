@@ -35,7 +35,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FULL_DIR_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
-    FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+    FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GetDriveTypeW,
     GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
     SetFileInformationByHandle,
 };
@@ -772,21 +772,86 @@ pub struct DirEntry {
     pub attributes: u32,
 }
 
+/// Byte offsets inside one `FILE_FULL_DIR_INFO` record. Checked against
+/// the real struct at compile time below.
+const REC_NEXT: usize = 0;
+const REC_ATTRIBUTES: usize = 56;
+const REC_NAME_LENGTH: usize = 60;
+const REC_NAME: usize = 68;
+
+const _: () = {
+    assert!(std::mem::offset_of!(FILE_FULL_DIR_INFO, NextEntryOffset) == REC_NEXT);
+    assert!(std::mem::offset_of!(FILE_FULL_DIR_INFO, FileAttributes) == REC_ATTRIBUTES);
+    assert!(std::mem::offset_of!(FILE_FULL_DIR_INFO, FileNameLength) == REC_NAME_LENGTH);
+    assert!(std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName) == REC_NAME);
+};
+
+fn read_u32(buf: &[u8], at: usize) -> io::Result<u32> {
+    at.checked_add(4)
+        .and_then(|end| buf.get(at..end))
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or_else(|| io::Error::other("directory listing record out of bounds"))
+}
+
+/// Walks the `FILE_FULL_DIR_INFO` records in `buf`. Safe code only: every
+/// field is read through a bounds-checked slice, so a bad record gives an
+/// error, never a read outside `buf`. `.` and `..` are left out.
+///
+/// # Errors
+/// A record header or name that does not fit in `buf`, or a next offset
+/// that leaves `buf`.
+pub fn parse_dir_records(buf: &[u8], out: &mut Vec<DirEntry>) -> io::Result<()> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut offset = 0usize;
+    loop {
+        // The fixed header must fit before any field is read.
+        if offset
+            .checked_add(REC_NAME)
+            .is_none_or(|end| end > buf.len())
+        {
+            return Err(io::Error::other("directory listing record out of bounds"));
+        }
+        let next = read_u32(buf, offset + REC_NEXT)? as usize;
+        let attributes = read_u32(buf, offset + REC_ATTRIBUTES)?;
+        let name_len = read_u32(buf, offset + REC_NAME_LENGTH)? as usize;
+        let name_start = offset + REC_NAME;
+        let name = name_start
+            .checked_add(name_len)
+            .and_then(|end| buf.get(name_start..end))
+            .ok_or_else(|| io::Error::other("directory listing name out of bounds"))?;
+        let units: Vec<u16> = name
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let name = std::ffi::OsString::from_wide(&units);
+        if name != "." && name != ".." {
+            out.push(DirEntry { name, attributes });
+        }
+        if next == 0 {
+            return Ok(());
+        }
+        offset = offset
+            .checked_add(next)
+            .filter(|o| *o < buf.len())
+            .ok_or_else(|| io::Error::other("directory listing next record out of bounds"))?;
+    }
+}
+
 /// Lists a directory through its open handle. The handle needs
 /// `FILE_LIST_DIRECTORY`. Nothing is opened by path and no link is followed.
 /// `.` and `..` are left out.
 ///
 /// # Errors
-/// The OS error if the listing fails.
+/// The OS error if the listing fails, or a malformed record.
 pub fn list_dir(handle: &OwnedHandle) -> io::Result<Vec<DirEntry>> {
-    use std::os::windows::ffi::OsStringExt;
-    // u64 elements give the 8-byte alignment FILE_FULL_DIR_INFO needs.
+    // u64 elements give the 8-byte alignment the OS wants for the buffer.
     let mut buf = vec![0u64; 8192];
     let bytes = buf.len() * 8;
     // 64 KiB fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let size = bytes as u32;
-    let name_offset = std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName);
     let mut out = Vec::new();
     let mut class = FileFullDirectoryRestartInfo;
     loop {
@@ -808,58 +873,33 @@ pub fn list_dir(handle: &OwnedHandle) -> io::Result<Vec<DirEntry>> {
             return Err(e);
         }
         class = FileFullDirectoryInfo;
-        let mut offset = 0usize;
-        loop {
-            if offset + name_offset > bytes {
-                return Err(io::Error::other("directory listing record out of bounds"));
-            }
-            let base = buf.as_ptr().cast::<u8>();
-            // SAFETY: the bounds check above keeps the fixed header inside
-            // `buf`. `read_unaligned` makes no alignment assumption.
-            #[allow(clippy::cast_ptr_alignment)]
-            let rec = unsafe {
-                base.add(offset)
-                    .cast::<FILE_FULL_DIR_INFO>()
-                    .read_unaligned()
-            };
-            let name_bytes = rec.FileNameLength as usize;
-            if offset + name_offset + name_bytes > bytes {
-                return Err(io::Error::other("directory listing name out of bounds"));
-            }
-            let start = offset + name_offset;
-            let units: Vec<u16> = (0..name_bytes / 2)
-                .map(|i| {
-                    // SAFETY: the check above proves the whole name lies
-                    // inside `buf`. `read_unaligned` makes no alignment
-                    // assumption.
-                    #[allow(clippy::cast_ptr_alignment)]
-                    unsafe {
-                        base.add(start + 2 * i).cast::<u16>().read_unaligned()
-                    }
-                })
-                .collect();
-            let name = std::ffi::OsString::from_wide(&units);
-            if name != "." && name != ".." {
-                out.push(DirEntry {
-                    name,
-                    attributes: rec.FileAttributes,
-                });
-            }
-            if rec.NextEntryOffset == 0 {
-                break;
-            }
-            offset += rec.NextEntryOffset as usize;
-        }
+        // SAFETY: `buf` owns `bytes` initialised bytes (it started zeroed and
+        // u64 has no invalid bit patterns). The byte view lives only for the
+        // parse call, while `buf` is not touched otherwise.
+        let view = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), bytes) };
+        parse_dir_records(view, &mut out)?;
     }
 }
 
-/// Attributes and hard link count of an open file.
+/// Attributes, hard link count and identity of an open file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkInfo {
     /// `FILE_ATTRIBUTE_*` bits.
     pub attributes: u32,
     /// Number of hard links to the file.
     pub links: u32,
+    /// Serial number of the volume that holds the file.
+    pub volume_serial: u32,
+    /// File index, unique on its volume while the file is open.
+    pub file_index: u64,
+}
+
+impl LinkInfo {
+    /// True when both describe the same file on the same volume.
+    #[must_use]
+    pub fn same_file(&self, other: &Self) -> bool {
+        self.volume_serial == other.volume_serial && self.file_index == other.file_index
+    }
 }
 
 /// Reads `GetFileInformationByHandle` for `handle`.
@@ -876,7 +916,20 @@ pub fn link_info(handle: &OwnedHandle) -> io::Result<LinkInfo> {
     Ok(LinkInfo {
         attributes: info.dwFileAttributes,
         links: info.nNumberOfLinks,
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     })
+}
+
+/// `GetDriveTypeW` for a drive root such as `C:\`. Read only.
+#[must_use]
+pub fn drive_type(root: &Path) -> u32 {
+    let Ok(name) = wide(root) else {
+        // DRIVE_NO_ROOT_DIR: never accepted.
+        return 1;
+    };
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    unsafe { GetDriveTypeW(name.as_ptr()) }
 }
 
 /// Marks the file behind `handle` for deletion. It goes when the last
@@ -903,4 +956,82 @@ pub fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One record: next offset, attributes, name. Padded to 8 bytes like
+    /// the OS does when `pad` is set.
+    fn record(next: u32, attributes: u32, name: &str, pad: bool) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut r = vec![0u8; REC_NAME];
+        r[REC_NEXT..REC_NEXT + 4].copy_from_slice(&next.to_le_bytes());
+        r[REC_ATTRIBUTES..REC_ATTRIBUTES + 4].copy_from_slice(&attributes.to_le_bytes());
+        let len = u32::try_from(units.len() * 2).unwrap();
+        r[REC_NAME_LENGTH..REC_NAME_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
+        for u in units {
+            r.extend_from_slice(&u.to_le_bytes());
+        }
+        if pad {
+            while !r.len().is_multiple_of(8) {
+                r.push(0);
+            }
+        }
+        r
+    }
+
+    fn parse(buf: &[u8]) -> io::Result<Vec<DirEntry>> {
+        let mut out = Vec::new();
+        parse_dir_records(buf, &mut out).map(|()| out)
+    }
+
+    #[test]
+    fn walker_reads_chained_records_and_skips_dots() {
+        let a = record(0, 0x10, ".", true);
+        let mut buf = a.clone();
+        buf[REC_NEXT..REC_NEXT + 4].copy_from_slice(&u32::try_from(a.len()).unwrap().to_le_bytes());
+        let b = record(0, 0x20, "drift.txt", true);
+        buf.extend_from_slice(&b);
+        let out = parse(&buf).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "drift.txt");
+        assert_eq!(out[0].attributes, 0x20);
+    }
+
+    #[test]
+    fn walker_stops_at_a_zero_next_offset() {
+        let mut buf = record(0, 0x20, "drift.txt", true);
+        // Garbage after the last record is never read.
+        buf.extend_from_slice(&[0xFF; 100]);
+        assert_eq!(parse(&buf).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn walker_refuses_a_truncated_header() {
+        let buf = record(0, 0x20, "x", false);
+        assert!(parse(&buf[..REC_NAME - 1]).is_err());
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn walker_refuses_a_name_longer_than_the_buffer() {
+        let mut buf = record(0, 0x20, "drift.txt", false);
+        buf.truncate(buf.len() - 2);
+        assert!(parse(&buf).is_err());
+        let mut huge = record(0, 0x20, "x", false);
+        huge[REC_NAME_LENGTH..REC_NAME_LENGTH + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse(&huge).is_err());
+    }
+
+    #[test]
+    fn walker_refuses_a_next_offset_past_the_end() {
+        let mut buf = record(0, 0x20, "drift.txt", true);
+        let len = u32::try_from(buf.len()).unwrap();
+        buf[REC_NEXT..REC_NEXT + 4].copy_from_slice(&len.to_le_bytes());
+        assert!(parse(&buf).is_err());
+        buf[REC_NEXT..REC_NEXT + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse(&buf).is_err());
+    }
 }
