@@ -908,6 +908,10 @@ fn old_sample_is_left_out_of_step_decision() {
     ];
     let mut h = Harness::new(EngineConfig::default(), reply);
     h.rtt = Duration::from_millis(300);
+    // The refusal slews at 500 ppm, so real readings move with it. Without
+    // the model source 3 would read 5 s for 700 s of slewing, and the
+    // slew-corrected old sample of source 1 (ruling R50) would disagree.
+    h.model = Some(ClockModel::default());
     h.feed(Event::AdjustmentAllowed(true));
     h.feed(Event::SourcesChanged(specs));
     h.run(3600);

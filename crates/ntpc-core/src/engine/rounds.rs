@@ -132,7 +132,7 @@ impl Engine {
             // The resume set a recheck, so a fresh round follows.
             return;
         }
-        let picked = self.select_in(tier, self.cfg.selection.max_age);
+        let picked = self.select_now(tier);
         let before = self.tiers.active();
         // Lower tiers are never observed. The pool cross-check is such a
         // tier. Its samples only veto steps.
@@ -173,6 +173,22 @@ impl Engine {
             .values()
             .filter(|s| s.spec.tier == tier)
             .filter_map(|s| s.filter.best_fresh(self.now, max_age))
+            .collect();
+        select(&samples, self.now, &self.cfg.selection)
+    }
+
+    /// Selection for tier usability. Like [`Engine::select_in`], but each
+    /// stored offset is corrected for the slew applied since it was taken
+    /// (ruling R50). Samples from different polls then measure the same
+    /// clock, so a fast slew cannot make agreeing sources disagree.
+    pub(super) fn select_now(&self, tier: Tier) -> Option<Selection> {
+        let max_age = self.cfg.selection.max_age;
+        let samples: Vec<Sample> = self
+            .sources
+            .values()
+            .filter(|s| s.spec.tier == tier)
+            .filter_map(|s| s.filter.best_fresh(self.now, max_age))
+            .map(|s| self.corrected(s))
             .collect();
         select(&samples, self.now, &self.cfg.selection)
     }
@@ -245,6 +261,9 @@ impl Engine {
                     .copied()
                     .or_else(|| s.filter.best_fresh(self.now, max_age))
             })
+            // The vote compares readings from different polls. Bring them
+            // to now (ruling R50). The fed selection stays raw.
+            .map(|s| self.corrected(s))
             .collect();
         let Some(tier_vote) = select(&vote, self.now, &self.cfg.selection) else {
             return;

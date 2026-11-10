@@ -333,9 +333,9 @@ pub struct Engine {
     step: StepState,
     /// A frequency the host has not been sent yet.
     pending_frequency: Option<Ppm>,
-    /// Slew part of the frequency in effect, in ppm. Zero while the clock
-    /// is not steered.
-    slew_ppm: f64,
+    /// Slew part of the frequency over time. Zero while the clock is not
+    /// steered.
+    steer: Steer,
     /// When the frequency last changed. Samples from before it measured a
     /// clock that has moved since, so they cannot decide a step.
     freq_changed_at: Option<Mono>,
@@ -379,7 +379,7 @@ impl Engine {
             gate: Gate::default(),
             step: StepState::Idle,
             pending_frequency: None,
-            slew_ppm: 0.0,
+            steer: Steer::default(),
             freq_changed_at: None,
             held_since: None,
             holdover: false,
@@ -647,7 +647,7 @@ impl Engine {
         self.gate = gate;
         match (was, gate.open()) {
             (true, false) => {
-                self.slew_ppm = 0.0;
+                self.set_slew(0.0);
                 out.push(Action::Log(LogEvent::AdjustmentDisabled { reason }));
             }
             (false, true) => {
@@ -814,9 +814,8 @@ impl Engine {
         let big = x.abs() > self.cfg.discipline.step_threshold.as_secs_f64();
         let limit = sel.error_bound.max(JITTER_FLOOR).as_secs_f64();
         let jumpy = self.prev_offset.is_some_and(|(prev, at)| {
-            let dt = self.now.saturating_duration_since(at).as_secs_f64();
             // A positive slew closes a positive offset.
-            let expected = prev.as_secs() - self.slew_ppm * PPM_PER_UNIT * dt;
+            let expected = prev.as_secs() - self.steer.since(at, self.now);
             (x - expected).abs() > limit
         });
         if big || jumpy {
@@ -832,7 +831,7 @@ impl Engine {
         self.freq_changed_at = Some(self.now);
         // The drift part only holds the clock's own error. The rest moves
         // the offset.
-        self.slew_ppm = f.value() - self.discipline.drift().value();
+        self.set_slew(f.value() - self.discipline.drift().value());
     }
 
     fn set_frequency(&mut self, f: Ppm) {
@@ -922,8 +921,10 @@ impl Engine {
 }
 
 mod rounds;
+mod steer;
 
 use rounds::Round;
+use steer::Steer;
 
 #[cfg(test)]
 mod tests;
