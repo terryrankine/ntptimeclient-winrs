@@ -145,16 +145,6 @@ fn failed_writes_are_counted_and_not_fatal() {
     assert_eq!(sink.counts().failed.load(Ordering::Relaxed), 5);
 }
 
-#[test]
-fn tee_sends_to_every_sink() {
-    let a = Arc::new(crate::logging::MemorySink::new());
-    let b = Arc::new(crate::logging::MemorySink::new());
-    let tee = TeeSink(vec![a.clone(), b.clone()]);
-    tee.write_line("x");
-    assert_eq!(a.lines(), vec!["x".to_owned()]);
-    assert_eq!(b.lines(), vec!["x".to_owned()]);
-}
-
 // ---- Source registration over a fake registry ----
 
 #[derive(Default)]

@@ -16,6 +16,7 @@ use crate::logging::{ConsoleSink, LineLogger, LogSink, Logger};
 use crate::registration::{ExeLocator, RealExeLocator, RealScm, SERVICE_NAME, ScmRegistration};
 use crate::service::{DepsLauncher, JobError, Launcher, ServiceRun, Started, real::service_main};
 use crate::transport::StdTimeSource;
+use crate::winimpl::{ResumeNotifier, WinDepsError, windows_deps};
 
 /// The host launcher.
 ///
@@ -25,7 +26,42 @@ use crate::transport::StdTimeSource;
 /// Until then `install` refuses (exit 9) and `run` and `service` stop
 /// with "host not built".
 fn launcher() -> DepsLauncher {
-    DepsLauncher::pending()
+    DepsLauncher::new(Arc::new(|cfg, sinks, started| {
+        // 14c-A takes boxed sinks. Each shared sink goes in through the
+        // `LogSink for Arc<T>` impl in `event_log`.
+        let boxed: Vec<Box<dyn LogSink>> = sinks
+            .into_iter()
+            .map(|s| Box::new(s) as Box<dyn LogSink>)
+            .collect();
+        let w = windows_deps(cfg, boxed).map_err(job_error)?;
+        if !started(Started {
+            control: w.control,
+            resume: Arc::new(w.resume),
+        }) {
+            return Ok(());
+        }
+        crate::host::run(cfg.clone(), w.deps, w.inbox).map_err(JobError::Host)
+    }))
+}
+
+/// Each 14c-A refusal with its own service exit code (R111).
+#[allow(clippy::needless_pass_by_value)]
+fn job_error(e: WinDepsError) -> JobError {
+    match e {
+        WinDepsError::Clock(_) => JobError::Clock(e.to_string()),
+        WinDepsError::UntrustedAccount | WinDepsError::AccountUnreadable(_) => {
+            JobError::Account(e.to_string())
+        }
+        WinDepsError::NoSinks => JobError::Deps(e.to_string()),
+    }
+}
+
+impl crate::service::Resume for ResumeNotifier {
+    fn notify_resumed(&self) {
+        // The inherent method, named in full: a plain call here would pick
+        // this trait method again and recurse.
+        ResumeNotifier::notify_resumed(self);
+    }
 }
 
 /// The folder of the running exe, resolved.
@@ -252,5 +288,35 @@ fn service(err: &mut dyn Write) -> u8 {
             );
             exit::SERVICE_FAILED
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_deps_refusal_gets_its_own_job_error() {
+        assert!(matches!(
+            job_error(WinDepsError::UntrustedAccount),
+            JobError::Account(_)
+        ));
+        assert!(matches!(
+            job_error(WinDepsError::AccountUnreadable(std::io::ErrorKind::Other)),
+            JobError::Account(_)
+        ));
+        assert!(matches!(
+            job_error(WinDepsError::NoSinks),
+            JobError::Deps(_)
+        ));
+        assert!(matches!(
+            job_error(WinDepsError::Clock(ntpc_core::ClockError::PermissionDenied)),
+            JobError::Clock(_)
+        ));
+    }
+
+    #[test]
+    fn the_real_launcher_is_ready() {
+        assert_eq!(launcher().ready(), Ok(()));
     }
 }

@@ -510,6 +510,35 @@ fn refused_state_dir_keeps_timekeeping_without_files() {
 }
 
 #[test]
+fn a_replaced_state_dir_is_logged_once_and_keeps_persistence() {
+    const LINE: &str = "state directory replaced: previous log, drift and status were discarded";
+    for outcome in [SecureOutcome::Replaced, SecureOutcome::RestoreDropped] {
+        let mut rig = Rig::new(0.050, 20.0);
+        rig.state = outcome;
+        rig.run(2 * HOUR);
+        let n = rig.lines().iter().filter(|l| l.contains(LINE)).count();
+        assert_eq!(n, 1, "{outcome:?}");
+        assert!(
+            rig.lines()
+                .iter()
+                .any(|l| l.contains(" WARN ") && l.contains(LINE))
+        );
+        assert_eq!(lock(&rig.drift).loads, 1, "persistence on: {outcome:?}");
+        assert!(
+            !lock(&rig.reports).is_empty(),
+            "status written: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn a_kept_state_dir_logs_no_replacement() {
+    let mut rig = Rig::new(0.0, 0.0);
+    rig.run(60);
+    assert!(!rig.log_has("state directory replaced"));
+}
+
+#[test]
 fn status_is_written_every_30_seconds() {
     let mut rig = Rig::new(0.0, 0.0);
     rig.run(HOUR);
@@ -755,9 +784,9 @@ fn panicking_dhcp_reads_are_reported_and_the_reader_stops() {
     rig.dhcp.panics.store(true, Ordering::SeqCst);
     rig.network_at = vec![700.0, 1400.0, 2100.0, 2800.0];
     rig.run(HOUR);
-    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (1 of 3)"));
-    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (3 of 3)"));
-    assert!(rig.log_has("the DHCP reader stopped"));
+    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (1 in 10 min"));
+    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (3 in 10 min"));
+    assert!(rig.log_has("the DHCP reader stopped. A fresh reader starts in 4 h"));
     assert_eq!(
         read_times(&rig).len(),
         3,
@@ -789,4 +818,163 @@ fn stuck_lookups_are_capped_at_three() {
     assert!(rig.log_has("3 name lookups are stuck. No new lookup starts"));
     // Let the stuck threads end.
     rig.lookup.hang.store(false, Ordering::SeqCst);
+}
+
+// ------------------------------------------------------------ fix round 2
+
+#[test]
+fn failed_hand_back_is_retried_while_w32time_runs() {
+    // R102: the first two resets fail, the third works.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    lock(&rig.world).fail_reset = 2;
+    rig.run(3 * HOUR);
+    let resets: Vec<(f64, bool)> = rig
+        .commands()
+        .iter()
+        .filter(|c| c.1 == Cmd::Reset)
+        .map(|c| (as_secs(c.0), c.2))
+        .collect();
+    assert_eq!(resets.len(), 3, "{resets:?}");
+    assert_eq!(
+        resets.iter().map(|r| r.1).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    let p = LEVEL_PERIOD.as_secs_f64();
+    assert!(resets[0].0 >= 3600.0 && resets[0].0 <= 3600.0 + p);
+    assert!((resets[1].0 - resets[0].0 - p).abs() < 1.0, "{resets:?}");
+    assert!((resets[2].0 - resets[1].0 - p).abs() < 1.0, "{resets:?}");
+    assert!(rig.log_has("could not hand the clock rate back: clock change rejected"));
+}
+
+#[test]
+fn hand_back_pending_at_stop_still_resets() {
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    lock(&rig.world).fail_reset = 1_000;
+    rig.run(2 * HOUR);
+    let resets = times_of(&rig, Cmd::Reset);
+    // Every check while w32time runs, plus one at stop.
+    assert!(resets.len() > 100, "{}", resets.len());
+    assert!(*resets.last().expect("some") >= 7199.0);
+}
+
+#[test]
+fn no_clock_command_after_w32time_is_seen_running() {
+    // M1: the monitor call itself takes long enough for the hold limit to
+    // pass. A tick in front of the false level would run holdover's
+    // frequency command after w32time was seen running.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    rig.monitor_advance_s = 2100;
+    rig.run(3 * HOUR);
+    let calls = lock(&rig.monitor_calls).clone();
+    let seen = calls
+        .iter()
+        .map(|t| as_secs(*t))
+        .find(|t| *t >= 3600.0)
+        .expect("a running check");
+    let after: Vec<_> = clock_cmds(&rig)
+        .into_iter()
+        .filter(|c| as_secs(c.0) >= seen)
+        .collect();
+    assert!(after.is_empty(), "{after:?}");
+}
+
+#[test]
+fn slow_failed_frequency_command_runs_nothing_before_the_rearm() {
+    // M4: a failing SetFrequency that takes past the hold limit. A tick in
+    // front of its ClockResult would run holdover's SetFrequency at once.
+    let mut rig = Rig::new(0.050, 20.0);
+    {
+        let mut w = lock(&rig.world);
+        w.fail_numbers.insert(5);
+        w.fail_advance_s = 2100;
+    }
+    rig.run(4 * HOUR);
+    let cmds = clock_cmds(&rig);
+    let i = cmds.iter().position(|c| !c.2).expect("the failure");
+    assert!(matches!(cmds[i].1, Cmd::Freq(_)), "{cmds:?}");
+    let gap = cmds[i + 1].0.saturating_duration_since(cmds[i].0);
+    assert!(
+        gap >= Duration::from_secs(2100) + REARM_FIRST,
+        "next command {gap:?} after the failure"
+    );
+}
+
+#[test]
+fn a_panicking_log_sink_at_stop_does_not_skip_the_reset() {
+    // M3: the loop panics, then the sink panics on the panic log line.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_panic_at = Some(600.0);
+    rig.sink_panic_on = Some("the host loop panicked");
+    let r = rig.try_run(HOUR);
+    assert!(
+        matches!(r, Err(ntpc_service::host::HostError::Panicked(_))),
+        "{r:?}"
+    );
+    assert_eq!(times_of(&rig, Cmd::Reset).len(), 1);
+}
+
+#[test]
+fn queries_that_cannot_start_answer_after_the_batch() {
+    // M2: with no thread for queries, the host answers each one as
+    // unreachable itself, after the batch. It keeps running, and nothing
+    // moves the clock but the enable's drift frequency.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.no_spawn = true;
+    rig.run(HOUR);
+    assert!(rig.log_has("could not start a query thread"));
+    let r = lock(&rig.reports).last().cloned().expect("report").1;
+    assert!(r.counters.unreachable >= 4, "{:?}", r.counters);
+    assert_eq!(r.counters.samples, 0);
+    assert!(clock_cmds(&rig).iter().all(|c| matches!(c.1, Cmd::Freq(_))));
+}
+
+#[test]
+fn a_stopped_dhcp_reader_is_restarted_after_the_re_read_interval() {
+    // R103: three panics stop the reader. After 4 h a fresh one starts.
+    let mut rig = dhcp_rig();
+    rig.dhcp.panics.store(true, Ordering::SeqCst);
+    rig.network_at = vec![700.0, 1400.0, 2100.0];
+    rig.run(5 * HOUR);
+    assert!(rig.log_has("starting a fresh DHCP reader"));
+    let t = read_times(&rig);
+    assert_eq!(t.len(), 4, "{t:?}");
+    assert!(t[3] >= 2100.0 + 4.0 * 3600.0, "{t:?}");
+}
+
+#[test]
+fn escape_covers_the_remaining_format_characters_and_hangul_fillers() {
+    // M7.
+    for c in [
+        '\u{0600}',
+        '\u{0605}',
+        '\u{06DD}',
+        '\u{070F}',
+        '\u{08E2}',
+        '\u{110BD}',
+        '\u{110CD}',
+        '\u{1D173}',
+        '\u{1D17A}',
+        '\u{115F}',
+        '\u{1160}',
+        '\u{3164}',
+        '\u{FFA0}',
+    ] {
+        let e = escape(&format!("a{c}b"));
+        assert_eq!(e, format!("a\\u{{{:04X}}}b", u32::from(c)), "{c:?}");
+    }
+    // Ordinary text of many scripts stays as it is.
+    for text in [
+        "Zürich Ångström façade",
+        "Ελληνικά",
+        "Кириллица",
+        "漢字かなカナ",
+        "한국어 서버",
+        "emoji 😀 🕒",
+        "עברית العربية",
+    ] {
+        assert_eq!(escape(text), text);
+    }
 }

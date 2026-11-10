@@ -9,13 +9,14 @@ use std::time::Duration;
 use ntpc_core::engine::{Action, Engine, Event};
 use ntpc_core::{Mono, Offset, Ppm, QueryFailure, SourceId, SourceSpec, Tier};
 
-use super::dhcp::DhcpSchedule;
+use super::dhcp::{DHCP_REREAD, DhcpSchedule};
 use super::inflight::InFlight;
 use super::startup::{load_drift, log_start, secure_state_dir, start_dhcp_reader};
 use super::{
-    AdapterKey, ClockControl, DriftFile, HostDeps, HostResolver, Inbox, Inner, LEVEL_PERIOD, Msg,
-    NetworkEvents, PowerEvents, QUERY_TIMEOUT, QUERY_WATCHDOG, REARM_FIRST, REARM_MAX,
-    RESOLVE_GIVE_UP, STATUS_PERIOD, ServiceMonitor, SharedLookup, SharedOwn, Spawn, Waiter,
+    AdapterKey, ClockControl, DhcpSource, DriftFile, HostDeps, HostResolver, Inbox, Inner,
+    LEVEL_PERIOD, Msg, NetworkEvents, PowerEvents, QUERY_TIMEOUT, QUERY_WATCHDOG, REARM_FIRST,
+    REARM_MAX, RESOLVE_GIVE_UP, STATUS_PERIOD, ServiceMonitor, SharedLookup, SharedOwn, Spawn,
+    Waiter,
 };
 use crate::config::Config;
 use crate::logging::{Level, Logger, engine_event};
@@ -32,10 +33,16 @@ const MAX_ABANDONED_LOOKUPS: usize = 3;
 /// `ClockResult` is not such an event: it belongs to the batch that made
 /// the action, and a tick in between could run new clock actions before
 /// the engine hears of a failure, or pair a result with the wrong action.
+///
+/// `AdjustmentAllowed(false)` gets none either. It must close the gate
+/// before anything else runs: a tick first could run clock actions after
+/// the host has seen w32time running. The engine stamps the close with the
+/// last time it saw, at most one loop turn old, which only dates the zero
+/// slew it records.
 fn needs_tick(ev: &Event, fed: Option<Mono>, now: Mono) -> bool {
     let timeless = matches!(
         ev,
-        Event::Failed(..) | Event::SourcesChanged(_) | Event::AdjustmentAllowed(_)
+        Event::Failed(..) | Event::SourcesChanged(_) | Event::AdjustmentAllowed(true)
     );
     timeless && fed.is_none_or(|f| f < now)
 }
@@ -50,8 +57,11 @@ fn later(at: Mono, by: Duration) -> Mono {
 }
 
 struct DhcpReader {
-    requests: Sender<BTreeSet<AdapterKey>>,
+    /// `None` after the reader thread stopped, until `respawn_at`.
+    requests: Option<Sender<BTreeSet<AdapterKey>>>,
     schedule: DhcpSchedule,
+    source: Arc<dyn DhcpSource>,
+    respawn_at: Option<Mono>,
 }
 
 #[expect(
@@ -110,6 +120,8 @@ pub(super) struct Host {
     stopping: bool,
     /// `take_rate_control` succeeded. Then stop resets the rate.
     rate_taken: bool,
+    /// A hand-back to w32time failed and is retried (R102).
+    reset_pending: bool,
     last_saved_drift: Option<Ppm>,
     last_step: Option<(i128, f64)>,
     counters: Counters,
@@ -150,9 +162,11 @@ impl Host {
         let engine = Engine::new(cfg.engine_config(), loaded);
 
         let dhcp_reader = if cfg.dhcp {
-            start_dhcp_reader(dhcp, tx.clone(), &*logger).map(|requests| DhcpReader {
-                requests,
+            start_dhcp_reader(Arc::clone(&dhcp), tx.clone(), &*logger).map(|requests| DhcpReader {
+                requests: Some(requests),
                 schedule: DhcpSchedule::new(now),
+                source: dhcp,
+                respawn_at: None,
             })
         } else {
             None
@@ -202,6 +216,7 @@ impl Host {
             started_at: now,
             stopping: false,
             rate_taken: false,
+            reset_pending: false,
             last_saved_drift: loaded,
             last_step: None,
             counters: Counters::default(),
@@ -286,7 +301,13 @@ impl Host {
             self.resolving_since
                 .and_then(|t| t.checked_add(RESOLVE_GIVE_UP)),
         );
-        d.push(self.dhcp.as_ref().and_then(|r| r.schedule.due_at()));
+        d.push(self.dhcp.as_ref().and_then(|r| {
+            if r.requests.is_some() {
+                r.schedule.due_at()
+            } else {
+                r.respawn_at
+            }
+        }));
         let next = d
             .into_iter()
             .flatten()
@@ -314,6 +335,9 @@ impl Host {
         }
         let actions = self.engine.handle(ev);
         let mut results = Vec::new();
+        // Answers the host gives itself (a query it could not start). They
+        // go in after this batch's clock results, never in the middle.
+        let mut later_events = Vec::new();
         let mut failed = false;
         for action in actions {
             match action {
@@ -331,7 +355,7 @@ impl Host {
                     }
                     results.push(r);
                 }
-                Action::Query { source, .. } => self.start_query(source),
+                Action::Query { source, .. } => later_events.extend(self.start_query(source)),
                 Action::SaveDrift(p) => self.save_drift(p),
                 Action::Log(e) => {
                     let addrs = &self.addrs;
@@ -346,6 +370,9 @@ impl Host {
         }
         for r in results {
             self.feed(Event::ClockResult(r));
+        }
+        for ev in later_events {
+            self.feed(ev);
         }
     }
 
@@ -391,6 +418,34 @@ impl Host {
         self.feed(Event::AdjustmentAllowed(allowed));
     }
 
+    /// Resets the rate for w32time. On failure the reset stays pending.
+    fn hand_back(&mut self) {
+        match self.clock.reset_frequency() {
+            Ok(()) => {
+                self.reset_pending = false;
+                self.log(
+                    Level::Info,
+                    "rate_control",
+                    "w32time runs: clock rate handed back to the system",
+                );
+            }
+            Err(e) => {
+                self.reset_pending = true;
+                self.counters.clock_failures += 1;
+                // Rate limited by kind, so a reset that keeps failing
+                // every 30 s cannot fill the log.
+                self.log(
+                    Level::Error,
+                    "rate_control",
+                    &format!(
+                        "w32time runs: could not hand the clock rate back: {e}. Retrying in {} s",
+                        LEVEL_PERIOD.as_secs()
+                    ),
+                );
+            }
+        }
+    }
+
     /// Asks the monitor, re-sends the level and re-arms after a failure.
     fn check_level(&mut self, now: Mono) {
         self.next_level = later(now, LEVEL_PERIOD);
@@ -412,24 +467,12 @@ impl Host {
             self.send_level(false);
             // R98: hand the rate back at once, so our last frequency with
             // the OS kept out does not stay in force under w32time. The
-            // next enable takes it again. Stop then leaves it alone.
-            if self.rate_taken {
+            // next enable takes it again. Stop then leaves it alone. R102:
+            // a failed hand-back is retried at every check while w32time
+            // runs.
+            if self.rate_taken || self.reset_pending {
                 self.rate_taken = false;
-                match self.clock.reset_frequency() {
-                    Ok(()) => self.log(
-                        Level::Info,
-                        "rate_control",
-                        "w32time runs: clock rate handed back to the system",
-                    ),
-                    Err(e) => {
-                        self.counters.clock_failures += 1;
-                        self.log(
-                            Level::Error,
-                            "rate_control",
-                            &format!("w32time runs: could not hand the clock rate back: {e}"),
-                        );
-                    }
-                }
+                self.hand_back();
             }
             return;
         }
@@ -449,6 +492,8 @@ impl Host {
             match self.clock.take_rate_control() {
                 Ok(()) => {
                     self.rate_taken = true;
+                    // Taking the rate overrides a hand-back still pending.
+                    self.reset_pending = false;
                     self.latched = false;
                     self.log(
                         Level::Info,
@@ -483,21 +528,21 @@ impl Host {
 
     // ------------------------------------------------------------ queries
 
-    fn start_query(&mut self, source: SourceId) {
+    /// Starts a query. Returns the event to feed if it could not start.
+    fn start_query(&mut self, source: SourceId) -> Option<Event> {
         if self.stopping {
-            return;
+            return None;
         }
         let Some((addr, _)) = self.addrs.get(&source).cloned() else {
             // The engine only asks for listed sources. Answer anyway, the
             // contract wants one answer per query.
             self.counters.unreachable += 1;
-            self.feed(Event::Failed(source, QueryFailure::Unreachable));
-            return;
+            return Some(Event::Failed(source, QueryFailure::Unreachable));
         };
         let Some(ticket) = self.in_flight.begin(source, addr, self.time.mono()) else {
             // R15: the running query answers this one too.
             self.counters.duplicate_queries += 1;
-            return;
+            return None;
         };
         self.counters.queries += 1;
         let transport = Arc::clone(&self.transport);
@@ -518,8 +563,9 @@ impl Host {
                 "spawn",
                 "could not start a query thread. The query counts as unreachable",
             );
-            self.feed(Event::Failed(source, QueryFailure::Unreachable));
+            return Some(Event::Failed(source, QueryFailure::Unreachable));
         }
+        None
     }
 
     fn run_watchdog(&mut self, now: Mono) {
@@ -581,17 +627,44 @@ impl Host {
         let Some(d) = self.dhcp.as_mut() else {
             return;
         };
+        if d.requests.is_none() {
+            if d.respawn_at.is_some_and(|t| now < t) {
+                return;
+            }
+            let Some(requests) =
+                start_dhcp_reader(Arc::clone(&d.source), self.tx.clone(), &*self.logger)
+            else {
+                d.respawn_at = Some(later(now, DHCP_REREAD));
+                return;
+            };
+            d.requests = Some(requests);
+            d.respawn_at = None;
+            self.logger
+                .log(Level::Info, "dhcp", "starting a fresh DHCP reader");
+        }
+        let Some(d) = self.dhcp.as_mut() else {
+            return;
+        };
         if d.schedule.due_at().is_none_or(|t| t > now) {
             return;
         }
         let skip = d.schedule.start(now);
-        if d.requests.send(skip).is_err() {
-            // The reader thread is gone. No more DHCP for this run.
-            self.dhcp = None;
+        let sent = d.requests.as_ref().is_some_and(|r| r.send(skip).is_ok());
+        if !sent {
+            // The reader thread stopped after repeated panics. The read
+            // never ran, so it ends here, and a fresh reader starts after
+            // the re-read interval.
+            d.requests = None;
+            d.respawn_at = Some(later(now, DHCP_REREAD));
+            d.schedule
+                .finish(&Err(super::DhcpReadError("reader stopped".into())));
             self.log(
                 Level::Error,
                 "dhcp",
-                "the DHCP reader stopped. DHCP servers are no longer read",
+                &format!(
+                    "the DHCP reader stopped. A fresh reader starts in {} h",
+                    DHCP_REREAD.as_secs() / 3600
+                ),
             );
         }
     }
@@ -719,31 +792,34 @@ impl Host {
 
     // ------------------------------------------------------------ stop
 
-    pub(super) fn log_panic(&self, message: &str) {
-        self.log(
-            Level::Error,
-            "panic",
-            &format!("the host loop panicked: {message}. Stopping"),
-        );
-    }
-
-    pub(super) fn shutdown(&mut self) {
+    /// The stop sequence. The rate reset comes first, before any log line,
+    /// so a log sink that panics cannot skip it. `panic` is the text of a
+    /// loop panic, logged right after the reset.
+    pub(super) fn shutdown(&mut self, panic: Option<&str>) {
         let now = self.time.mono();
         self.stopping = true;
-        self.log(Level::Info, "stop", "stopping");
         // R71: hand the rate back so w32time can take over. Skipped if it
-        // was never taken: then this run never touched the clock.
-        if self.rate_taken {
-            match self.clock.reset_frequency() {
-                Ok(()) => self.log(Level::Info, "stop", "clock rate handed back to the system"),
-                Err(e) => {
-                    self.counters.clock_failures += 1;
-                    self.log(
-                        Level::Error,
-                        "stop",
-                        &format!("could not hand the clock rate back: {e}"),
-                    );
-                }
+        // was never taken and no hand-back is pending: then the clock is
+        // not ours to touch.
+        let reset = (self.rate_taken || self.reset_pending).then(|| self.clock.reset_frequency());
+        if let Some(m) = panic {
+            self.log(
+                Level::Error,
+                "panic",
+                &format!("the host loop panicked: {m}. Stopping"),
+            );
+        }
+        self.log(Level::Info, "stop", "stopping");
+        match reset {
+            None => {}
+            Some(Ok(())) => self.log(Level::Info, "stop", "clock rate handed back to the system"),
+            Some(Err(e)) => {
+                self.counters.clock_failures += 1;
+                self.log(
+                    Level::Error,
+                    "stop",
+                    &format!("could not hand the clock rate back: {e}"),
+                );
             }
         }
         let drift = self.engine.status().drift;
@@ -789,6 +865,7 @@ mod tests {
             now
         ));
         assert!(needs_tick(&Event::AdjustmentAllowed(true), fed, now));
+        assert!(!needs_tick(&Event::AdjustmentAllowed(false), fed, now));
         assert!(!needs_tick(&Event::AdjustmentAllowed(true), fed, then));
         assert!(!needs_tick(&Event::Tick(now), fed, now));
     }

@@ -6,9 +6,11 @@
 //!
 //! Nothing here decides policy. `clock` and `acl` do that.
 
+pub(crate) mod adapters;
 pub(crate) mod dhcp;
 pub(crate) mod scm;
 pub(crate) mod service;
+pub(crate) mod thread;
 
 use std::ffi::c_void;
 use std::io;

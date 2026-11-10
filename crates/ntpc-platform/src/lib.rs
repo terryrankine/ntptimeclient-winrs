@@ -22,6 +22,12 @@ pub mod install_location;
 #[cfg(windows)]
 pub mod service_host;
 
+/// This machine's own unicast addresses.
+pub mod net;
+
+/// The calling thread's priority, for the timing path.
+pub mod thread;
+
 /// State directory security. Windows only.
 #[cfg(windows)]
 pub mod acl;
@@ -60,6 +66,36 @@ pub fn replace_file_write_through(
     win32::scm::replace_file_write_through(from, to)
 }
 
+/// Whether this process's token gives new objects a trusted owner: SYSTEM
+/// or Administrators. Every file the service writes in the state directory
+/// gets that owner, and any other owner makes the next start replace the
+/// directory (R106). Read only.
+///
+/// # Errors
+/// The OS error if the token cannot be read.
+#[cfg(windows)]
+pub fn default_owner_is_trusted() -> std::io::Result<bool> {
+    Ok(matches!(
+        win32::token_default_owner()?,
+        win32::Principal::System | win32::Principal::Administrators
+    ))
+}
+
+/// The hard link count of an open file. Read only, through the handle, so
+/// a rename after the open cannot change the answer. Stable `std` has no
+/// way to read it on Windows. The host's log file sink refuses a file with
+/// more than one link (R75): a planted hard link would point our writes at
+/// a file someone else chose.
+///
+/// # Errors
+/// The OS error.
+#[cfg(windows)]
+pub fn file_link_count(file: &std::fs::File) -> std::io::Result<u32> {
+    // A duplicate of the handle, so the wrapper can take an OwnedHandle.
+    let h = std::os::windows::io::OwnedHandle::from(file.try_clone()?);
+    Ok(win32::link_info(&h)?.links)
+}
+
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";
 
@@ -75,5 +111,34 @@ mod tests {
     #[test]
     fn depends_on_core() {
         assert_eq!(ntpc_core::CRATE_NAME, "ntpc-core");
+    }
+
+    /// Read only: `GetTokenInformation(TokenOwner)` on this process.
+    #[cfg(windows)]
+    #[test]
+    fn default_owner_reads() {
+        let _trusted: bool = default_owner_is_trusted().expect("token owner");
+    }
+
+    /// Only files in a fresh directory under the system temp folder. The
+    /// directory is removed at the end.
+    #[cfg(windows)]
+    #[test]
+    fn link_count_sees_a_hard_link_on_read_and_append_handles() {
+        use std::fs::{self, OpenOptions};
+        let dir = std::env::temp_dir().join(format!("ntpc-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).expect("temp dir");
+        let one = dir.join("one.log");
+        fs::write(&one, b"x").expect("write");
+        let read = fs::File::open(&one).expect("open");
+        assert_eq!(file_link_count(&read).expect("count"), 1);
+        let append = OpenOptions::new().append(true).open(&one).expect("append");
+        assert_eq!(file_link_count(&append).expect("count on append"), 1);
+        fs::hard_link(&one, dir.join("two.log")).expect("hard link");
+        assert_eq!(file_link_count(&read).expect("count"), 2);
+        assert_eq!(file_link_count(&append).expect("count on append"), 2);
+        drop((read, append));
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 }

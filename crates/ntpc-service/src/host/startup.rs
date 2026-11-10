@@ -1,9 +1,11 @@
 //! Start-up steps and log texts, kept apart from the loop.
 
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
+use std::time::{Duration, Instant};
 
 use ntpc_core::Ppm;
 
@@ -17,10 +19,15 @@ use crate::resolver::ResolveNote;
 /// Name of the DHCP reader thread.
 const DHCP_THREAD: &str = "ntpc-dhcp";
 
-/// Panicking reads before the DHCP reader gives up. A reader that keeps
-/// panicking has a bug, and DHCP is a lower tier, so the service runs on
-/// without it and says so.
-pub(super) const MAX_DHCP_PANICS: u32 = 3;
+/// Panicking reads within [`DHCP_PANIC_WINDOW`] before the DHCP reader
+/// thread stops. A reader that keeps panicking has a bug, and DHCP is a
+/// lower tier, so the service runs on without it, says so, and starts a
+/// fresh reader after the re-read interval.
+pub(super) const MAX_DHCP_PANICS: usize = 3;
+
+/// The window the panic limit counts in. Rare panics spread over a long
+/// run do not stop the reader.
+pub(super) const DHCP_PANIC_WINDOW: Duration = Duration::from_secs(600);
 
 /// The start lines: version, join state, active config and its warnings.
 pub(super) fn log_start(cfg: &Config, join: &dyn super::JoinStateProvider, logger: &dyn Logger) {
@@ -57,7 +64,13 @@ pub(super) fn secure_state_dir(state_dir: &dyn super::StateDir, logger: &dyn Log
             logger.log(Level::Info, "state_dir", "state directory secured");
             true
         }
+        SecureOutcome::Replaced => {
+            logger.log(Level::Info, "state_dir", "state directory secured");
+            log_replaced(logger);
+            true
+        }
         SecureOutcome::RestoreDropped => {
+            log_replaced(logger);
             logger.log(
                 Level::Warn,
                 "state_dir",
@@ -78,6 +91,15 @@ pub(super) fn secure_state_dir(state_dir: &dyn super::StateDir, logger: &dyn Log
             false
         }
     }
+}
+
+/// R108: once per start that replaced the directory.
+fn log_replaced(logger: &dyn Logger) {
+    logger.log(
+        Level::Warn,
+        "state_dir",
+        "state directory replaced: previous log, drift and status were discarded",
+    );
 }
 
 /// Loads the saved drift and logs the note.
@@ -116,16 +138,27 @@ pub(super) fn start_dhcp_reader(
             // after too many panics. A read that panics still answers, so
             // the loop's busy flag clears. After the last one the request
             // channel closes and the loop sees the reader is gone.
-            let mut panics = 0u32;
+            // Real time on purpose: the window guards this thread's CPU and
+            // log, whatever the host's clock does.
+            let mut recent: VecDeque<Instant> = VecDeque::new();
             while let Ok(skip) = req_rx.recv() {
                 let read = std::panic::catch_unwind(AssertUnwindSafe(|| source.read(&skip)));
                 let result = read.unwrap_or_else(|_| {
-                    panics += 1;
+                    let now = Instant::now();
+                    recent.push_back(now);
+                    while recent
+                        .front()
+                        .is_some_and(|t| now.duration_since(*t) > DHCP_PANIC_WINDOW)
+                    {
+                        recent.pop_front();
+                    }
                     Err(DhcpReadError(format!(
-                        "the DHCP read panicked ({panics} of {MAX_DHCP_PANICS})"
+                        "the DHCP read panicked ({} in {} min, the reader stops at {MAX_DHCP_PANICS})",
+                        recent.len(),
+                        DHCP_PANIC_WINDOW.as_secs() / 60
                     )))
                 });
-                if tx.send(Msg(Inner::Dhcp(result))).is_err() || panics >= MAX_DHCP_PANICS {
+                if tx.send(Msg(Inner::Dhcp(result))).is_err() || recent.len() >= MAX_DHCP_PANICS {
                     break;
                 }
             }

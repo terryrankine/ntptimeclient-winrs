@@ -101,8 +101,12 @@ pub mod service_exit {
     pub const ENDED_UNASKED: u32 = 5;
     /// The host thread could not be started.
     pub const THREAD: u32 = 6;
-    /// Building the host adapters failed at run time.
+    /// Building the host adapters failed at run time, another reason.
     pub const DEPS_FAILED: u32 = 7;
+    /// The system clock could not be opened (usually the privilege).
+    pub const CLOCK: u32 = 8;
+    /// The service account is not `LocalSystem` or cannot be checked (R106).
+    pub const ACCOUNT: u32 = 9;
 }
 
 /// A reported state. The order is the only order reports may take.
@@ -406,9 +410,13 @@ impl Controller {
 /// Why the host run ended with an error.
 #[derive(Debug)]
 pub enum JobError {
-    /// Building the host adapters failed (14c-A `WinDepsError`, for
-    /// example the clock or an account or owner refusal).
+    /// Building the host adapters failed for another reason.
     Deps(String),
+    /// The system clock could not be opened (14c-A `WinDepsError::Clock`).
+    Clock(String),
+    /// The service account is refused (R106, `UntrustedAccount` or
+    /// `AccountUnreadable`).
+    Account(String),
     /// The host returned an error.
     Host(HostError),
 }
@@ -607,6 +615,14 @@ fn map_result(result: Option<Result<(), JobError>>, asked: bool, logger: &dyn Lo
                 &format!("building the host adapters failed: {e}"),
             );
             service_exit::DEPS_FAILED
+        }
+        Some(Err(JobError::Clock(e))) => {
+            log(logger, Level::Error, &format!("cannot start: {e}"));
+            service_exit::CLOCK
+        }
+        Some(Err(JobError::Account(e))) => {
+            log(logger, Level::Error, &format!("cannot start: {e}"));
+            service_exit::ACCOUNT
         }
         Some(Err(JobError::Host(HostError::Config(e)))) => {
             log(logger, Level::Error, &format!("cannot start: {e}"));
