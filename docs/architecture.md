@@ -190,9 +190,9 @@ Each line names its source. "Measured" means read on the builder's Windows 11 ma
 - Stop refused: nothing changed. Stop timeout: the stop was sent and may still finish. The record stays so uninstall can restore. Disable fails after the stop: `w32time` is started again if it was running (rollback), and both errors are reported.
 - Restore sets the recorded start type. It starts `w32time` only if it was running and the recorded start type is not `Disabled`, because a disabled service cannot be started.
 - Uninstall with no record leaves `w32time` alone and says so. Guessing a start type could undo an administrator's deliberate choice. If `w32time` is disabled at that point (no record, a `Dropped` or untrusted record, an invalid record, or a missing state directory), uninstall exits 18 (`NO_RECORD_DISABLED`) instead of 0, says `w32time` is still disabled and prints the manual restore hint once (R92).
-- Uninstall order (R94): stop our service, put `w32time` back, then remove our registration. When `w32time` was not put back (exit 10 or 18) the registration is kept, stopped, and the run says so. The machine then keeps our time sync rather than none. Gap: the hook has no "start our service again", so it stays stopped until the next boot or a manual start.
+- Uninstall order (R94): stop our service, put `w32time` back, then remove our registration. When `w32time` was not put back (exit 10 or 18) the registration is kept, stopped, and the run says so. The machine then keeps our time sync rather than none. Since Task 14c-B the run also starts our service again when it stopped it at the start, and says so. A failed restart is reported with `sc.exe start ntptimeclient-winrs`.
 - Uninstall does not create a missing state directory (N5). It looks first without creating anything (`symlink_metadata` on the path and its parent). Missing means no record. A missing parent folder is reported as "state directory unavailable". Install refuses on a missing parent folder with exit 6 and that text. The read-only verify variant of `secure_state_dir` is still deferred. For an existing directory, uninstall calls `secure_state_dir`, which may fix its DACL.
-- Install exit 9 means registration is not built (not ready), nothing changed. Exit 19 means registering failed after the takeover. The text says whether `w32time` was put back (R95).
+- Install exit 9 means registration is not built (not ready: since Task 14c-B, the Windows host adapters are missing), nothing changed. Exit 20 means the exe location is not administrators-only, nothing changed. Exit 19 means registering failed after the takeover. The text says whether `w32time` was put back (R95).
 - `is_running` reports true on any query error, `NotFound` included (R85). When we cannot tell, the engine must not adjust the clock. A "not found" can also come from a broken service database.
 - The rollback start after a failed disable keys on the state seen at entry, not on the record. On a re-install the record can say "was running" while `w32time` was stopped at entry (M2).
 - A takeover that fails before any change (first query, record save, refused stop) removes the record this run wrote. A pre-existing record is never removed there. A failure after a change keeps the record and says to run uninstall (M8).
@@ -275,3 +275,146 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 - `wait(timeout)` blocks until a change, the timeout or a cancel. Bursts coalesce into one change. `WatchCanceller` wakes a blocked `wait` from another thread.
 - Drop: cancels waiters, then calls `CancelMibChangeNotify2`. Learn says the cancel must not run on the callback thread, else deadlock. That only makes sense if the cancel waits for a running callback. So the context is freed after the cancel returns. Inference, not stated outright. If the cancel fails, the context is leaked on purpose (a few bytes) and never freed under a live callback. The callback only takes a short mutex and never blocks, so the cancel cannot hang on it.
 - `LeaseTracker`: the first list counts as a change. The same set in another order is not a change, because the resolver keys sources by address and the reader's order is already deterministic. Any add or remove is a change. All removed is a change to empty. On a read error the host keeps the last good list. An error is not a lost lease.
+
+## Service wrapper (Task 14c-B)
+
+Each line names its source. "Learn" means the linked Microsoft Learn page. "Measured" means read on the builder's machine with read-only calls. "Guess" means not found in the docs.
+
+### Sources
+
+- [StartServiceCtrlDispatcherW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-startservicectrldispatcherw)
+- [ServiceMain (LPSERVICE_MAIN_FUNCTIONW)](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nc-winsvc-lpservice_main_functionw)
+- [RegisterServiceCtrlHandlerExW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-registerservicectrlhandlerexw)
+- [HandlerEx (LPHANDLER_FUNCTION_EX)](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nc-winsvc-lphandler_function_ex)
+- [SetServiceStatus](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-setservicestatus)
+- [SERVICE_STATUS](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_status)
+- [WM_POWERBROADCAST](https://learn.microsoft.com/en-us/windows/win32/power/wm-powerbroadcast)
+- [CreateServiceW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-createservicew)
+- [ChangeServiceConfig2W](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfig2w)
+- [SERVICE_REQUIRED_PRIVILEGES_INFOW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_required_privileges_infow)
+- [SERVICE_FAILURE_ACTIONSW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_failure_actionsw)
+- [SERVICE_FAILURE_ACTIONS_FLAG](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_failure_actions_flag)
+- [SERVICE_SID_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_sid_info)
+- [DeleteService](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-deleteservice)
+- [Service Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/services/service-security-and-access-rights)
+- [ReportEventW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reporteventw)
+- [Event Sources](https://learn.microsoft.com/en-us/windows/win32/eventlog/event-sources)
+- [eventcreate](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/eventcreate)
+- [HandlerRoutine (console)](https://learn.microsoft.com/en-us/windows/console/handlerroutine)
+
+### Dispatcher and `ServiceMain`
+
+- The main thread calls `StartServiceCtrlDispatcherW` "within 30 seconds" of start. It "does not return until all running services in the process have entered the SERVICE_STOPPED state". The table ends with an all-null entry. For `SERVICE_WIN32_OWN_PROCESS` "the service name in the table entry is ignored" (Learn).
+- Run from a console it fails with `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` (1063) (Learn). `service` then exits 26 with a hint to use `run`. A read-only test checks the 1063.
+- The dispatcher "creates a new thread to execute the ServiceMain function" (Learn). Our `ServiceMain` runs the Rust body under `catch_unwind`. Its arguments are ignored.
+- `ServiceMain` "should immediately call RegisterServiceCtrlHandlerEx", then `SetServiceStatus` (Learn). Ours registers first, reports `START_PENDING`, then loads the config and opens the Event Log.
+- Learn suggests ending `ServiceMain` and finishing on a thread pool wait. Ours blocks `ServiceMain` until the host returns instead, as Learn's own sample (`SvcInit` in "Writing a ServiceMain Function") does. Guess that this is fine for an own-process service. The SCM gets reports from the handler and from `ServiceMain` either way.
+- The status handle "does not have to be closed" (Learn). `SetServiceStatus` may be called "at any time from any thread" (Learn), so the handle is `Send` and `Sync`.
+
+### Status reports
+
+- States (Learn, `SERVICE_STATUS`): `STOPPED 1`, `START_PENDING 2`, `STOP_PENDING 3`, `RUNNING 4`. Accept flags: `ACCEPT_STOP 0x1`, `ACCEPT_SHUTDOWN 0x4`, `ACCEPT_POWEREVENT 0x40`.
+- "Do not register to accept controls while the status is SERVICE_START_PENDING" (Learn). Ours accepts nothing while starting or stopping. `RUNNING` accepts STOP, SHUTDOWN and POWEREVENT.
+- `dwCheckPoint` counts up during a pending state and "should be zero" otherwise. Before `dwWaitHint` passes the service must bump the checkpoint or change state (Learn). Ours bumps about once a second while stopping, for at most the stop budget, so a hung host cannot fake progress for ever.
+- A service-specific code needs `dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR` (1066) and the code in `dwServiceSpecificExitCode` (Learn). A non-zero stop is logged by the SCM as event 7023 (Learn, `SetServiceStatus`).
+- `SERVICE_STOPPED` is sent "one time only". "Subsequent calls can cause the process to crash", and no work may follow it (Learn). The reporter refuses a second `STOPPED` and any backwards step. The Event Log is drained (2 s at most) before it.
+- Timing: start hint 30 s, stop hint 20 s, stop budget 15 s, poll 1 s. Learn gives "about 20 seconds" at system shutdown and 125 s from the Services snap-in. The budget plus one poll stays under the stop hint (tested). When the budget runs out the wrapper reports `STOPPED` with code 4 and the process ends. The next start resets the clock rate (R71).
+
+### Control handler
+
+- Codes (Learn): `STOP 1`, `INTERROGATE 4`, `SHUTDOWN 5`, `POWEREVENT 13`. STOP and SHUTDOWN: "must stop ... and return NO_ERROR". After them the SCM sends no other control. Unhandled: `ERROR_CALL_NOT_IMPLEMENTED` (120). `INTERROGATE`: `NO_ERROR`.
+- The handler "is intended to receive notification and return immediately", must not take a lock that could block, and must return within 30 s (Learn). Ours does one status report under a short uncontended mutex, a channel send to `HostControl::shutdown` or `HostControl::wake`, and two atomics. It runs under `catch_unwind` in `win32/service.rs` and answers `NO_ERROR` if a panic is caught.
+- `SERVICE_CONTROL_PRESHUTDOWN` is not used. Learn: it blocks system shutdown and should be used "only if it is absolutely necessary". The shutdown work (rate reset, drift, status) fits in the SHUTDOWN window.
+- Power events (Learn, `WM_POWERBROADCAST`): `PBT_APMSUSPEND 4`, `PBT_APMRESUMESUSPEND 7`, `PBT_APMRESUMEAUTOMATIC 18`, `PBT_POWERSETTINGCHANGE 0x8013`. "The system always sends a PBT_APMRESUMEAUTOMATIC message whenever the system resumes." `RESUMESUSPEND` follows it after user input. So `RESUMEAUTOMATIC` always marks a resume, and `RESUMESUSPEND` marks one only when no automatic resume came since the last suspend. One sleep gives the host one `Resumed`, so the engine gets one step, not two. Every resume calls `HostControl::wake`, so the host polls `PowerEvents::resumed` at once.
+
+### Registration (`registration.rs`)
+
+- `CreateServiceW` (Learn): the manager handle needs `SC_MANAGER_CREATE_SERVICE`. "If the path contains a space, it must be quoted". A null account means LocalSystem. Errors `ERROR_SERVICE_EXISTS` (1073) and `ERROR_SERVICE_MARKED_FOR_DELETE` (1072).
+- Image path: always `"<exe>" service`, quoted even without a space, so the unquoted service path weakness cannot apply. Only a plain `X:\...` path is accepted: no UNC share, no `\\?\` prefix, no quote or NUL, no trailing backslash (inside quotes it would escape the closing quote), at most 32,767 UTF-16 units. The exe path is the running exe from `current_exe`, resolved by `canonicalize` (the `\\?\` prefix is stripped for a drive path), never a path from the user.
+- Settings: `SERVICE_WIN32_OWN_PROCESS`, `SERVICE_AUTO_START` plus delayed auto start, `SERVICE_ERROR_NORMAL`, no dependencies, LocalSystem. Display name and an honest description (what it does, that it replaces `w32time` while installed, that it is an unsigned preview).
+- Re-install: `ERROR_SERVICE_EXISTS` leads to `ChangeServiceConfigW` with the same values, then the optional settings again. The account is passed as `LocalSystem` with an empty password. Guess: Learn for `ChangeServiceConfigW` was not re-read for the exact account spelling. VM check item.
+- `ChangeServiceConfig2W` (Learn) levels used: `DESCRIPTION 1`, `FAILURE_ACTIONS 2`, `DELAYED_AUTO_START_INFO 3`, `FAILURE_ACTIONS_FLAG 4`, `SERVICE_SID_INFO 5`, `REQUIRED_PRIVILEGES_INFO 6`. The handle needs `SERVICE_CHANGE_CONFIG`, and `SERVICE_START` for a restart action (Learn).
+- Failure actions: restart after 60 s, 60 s, then 5 min. "If N is greater than cActions, the service controller repeats the last action" (Learn). Reset period 1 day (guess, our choice). `fFailureActionsOnNonCrashFailures = TRUE`: actions also run when the service "enters the SERVICE_STOPPED state but the dwWin32ExitCode ... is not ERROR_SUCCESS" (Learn). So a host panic or a config error restarts too. The flag "takes effect the next time the system is started" (Learn).
+- A failure after the create (a `ChangeServiceConfig2W` step or the Event Log source) deletes the service this run created and reports both errors. A service that existed before the run is left registered. Install then puts `w32time` back (exit 19, existing Task 12 path).
+- `DeleteService` "marks a service for deletion". The entry goes once every handle is closed and the service is not running (Learn). `ERROR_SERVICE_MARKED_FOR_DELETE` on uninstall counts as removed. On install it refuses with advice to close the Services window or reboot.
+- Stop of our own service: `ControlService(STOP)` through the Task 12 wrapper, then polls every 250 ms for at most 30 s.
+- Install starts our service after registering (exit 21 when that fails, the install is kept and the text names `sc.exe start ntptimeclient-winrs`). Uninstall starts it again when it stopped it and `w32time` could not be put back (R94 concern).
+
+### Account and privileges (R104)
+
+- LocalSystem, cut down by `SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO` to `SeSystemtimePrivilege`. Learn: "If you specify privileges for a service, the SCM will remove the privileges that are not required from the process token when the process starts." The page names no account restriction. That it works for LocalSystem is inferred from that text. VM check item: `whoami /priv` from a service process, or Process Explorer.
+- The list is a multi-string, each entry NUL-terminated and one more NUL at the end (Learn). Tested.
+- `SeChangeNotifyPrivilege` "is never removed from a process token ... a service need not explicitly specify this privilege" (Learn). Not listed.
+- Minimum set: `SeSystemtimePrivilege` for `SetSystemTimeAdjustmentPrecise` and `SetSystemTime` (Task 11). Nothing else the wrapper or host calls needs a privilege: the state directory, the registry and the Event Log are reached through DACLs, and the token keeps its groups (SYSTEM, Administrators). Guess: the 14c-A thread priority raise needs none at normal or highest thread priority. If it uses a realtime priority class it needs `SeIncreaseBasePriorityPrivilege` added here.
+- Why not LocalService: the state directory DACL grants only SYSTEM and Administrators (Task 11). A low-privilege account could not write its drift, status or restore files.
+- Service SID type: `SERVICE_SID_TYPE_NONE`. A restricted SID adds the write-restricted SID and makes the token restricted (Learn, `SERVICE_SID_INFO`), so every write would also need the state directory DACL to name `NT SERVICE\ntptimeclient-winrs`. It does not today. Decide together with a change of the state directory ACL. Not now.
+
+### Exe location check (`install_location.rs`)
+
+- Install refuses (exit 20, nothing changed) unless the exe, its folder and every parent up to the drive root are administrators-only. The same masks as the Task 15 wrapper (`Test-LocationOrFail`): the exe and its folder must give no one else write, append, extended-attribute write, delete child, attribute write, delete, permission or owner rights, or generic write or all. A parent must give no one else delete child, delete, permission, owner, generic write or all (so `C:\` letting users create folders is fine). Owner must be SYSTEM, Administrators or TrustedInstaller. Inherit-only and deny ACEs are skipped. A null DACL, an ACE type the code cannot read, a reparse point anywhere and a non-fixed drive are refused.
+- It reuses the Task 11 read wrappers (`open_no_follow`, `attribute_tag`, `read_security`, `drive_type`). No new `unsafe`.
+- Measured: `System32\cmd.exe` passes, a file in the user's temp folder fails (read-only tests).
+
+### Event Log (`event_log.rs`)
+
+- Source key `HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\ntptimeclient-winrs` with `EventMessageFile` (`REG_SZ` or `REG_EXPAND_SZ`) and `TypesSupported` (`REG_DWORD`, "Unused") (Learn, Event Sources). A source name "cannot contain the backslash character". Without a message file "the Event Viewer cannot map any event identifiers ... and will display an error" (Learn).
+- Message file: `%SystemRoot%\System32\EventCreate.exe`, `TypesSupported` 7. Measured (read only): its message table maps ids 1 to 1001 to `%1`, and sources made by `eventcreate` use this file with 7. Learn only says `eventcreate /id` takes "any number from 1 to 1000". So the trick is undocumented: a guess that it keeps working. If not, the text still travels as the insertion string.
+- Ids: 1 information, 2 warning, 3 error, 10 the wrapper's own lines. Debug lines never go to the Event Log.
+- `ReportEventW` (Learn): types `ERROR 1`, `WARNING 2`, `INFORMATION 4`. "Each string is limited to 31,839 characters". "%n" in a string "is treated as an insertion string". Ours caps at 2,048 characters, escapes control characters again and writes `%` as `\u{25}`.
+- The logger never waits on the Event Log: a 256-line queue and one writer thread. A full queue drops and counts. A failed write is counted. Neither stops the service.
+- Install registers the source after the service. Uninstall removes it after the service, also when the service was already gone. A source key this run created is removed again if writing it fails.
+
+### Config file and state
+
+- Config: `config.toml` in the folder of the running exe. `install`, `uninstall` and `service` always use it, so they agree on `state_dir`. `run` and `status` take `--config <path>`. A missing file means the defaults. A file that exists but cannot be read or breaks a rule is an error (exit 25, service code 1), never the defaults. Read through `safe_open` (no link followed, a link refused) and capped at 64 KiB by `Config::load`. Errors in the Event Log carry no path.
+- Why there: install already refuses an exe folder that non-administrators can change, so the config adds no new place to protect. The state directory cannot hold it (unknown children are refused, R68). A new folder under `ProgramData` would be a new trust root that any user could create first.
+- The wrapper writes nothing in the exe folder. The service writes only in the state directory (host) and the Event Log.
+- `status` reads `status.json` from the configured state directory. The DACL stays SYSTEM and Administrators only (14a review D4), so `status` needs an elevated prompt. Access denied is its own exit code (24).
+
+### Panic policy
+
+- No `[profile]` section in any `Cargo.toml` of the workspace or `fuzz/`, so `panic = "unwind"` holds in every profile. The host's `catch_unwind` (14a) and every FFI callback here rely on it.
+
+### Exit codes
+
+Process exit codes. `cli::exit` (install and uninstall) and `app::exit` (the rest). None is in 40 to 47, the Task 15 wrapper's own codes (tested).
+
+| Code | Meaning |
+|---|---|
+| 0 | Done |
+| 2 | Usage: no command, unknown command or argument |
+| 3 | Not elevated |
+| 4 | Domain joined, silent, no `--confirm-domain-joined` |
+| 5 | User answered no |
+| 6 | State directory or record could not be secured, read, written or removed |
+| 7 | `restore.json` not valid |
+| 8 | `w32time` takeover failed |
+| 9 | Not ready: the host adapters are not built into this exe. Nothing changed |
+| 10 | Uninstall could not restore `w32time` |
+| 11 | Uninstall could not stop or remove our service |
+| 12 | No record and `w32time` already disabled |
+| 13 | Earlier restore record dropped to quarantine |
+| 14 | `RollbackFailed` |
+| 15 | Restore record carry failed |
+| 16 | Bad `state_dir` path |
+| 17 | Directory or record not trusted |
+| 18 | Uninstall: no usable record and `w32time` disabled |
+| 19 | Registering failed after the takeover |
+| 20 | Exe location not administrators-only. Nothing changed |
+| 21 | Installed, but our service did not start |
+| 22 | `status`: no `status.json` |
+| 23 | `status`: `status.json` not valid or unreadable |
+| 24 | `status`: access denied, run elevated |
+| 25 | Config file unreadable or invalid |
+| 26 | `service` run by hand, not by the SCM |
+| 27 | `run`: host adapters not built |
+| 28 | `run`: the host ended with an error |
+| 29 | `service`: dispatcher failed |
+| 30 | `run`: our service is running, or its state cannot be read |
+
+Service-specific exit codes (`dwServiceSpecificExitCode`, with `dwWin32ExitCode` 1066): 1 config, 2 host adapters not built, 3 host panicked, 4 stop timed out, 5 host ended unasked, 6 host thread not started, 7 building the adapters failed. 0 is a normal stop.
+
+### Coupling with Task 14c-A
+
+- The wrapper takes the host adapters through `service::DepsLauncher`, a function from `&Config` to `HostDeps`. It overwrites `power` (the wrapper's resume tracker) and `logger` (the Event Log logger). `app/real.rs` has one `launcher()` function that returns `DepsLauncher::pending()` until the adapters merge. While pending, install refuses with exit 9 and `run` and `service` stop with "host not built" (27, service code 2), so no machine loses `w32time` to a service that cannot run.
+- The file log sink and its names in `KNOWN_CHILDREN` are 14c-A's (R100). The service logger is the Event Log only until then.
