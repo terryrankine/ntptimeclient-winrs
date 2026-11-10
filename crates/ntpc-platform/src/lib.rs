@@ -36,6 +36,28 @@ pub fn is_elevated() -> std::io::Result<bool> {
     win32::token_is_elevated()
 }
 
+/// Renames `from` over `to` and returns only once the move is on disk
+/// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`).
+///
+/// # Errors
+/// The OS error.
+#[cfg(windows)]
+pub fn replace_file_write_through(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<()> {
+    win32::scm::replace_file_write_through(from, to)
+}
+
+/// The hard link count of an open file. Read only.
+///
+/// # Errors
+/// The OS error.
+#[cfg(windows)]
+pub fn file_link_count(file: &std::fs::File) -> std::io::Result<u32> {
+    win32::scm::file_link_count(file)
+}
+
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";
 

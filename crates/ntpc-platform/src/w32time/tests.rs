@@ -356,7 +356,8 @@ fn is_running_is_true_on_query_error() {
 
 #[test]
 fn is_running_is_true_when_missing() {
-    // A missing w32time cannot fight, but "cannot tell" is the rule.
+    // R85: NotFound counts as running. A missing w32time cannot fight, but
+    // "cannot tell" is the rule and the engine must not adjust on a guess.
     assert!(is_running(&FakeScm::new(Script::missing())));
 }
 
@@ -554,5 +555,48 @@ fn non_utf8_record_is_refused() {
     assert_eq!(
         Restore::decode(&[0xff, 0xfe, b'{']),
         Err(RestoreFormatError::NotCanonical)
+    );
+}
+
+#[test]
+fn disable_failure_on_reinstall_does_not_start_a_service_stopped_at_entry() {
+    // The record from the first install says "was running". This run found
+    // w32time stopped (but not disabled, for example an admin set manual).
+    let mut script = Script::with(RunState::Stopped, StartType::Manual);
+    script.refuse_set_start = Some(SvcError::AccessDenied);
+    let mut ctl = FakeScm::new(script);
+    let e = take_over(&mut ctl, Some(rec(StartType::Automatic, true)), persist_ok).unwrap_err();
+    assert_eq!(
+        e,
+        TakeoverError::Disable {
+            error: SvcError::AccessDenied,
+            rollback: None
+        }
+    );
+    assert!(!ctl.calls().iter().any(|c| matches!(c, Call::Start(_))));
+    assert_eq!(ctl.state().unwrap().run, RunState::Stopped);
+}
+
+#[test]
+fn changed_nothing_covers_only_failures_before_a_change() {
+    assert!(TakeoverError::Query(SvcError::NotFound).changed_nothing());
+    assert!(TakeoverError::Persist("x".to_owned()).changed_nothing());
+    assert!(TakeoverError::Stop(SvcError::AccessDenied).changed_nothing());
+    assert!(!TakeoverError::StopTimeout.changed_nothing());
+    assert!(!TakeoverError::StopQuery(SvcError::AccessDenied).changed_nothing());
+    assert!(
+        !TakeoverError::Disable {
+            error: SvcError::AccessDenied,
+            rollback: None
+        }
+        .changed_nothing()
+    );
+    assert!(!TakeoverError::VerifyQuery(SvcError::AccessDenied).changed_nothing());
+    assert!(
+        !TakeoverError::VerifyMismatch(SvcState {
+            run: RunState::Running,
+            start: StartType::Disabled
+        })
+        .changed_nothing()
     );
 }
