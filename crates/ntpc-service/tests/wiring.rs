@@ -205,7 +205,8 @@ fn adjustment_starts_off_and_stays_off_while_w32time_runs() {
     let mut rig = Rig::new(0.050, 20.0);
     rig.monitor_running = vec![(0.0, 1e9)];
     rig.run(2 * HOUR);
-    assert!(clock_cmds(&rig).is_empty(), "{:?}", clock_cmds(&rig));
+    // Not even the rate is taken or reset: w32time owns the clock.
+    assert!(rig.commands().is_empty(), "{:?}", rig.commands());
     assert!(!lock(&rig.transport.queries).is_empty(), "still measuring");
     let last = lock(&rig.reports).last().cloned().expect("reports");
     assert_eq!(last.1.adjustment_blocked, Blocked::Starting, "final write");
@@ -263,6 +264,30 @@ fn clock_failure_stops_the_batch_and_rearms_after_the_delay() {
     assert!(rig.log_has("re-arming clock adjustment after a clock failure"));
     // After the re-arm the step is allowed again and taken.
     assert!(cmds[2..].iter().any(|c| matches!(c.1, Cmd::Step(_)) && c.2));
+}
+
+#[test]
+fn failed_rate_take_keeps_adjustment_off_and_retries() {
+    let mut rig = Rig::new(0.050, 20.0);
+    lock(&rig.world).fail_take = 1;
+    rig.run(HOUR);
+    let cmds = rig.commands();
+    let takes: Vec<f64> = cmds
+        .iter()
+        .filter(|c| c.1 == Cmd::Take)
+        .map(|c| as_secs(c.0))
+        .collect();
+    assert_eq!(takes.len(), 2, "{cmds:?}");
+    assert!(!cmds[0].2, "first take failed");
+    let first_freq = cmds
+        .iter()
+        .find(|c| matches!(c.1, Cmd::Freq(_)))
+        .expect("freq");
+    assert!(
+        as_secs(first_freq.0) >= REARM_FIRST.as_secs_f64(),
+        "{cmds:?}"
+    );
+    assert!(rig.log_has("could not take the clock rate"));
 }
 
 #[test]
