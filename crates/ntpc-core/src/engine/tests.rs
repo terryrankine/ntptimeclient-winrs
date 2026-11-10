@@ -1569,3 +1569,68 @@ fn non_finite_offset_changes_nothing() {
     assert_eq!(s.last_good_age, None);
     assert!(!s.holdover);
 }
+
+#[test]
+fn reply_measured_before_a_step_is_dropped() {
+    // R99. A config probe is in flight when a pool round steps the clock.
+    // Its reply measured the clock before the step, so it must not count,
+    // and its tier gets a fresh round. The config server never answers on
+    // its own. A resume makes one more step allowed, and the pool reads
+    // 0.5 s only while a config round is open, so the step lands then.
+    let mut e = Engine::new(EngineConfig::default(), None);
+    let mut now = at(1);
+    let _ = e.handle(Event::Tick(now));
+    let _ = e.handle(Event::AdjustmentAllowed(true));
+    let specs = vec![
+        spec(1, Tier::Config),
+        spec(2, Tier::Pool),
+        spec(3, Tier::Pool),
+        spec(4, Tier::Pool),
+    ];
+    let mut queue: Vec<Action> = e.handle(Event::SourcesChanged(specs));
+    let mut resumed = false;
+    let mut stepped_with_probe_open = false;
+    for _ in 0..500 {
+        let mut stepped = false;
+        while let Some(a) = queue.pop() {
+            match a {
+                Action::Query { source, .. } if source != id(1) => {
+                    let off = if resumed && e.round_of(id(1)).is_some() {
+                        0.5
+                    } else {
+                        0.0
+                    };
+                    queue.extend(e.handle(Event::Sample(sample(source, off, now))));
+                }
+                Action::Step(_) => stepped = true,
+                _ => {}
+            }
+        }
+        if stepped {
+            stepped_with_probe_open = e.round_of(id(1)).is_some();
+            break;
+        }
+        now = e.next_wake().expect("wake");
+        if !resumed && secs(now) >= 600 {
+            resumed = true;
+            queue = e.handle(Event::Resumed(now));
+        } else {
+            queue = e.handle(Event::Tick(now));
+        }
+    }
+    assert!(
+        stepped_with_probe_open,
+        "a step with the config probe in flight"
+    );
+    let mut acts = e.handle(Event::Sample(sample(id(1), 0.5, now)));
+    assert!(
+        e.sources[&id(1)].filter.best().is_none(),
+        "pre-step reply kept"
+    );
+    acts.extend(e.handle(Event::Tick(e.next_wake().expect("wake"))));
+    assert!(
+        acts.iter()
+            .any(|a| matches!(a, Action::Query { source, .. } if *source == id(1))),
+        "fresh config round: {acts:?}"
+    );
+}
