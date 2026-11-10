@@ -377,6 +377,17 @@ pub enum TakeoverError {
     VerifyMismatch(SvcState),
 }
 
+impl TakeoverError {
+    /// True when the takeover failed before it changed anything on the
+    /// service: the first query, the record save or a refused stop. The
+    /// caller then removes a record this run created, so a stale record
+    /// cannot later win over an administrator's change (M8).
+    #[must_use]
+    pub const fn changed_nothing(&self) -> bool {
+        matches!(self, Self::Query(_) | Self::Persist(_) | Self::Stop(_))
+    }
+}
+
 fn rollback_text(e: Option<&SvcError>) -> String {
     e.map_or_else(String::new, |e| {
         format!(". Starting it again also failed: {e}")
@@ -438,13 +449,16 @@ where
     }
 
     if let Err(error) = ctl.set_start_type(W32TIME, StartType::Disabled) {
-        let rollback = if record.was_running {
+        // Key on what this run saw, not on the record. On a re-install the
+        // record says "was running" while w32time was stopped at entry, and
+        // the rollback must not start it.
+        let rollback = if now.run == RunState::Stopped {
+            None
+        } else {
             match ctl.start(W32TIME) {
                 Ok(()) | Err(SvcError::AlreadyRunning) => None,
                 Err(e) => Some(e),
             }
-        } else {
-            None
         };
         return Err(TakeoverError::Disable { error, rollback });
     }
@@ -525,7 +539,10 @@ pub fn restore<C: ServiceControl + ?Sized>(
 
 /// Whether `w32time` may be adjusting the clock. True for every state but
 /// stopped, and true when the state cannot be read: when we cannot tell, the
-/// engine must not adjust.
+/// engine must not adjust. That includes [`SvcError::NotFound`] (R85). A
+/// missing `w32time` cannot fight, but a query that says "not found" may also
+/// come from a broken or reconfigured service database, and adjusting on a
+/// guess is the wrong side to fail on.
 #[must_use]
 pub fn is_running<C: ServiceControl + ?Sized>(ctl: &C) -> bool {
     !matches!(

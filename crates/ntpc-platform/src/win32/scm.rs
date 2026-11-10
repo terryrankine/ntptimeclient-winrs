@@ -351,3 +351,56 @@ pub fn set_delayed_auto_start(s: &Service, delayed: bool) -> io::Result<()> {
     }
     Ok(())
 }
+
+// ---- File helpers for the restore record ----
+//
+// They sit here, not in a new sibling file, so `win32.rs` keeps exactly the
+// one `mod scm;` line this task added.
+
+/// Renames `from` over `to` with `MOVEFILE_REPLACE_EXISTING |
+/// MOVEFILE_WRITE_THROUGH`. Learn (MoveFileExW): with write-through "the
+/// function does not return until the file is actually moved on the disk".
+/// So the restore record survives a power cut right after the call.
+///
+/// # Errors
+/// The OS error, or `InvalidInput` for a path with a NUL.
+pub fn replace_file_write_through(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from = super::wide(from)?;
+    let to = super::wide(to)?;
+    // SAFETY: both names are NUL-terminated wide strings that outlive the
+    // call. The flags are documented values.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The hard link count of an open file. Read only.
+///
+/// # Errors
+/// The OS error.
+pub fn file_link_count(file: &std::fs::File) -> io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain old data, all zero is valid.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns a live handle for the whole call. `info` is a live
+    // out slot of the documented type.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.nNumberOfLinks)
+}
