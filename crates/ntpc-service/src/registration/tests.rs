@@ -325,8 +325,25 @@ fn every_create_parameter_is_what_the_design_says() {
     assert_eq!(spec.reset_period_s, 86_400);
     assert!(spec.actions_on_non_crash);
     assert_eq!(spec.sid_type, 0, "SERVICE_SID_TYPE_NONE");
+    // R106: never SERVICE_SID_TYPE_RESTRICTED (3). A write-restricted token
+    // would fail every write to the SY and BA only state directory.
+    assert_ne!(spec.sid_type, 3);
+    assert!(spec.sid_type == 0 || spec.sid_type == 1);
     assert!(spec.description.contains("w32time"));
     assert!(spec.description.contains("preview"));
+}
+
+#[test]
+fn the_update_on_reinstall_also_names_localsystem_and_no_restricted_sid() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.with(|r| r.register()).unwrap();
+    for c in w.calls() {
+        if let Call::Update(spec) | Call::Configure(spec) = c {
+            assert_eq!(spec.account, None);
+            assert_ne!(spec.sid_type, 3);
+        }
+    }
 }
 
 #[test]

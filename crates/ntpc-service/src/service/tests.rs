@@ -2,7 +2,7 @@
 //! host. No SCM, no real host.
 
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::*;
 use crate::host::{Inner, Msg};
@@ -56,6 +56,10 @@ struct FakeLauncher {
     behaviour: Behaviour,
     wakes: Arc<AtomicU32>,
     resumes: Arc<AtomicU32>,
+    /// Set when the host loop really ran (after `started` said yes).
+    ran: Arc<AtomicBool>,
+    /// Waits before handing over, so a test can send a stop first.
+    hold: Option<Arc<AtomicBool>>,
 }
 
 impl FakeLauncher {
@@ -65,7 +69,22 @@ impl FakeLauncher {
             behaviour,
             wakes: Arc::new(AtomicU32::new(0)),
             resumes: Arc::new(AtomicU32::new(0)),
+            ran: Arc::new(AtomicBool::new(false)),
+            hold: None,
         }
+    }
+}
+
+/// Counts notifications and wakes the loop, as 14c-A's notifier does.
+struct FakeResume {
+    count: Arc<AtomicU32>,
+    control: HostControl,
+}
+
+impl Resume for FakeResume {
+    fn notify_resumed(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.control.wake();
     }
 }
 
@@ -74,19 +93,38 @@ impl Launcher for FakeLauncher {
         self.ready.clone()
     }
 
-    fn job(&self, _cfg: Config, power: SharedPower, _logger: Arc<dyn Logger>) -> HostJob {
-        let b = self.behaviour;
-        let wakes = self.wakes.clone();
-        let resumes = self.resumes.clone();
-        Box::new(move |inbox: Inbox| match b {
+    fn run(
+        &self,
+        _cfg: Config,
+        sinks: Vec<Arc<dyn LogSink>>,
+        started: StartedFn<'_>,
+    ) -> Result<(), JobError> {
+        assert!(!sinks.is_empty(), "14c-A refuses an empty sink list");
+        match self.behaviour {
+            Behaviour::DepsFail => return Err(JobError::Deps("no clock".to_owned())),
+            Behaviour::Panics => panic!("fake host panic"),
+            _ => {}
+        }
+        if let Some(h) = &self.hold {
+            while !h.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let (control, inbox) = crate::host::channel();
+        let resume = Arc::new(FakeResume {
+            count: self.resumes.clone(),
+            control: control.clone(),
+        });
+        if !started(Started { control, resume }) {
+            return Ok(());
+        }
+        self.ran.store(true, Ordering::SeqCst);
+        match self.behaviour {
             Behaviour::UntilShutdown => loop {
                 match inbox.recv_timeout(Duration::from_secs(5)) {
                     Some(Msg(Inner::Shutdown)) | None => return Ok(()),
                     Some(Msg(Inner::Wake)) => {
-                        wakes.fetch_add(1, Ordering::SeqCst);
-                        if power.resumed() {
-                            resumes.fetch_add(1, Ordering::SeqCst);
-                        }
+                        self.wakes.fetch_add(1, Ordering::SeqCst);
                     }
                     Some(_) => {}
                 }
@@ -95,11 +133,9 @@ impl Launcher for FakeLauncher {
                 std::thread::sleep(Duration::from_secs(5));
                 Ok(())
             }
-            Behaviour::EndsAtOnce => Ok(()),
-            Behaviour::Panics => panic!("fake host panic"),
             Behaviour::HostPanicked => Err(JobError::Host(HostError::Panicked("boom".to_owned()))),
-            Behaviour::DepsFail => Err(JobError::Deps("no clock".to_owned())),
-        })
+            Behaviour::EndsAtOnce | Behaviour::DepsFail | Behaviour::Panics => Ok(()),
+        }
     }
 }
 
@@ -141,6 +177,7 @@ fn start(
         config,
         launcher: Arc::new(launcher),
         logger: logger(&sink),
+        sinks: vec![Arc::new(sink.clone())],
         drain: Box::new(move |_| d.store(true, Ordering::SeqCst)),
     };
     let h = std::thread::spawn(move || run_service(core, run));
@@ -272,58 +309,78 @@ fn unknown_control_is_not_implemented_and_reports_nothing() {
 }
 
 #[test]
-fn power_resume_wakes_the_host_and_marks_one_resume() {
+fn both_resume_events_notify_and_return_at_once() {
     let launcher = FakeLauncher::new(Behaviour::UntilShutdown);
     let wakes = launcher.wakes.clone();
     let resumes = launcher.resumes.clone();
     let (rig, ctl, h) = start(launcher, Ok(Config::default()));
     wait_for(&rig.api, State::Running);
-    assert_eq!(
-        ctl.handle(raw::CONTROL_POWEREVENT, raw::PBT_APMSUSPEND),
-        raw::NO_ERROR
-    );
-    assert_eq!(
-        ctl.handle(raw::CONTROL_POWEREVENT, raw::PBT_APMRESUMEAUTOMATIC),
-        raw::NO_ERROR
-    );
-    // The user-input resume that follows is not a second resume.
-    assert_eq!(
-        ctl.handle(raw::CONTROL_POWEREVENT, raw::PBT_APMRESUMESUSPEND),
-        raw::NO_ERROR
-    );
+    let before = rig.api.all().len();
+    for e in [
+        raw::PBT_APMSUSPEND,
+        raw::PBT_APMRESUMEAUTOMATIC,
+        raw::PBT_APMRESUMESUSPEND,
+        10,
+        0x8013,
+    ] {
+        assert_eq!(ctl.handle(raw::CONTROL_POWEREVENT, e), raw::NO_ERROR, "{e}");
+    }
+    // R107: both resume events notify. The notifier debounces them.
+    assert_eq!(resumes.load(Ordering::SeqCst), 2);
     for _ in 0..200 {
-        if resumes.load(Ordering::SeqCst) == 1 {
+        if wakes.load(Ordering::SeqCst) == 2 {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(resumes.load(Ordering::SeqCst), 1);
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.api.all().len(), before, "power events report nothing");
     let _ = ctl.handle(raw::CONTROL_STOP, 0);
     assert_eq!(h.join().unwrap(), service_exit::OK);
 }
 
 #[test]
-fn power_tracker_rules() {
-    let p = PowerTracker::default();
-    assert!(!p.resumed());
-    // A user resume with no automatic one seen (a missed event) counts.
-    assert!(p.on_event(raw::PBT_APMRESUMESUSPEND));
-    assert!(p.resumed());
-    assert!(!p.resumed(), "read once");
-    // Suspend, automatic, user: one resume.
-    assert!(!p.on_event(raw::PBT_APMSUSPEND));
-    assert!(p.on_event(raw::PBT_APMRESUMEAUTOMATIC));
-    assert!(!p.on_event(raw::PBT_APMRESUMESUSPEND));
-    assert!(p.resumed());
-    assert!(!p.resumed());
-    // An automatic resume always counts, even without a suspend seen.
-    assert!(p.on_event(raw::PBT_APMRESUMEAUTOMATIC));
-    assert!(p.resumed());
-    // Other power events are ignored.
-    assert!(!p.on_event(10));
-    assert!(!p.on_event(0x8013));
-    assert!(!p.resumed());
+fn a_resume_before_the_host_is_built_is_ignored() {
+    let api = Arc::new(RecordingApi::default());
+    let core = new_core(api, fast());
+    assert_eq!(
+        core.controller
+            .handle(raw::CONTROL_POWEREVENT, raw::PBT_APMRESUMEAUTOMATIC),
+        raw::NO_ERROR
+    );
+}
+
+#[test]
+fn running_is_reported_only_after_the_host_handed_over() {
+    let mut l = FakeLauncher::new(Behaviour::UntilShutdown);
+    let hold = Arc::new(AtomicBool::new(false));
+    l.hold = Some(hold.clone());
+    let (rig, ctl, h) = start(l, Ok(Config::default()));
+    wait_for(&rig.api, State::StartPending);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!rig.api.states().contains(&State::Running));
+    hold.store(true, Ordering::SeqCst);
+    wait_for(&rig.api, State::Running);
+    let _ = ctl.handle(raw::CONTROL_STOP, 0);
+    assert_eq!(h.join().unwrap(), service_exit::OK);
+}
+
+#[test]
+fn a_stop_before_the_handover_means_the_host_never_runs() {
+    let mut l = FakeLauncher::new(Behaviour::UntilShutdown);
+    let hold = Arc::new(AtomicBool::new(false));
+    l.hold = Some(hold.clone());
+    let ran = l.ran.clone();
+    let (rig, ctl, h) = start(l, Ok(Config::default()));
+    wait_for(&rig.api, State::StartPending);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(ctl.handle(raw::CONTROL_STOP, 0), raw::NO_ERROR);
+    hold.store(true, Ordering::SeqCst);
+    assert_eq!(h.join().unwrap(), service_exit::OK);
+    assert!(!ran.load(Ordering::SeqCst), "the host loop must not run");
+    let r = rig.api.all();
+    assert_never_backwards(&r);
+    assert!(!r.iter().any(|x| x.state == State::Running), "{r:?}");
 }
 
 #[test]
@@ -411,23 +468,26 @@ fn a_host_that_ignores_stop_is_given_up_within_the_wait_hint() {
 
 #[test]
 fn stop_during_start_never_reports_running() {
-    // Drive the core by hand: a stop arrives after START_PENDING and before
-    // the host runs.
+    // A stop arrives after START_PENDING and before the host thread starts.
     let api = Arc::new(RecordingApi::default());
     let core = new_core(api.clone(), fast());
     core.reporter.start_pending();
     assert_eq!(core.controller.handle(raw::CONTROL_STOP, 0), raw::NO_ERROR);
     let sink = MemorySink::new();
+    let l = FakeLauncher::new(Behaviour::UntilShutdown);
+    let ran = l.ran.clone();
     let run = ServiceRun {
         config: Ok(Config::default()),
-        launcher: Arc::new(FakeLauncher::new(Behaviour::UntilShutdown)),
+        launcher: Arc::new(l),
         logger: logger(&sink),
+        sinks: vec![Arc::new(sink.clone())],
         drain: Box::new(|_| {}),
     };
     assert_eq!(run_service(core, run), service_exit::OK);
     let r = api.all();
     assert_never_backwards(&r);
     assert!(!r.iter().any(|x| x.state == State::Running), "{r:?}");
+    assert!(!ran.load(Ordering::SeqCst));
 }
 
 #[test]

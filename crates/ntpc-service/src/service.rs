@@ -10,8 +10,12 @@
 //! 2. It checks the config and that the host adapters are built. A failure
 //!    reports `STOPPED` with a service-specific exit code
 //!    ([`service_exit`]).
-//! 3. It starts the host on its own thread and reports `RUNNING`, accepting
-//!    STOP, SHUTDOWN and POWEREVENT.
+//! 3. It starts the host thread. That thread builds the Windows adapters
+//!    and the host on itself (`HostDeps` is not `Send`), hands the host's
+//!    control and resume handles to the handler slot, and only then the
+//!    wrapper reports `RUNNING`, accepting STOP, SHUTDOWN and POWEREVENT.
+//!    A stop that came before the slot was filled is seen there, and the
+//!    host is not run.
 //! 4. STOP or SHUTDOWN: the handler reports `STOP_PENDING`, calls
 //!    [`HostControl::shutdown`] and returns at once. It never blocks.
 //! 5. `ServiceMain` waits for the host, bumping the checkpoint about once a
@@ -24,21 +28,20 @@
 //! Reports never go backwards and `STOPPED` is sent once. Checkpoints count
 //! up while a state is pending and are zero otherwise.
 //!
-//! Resume: `PBT_APMRESUMEAUTOMATIC` always marks a resume (Learn: "sent
-//! every time the system resumes"). `PBT_APMRESUMESUSPEND` follows it when a
-//! user woke the machine, so it marks a resume only if no automatic resume
-//! was seen since the last suspend. One sleep gives one `Resumed`, so the
-//! engine allows one step, not two.
+//! Resume: both `PBT_APMRESUMEAUTOMATIC` (Learn: "sent every time the
+//! system resumes") and `PBT_APMRESUMESUSPEND` (after it, on user input)
+//! call [`Resume::notify_resumed`]. 14c-A's notifier debounces calls within
+//! 5 s into one `Resumed` event (R107), so the engine allows one step, not
+//! two.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::host::{HostControl, HostError, Inbox, PowerEvents};
-use crate::logging::{Level, Logger};
+use crate::host::{HostControl, HostError};
+use crate::logging::{Level, LogSink, Logger};
 
 /// Win32 values used here (Learn, `SERVICE_STATUS` and `HandlerEx`).
 pub mod raw {
@@ -320,69 +323,57 @@ impl Reporter {
     }
 }
 
-/// Resume tracking. Implements [`PowerEvents`] for the host.
-#[derive(Debug, Default)]
-pub struct PowerTracker {
-    pending: AtomicBool,
-    auto_seen: AtomicBool,
+/// Tells the host that the machine resumed. 14c-A's `ResumeNotifier`
+/// implements it and debounces notifications within 5 s into one
+/// `Resumed` event (R107), so both resume events may notify.
+pub trait Resume: Send + Sync {
+    /// Called from the control handler. Must return at once.
+    fn notify_resumed(&self);
 }
 
-impl PowerTracker {
-    /// Applies one power event. True if it marked a resume.
-    pub fn on_event(&self, event_type: u32) -> bool {
-        match event_type {
-            raw::PBT_APMSUSPEND => {
-                self.auto_seen.store(false, Ordering::SeqCst);
-                false
-            }
-            raw::PBT_APMRESUMEAUTOMATIC => {
-                self.auto_seen.store(true, Ordering::SeqCst);
-                self.pending.store(true, Ordering::SeqCst);
-                true
-            }
-            raw::PBT_APMRESUMESUSPEND if !self.auto_seen.load(Ordering::SeqCst) => {
-                self.auto_seen.store(true, Ordering::SeqCst);
-                self.pending.store(true, Ordering::SeqCst);
-                true
-            }
-            _ => false,
-        }
-    }
+/// What the host hands the control handler once it is built: how to stop
+/// it and how to tell it about a resume.
+#[derive(Clone)]
+pub struct Started {
+    /// Stops and wakes the host loop.
+    pub control: HostControl,
+    /// Resume notifications.
+    pub resume: Arc<dyn Resume>,
 }
 
-impl PowerEvents for PowerTracker {
-    fn resumed(&self) -> bool {
-        self.pending.swap(false, Ordering::SeqCst)
-    }
-}
-
-/// The [`PowerEvents`] the host gets: a shared [`PowerTracker`].
-#[derive(Debug, Clone)]
-pub struct SharedPower(pub Arc<PowerTracker>);
-
-impl PowerEvents for SharedPower {
-    fn resumed(&self) -> bool {
-        self.0.resumed()
-    }
-}
-
-/// The control handler logic. Never blocks: a report, a channel send and
-/// two atomics. The reporter's lock is held only for the report.
+/// The control handler logic. Never blocks: a report, a channel send and a
+/// notify. The reporter's lock is held only for the report.
 pub struct Controller {
     reporter: Arc<Reporter>,
-    host: HostControl,
-    power: Arc<PowerTracker>,
+    host: OnceLock<Started>,
 }
 
 impl Controller {
-    /// A controller over these parts.
+    /// A controller with an empty host slot.
     #[must_use]
-    pub fn new(reporter: Arc<Reporter>, host: HostControl, power: Arc<PowerTracker>) -> Self {
+    pub fn new(reporter: Arc<Reporter>) -> Self {
         Self {
             reporter,
-            host,
-            power,
+            host: OnceLock::new(),
         }
+    }
+
+    /// Fills the host slot, then reports `RUNNING`. False if a stop came
+    /// first: the host must then not run.
+    ///
+    /// Order matters. The slot is filled before the stop flag is read, and
+    /// the handler sets the flag before it reads the slot. So a stop is
+    /// seen by one side or the other, never by neither.
+    pub fn host_started(&self, s: Started) -> bool {
+        let _ = self.host.set(s);
+        if self.reporter.stop_requested() {
+            if let Some(h) = self.host.get() {
+                h.control.shutdown();
+            }
+            return false;
+        }
+        self.reporter.running();
+        true
     }
 
     /// Handles one control. Returns the `HandlerEx` return code.
@@ -390,17 +381,20 @@ impl Controller {
     pub fn handle(&self, control: u32, event_type: u32) -> u32 {
         match control {
             raw::CONTROL_STOP | raw::CONTROL_SHUTDOWN => {
-                // Report first, then ask: the host may finish before the
-                // report otherwise, and STOP_PENDING after STOPPED is refused
-                // anyway, but the order keeps the log readable.
                 self.reporter.request_stop();
-                self.host.shutdown();
+                if let Some(h) = self.host.get() {
+                    h.control.shutdown();
+                }
                 raw::NO_ERROR
             }
             raw::CONTROL_INTERROGATE => raw::NO_ERROR,
             raw::CONTROL_POWEREVENT => {
-                if self.power.on_event(event_type) {
-                    self.host.wake();
+                if matches!(
+                    event_type,
+                    raw::PBT_APMRESUMEAUTOMATIC | raw::PBT_APMRESUMESUSPEND
+                ) && let Some(h) = self.host.get()
+                {
+                    h.resume.notify_resumed();
                 }
                 raw::NO_ERROR
             }
@@ -409,21 +403,22 @@ impl Controller {
     }
 }
 
-/// Why the host job ended with an error.
+/// Why the host run ended with an error.
 #[derive(Debug)]
 pub enum JobError {
-    /// Building the host adapters failed.
+    /// Building the host adapters failed (14c-A `WinDepsError`, for
+    /// example the clock or an account or owner refusal).
     Deps(String),
     /// The host returned an error.
     Host(HostError),
 }
 
-/// The host run, built by a [`Launcher`]. Runs on the host thread, which
-/// also builds the adapters (they need not be `Send`).
-pub type HostJob = Box<dyn FnOnce(Inbox) -> Result<(), JobError> + Send>;
+/// Hands the built host to the wrapper. False: a stop came first, do not run.
+pub type StartedFn<'a> = &'a (dyn Fn(Started) -> bool + Sync);
 
-/// Builds the host run. The real one wires the Windows adapters
-/// (`windows_deps`, Task 14c-A).
+/// Builds and runs the host. The real one calls 14c-A's
+/// `windows_deps(&cfg, sinks)` and `host::run` on one thread, because
+/// `HostDeps` is not `Send`.
 pub trait Launcher: Send + Sync {
     /// Whether the adapters are built into this exe.
     ///
@@ -431,18 +426,30 @@ pub trait Launcher: Send + Sync {
     /// Why not.
     fn ready(&self) -> Result<(), String>;
 
-    /// The host run for `cfg`, with these power events and this log.
-    fn job(&self, cfg: Config, power: SharedPower, logger: Arc<dyn Logger>) -> HostJob;
+    /// Builds the host with these log sinks (never empty), calls `started`
+    /// with its control and resume handles, and runs it unless `started`
+    /// said no. Called once per process, on the thread that runs the host.
+    ///
+    /// # Errors
+    /// [`JobError`].
+    fn run(
+        &self,
+        cfg: Config,
+        sinks: Vec<Arc<dyn LogSink>>,
+        started: StartedFn<'_>,
+    ) -> Result<(), JobError>;
 }
 
 /// What `ServiceMain` needs besides the reporter.
 pub struct ServiceRun {
     /// The loaded config, or why it could not be loaded (no path in it).
     pub config: Result<Config, String>,
-    /// Builds the host.
+    /// Builds and runs the host.
     pub launcher: Arc<dyn Launcher>,
-    /// The log (the Event Log in service mode).
+    /// The wrapper's own log (the Event Log in service mode).
     pub logger: Arc<dyn Logger>,
+    /// The sinks the host logs to. At least the Event Log sink.
+    pub sinks: Vec<Arc<dyn LogSink>>,
     /// Waits for queued log lines to be written, before `STOPPED`.
     pub drain: Box<dyn Fn(Duration) + Send + Sync>,
 }
@@ -453,23 +460,17 @@ pub struct ServiceCore {
     pub reporter: Arc<Reporter>,
     /// Shared with the handler.
     pub controller: Arc<Controller>,
-    inbox: Inbox,
-    power: Arc<PowerTracker>,
     timing: Timing,
 }
 
-/// Makes the reporter, controller and host channel.
+/// Makes the reporter and the controller.
 #[must_use]
 pub fn new_core(api: Arc<dyn StatusApi>, timing: Timing) -> ServiceCore {
     let reporter = Arc::new(Reporter::new(api, timing));
-    let (control, inbox) = crate::host::channel();
-    let power = Arc::new(PowerTracker::default());
-    let controller = Arc::new(Controller::new(reporter.clone(), control, power.clone()));
+    let controller = Arc::new(Controller::new(reporter.clone()));
     ServiceCore {
         reporter,
         controller,
-        inbox,
-        power,
         timing,
     }
 }
@@ -495,13 +496,11 @@ fn log(logger: &dyn Logger, level: Level, msg: &str) {
 pub fn run_service(core: ServiceCore, run: ServiceRun) -> u32 {
     let ServiceCore {
         reporter,
-        controller: _,
-        inbox,
-        power,
+        controller,
         timing,
     } = core;
     reporter.start_pending();
-    let exit_code = start_and_wait(&reporter, inbox, power, timing, &run);
+    let exit_code = start_and_wait(&reporter, &controller, timing, &run);
     log(
         run.logger.as_ref(),
         if exit_code == service_exit::OK {
@@ -519,8 +518,7 @@ pub fn run_service(core: ServiceCore, run: ServiceRun) -> u32 {
 
 fn start_and_wait(
     reporter: &Reporter,
-    inbox: Inbox,
-    power: Arc<PowerTracker>,
+    controller: &Arc<Controller>,
     timing: Timing,
     run: &ServiceRun,
 ) -> u32 {
@@ -545,16 +543,21 @@ fn start_and_wait(
     }
     reporter.start_pending();
 
-    let job = run
-        .launcher
-        .job(cfg, SharedPower(power), run.logger.clone());
+    // The host is built and run on its own thread, so this thread can
+    // bound the stop wait. `HostDeps` is not `Send`, so both happen on
+    // that one thread.
+    let launcher = run.launcher.clone();
+    let sinks = run.sinks.clone();
+    let ctl = controller.clone();
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("ntpc-host".to_owned())
         .spawn(move || {
-            let r = catch_unwind(AssertUnwindSafe(|| job(inbox))).unwrap_or_else(|p| {
-                Err(JobError::Host(HostError::Panicked(panic_text(p.as_ref()))))
-            });
+            let started = move |s: Started| ctl.host_started(s);
+            let r = catch_unwind(AssertUnwindSafe(|| launcher.run(cfg, sinks, &started)))
+                .unwrap_or_else(|p| {
+                    Err(JobError::Host(HostError::Panicked(panic_text(p.as_ref()))))
+                });
             let _ = tx.send(r);
         });
     if let Err(e) = spawned {
@@ -565,8 +568,6 @@ fn start_and_wait(
         );
         return service_exit::THREAD;
     }
-    reporter.running();
-    log(logger, Level::Info, "service running");
 
     let mut stop_seen: Option<Instant> = None;
     let result = loop {
@@ -589,8 +590,12 @@ fn start_and_wait(
             reporter.stop_progress();
         }
     };
+    map_result(result, reporter.stop_requested(), logger)
+}
+
+fn map_result(result: Option<Result<(), JobError>>, asked: bool, logger: &dyn Logger) -> u32 {
     match result {
-        Some(Ok(())) if reporter.stop_requested() => service_exit::OK,
+        Some(Ok(())) if asked => service_exit::OK,
         Some(Ok(())) => {
             log(logger, Level::Error, "the host ended without being asked");
             service_exit::ENDED_UNASKED
@@ -615,26 +620,8 @@ fn start_and_wait(
     }
 }
 
-/// Runs a host job in the console (`run` mode): the host on this thread,
-/// `shutdown` on Ctrl+C from the caller's handler.
-///
-/// # Errors
-/// [`JobError`].
-pub fn run_console(
-    launcher: &dyn Launcher,
-    cfg: Config,
-    logger: Arc<dyn Logger>,
-    inbox: Inbox,
-) -> Result<(), JobError> {
-    launcher.ready().map_err(JobError::Deps)?;
-    // No power events in a console: the machine's resume reaches the host
-    // only in service mode.
-    let job = launcher.job(cfg, SharedPower(Arc::new(PowerTracker::default())), logger);
-    job(inbox)
-}
-
 mod launcher;
-pub use launcher::{BuildDeps, DepsLauncher, NOT_BUILT};
+pub use launcher::{DepsLauncher, NOT_BUILT, RunFn};
 
 #[cfg(windows)]
 pub mod real;
