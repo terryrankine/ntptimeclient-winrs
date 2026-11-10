@@ -394,6 +394,12 @@ fn open_append(path: &Path) -> io::Result<File> {
     if f.metadata()?.file_type().is_symlink() {
         return Err(io::Error::other("log path is a symbolic link or junction"));
     }
+    // R75: a planted hard link would send our lines into a file someone
+    // else chose.
+    #[cfg(windows)]
+    if ntpc_platform::file_link_count(&f)? > 1 {
+        return Err(io::Error::other("log file has more than one hard link"));
+    }
     Ok(f)
 }
 
