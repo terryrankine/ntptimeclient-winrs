@@ -1,6 +1,7 @@
 //! Sans-IO core of the NTP client. It takes events in and returns actions out.
 //! It never touches the clock, the network or the file system.
 
+pub mod discipline;
 mod error;
 pub mod filter;
 mod ports;
