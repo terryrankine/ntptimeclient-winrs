@@ -406,7 +406,8 @@ fn failed_lookup_keeps_the_previous_addresses_and_ids() {
     assert!(
         notes.contains(&ResolveNote::LookupFailed {
             name: "a".into(),
-            kind: io::ErrorKind::TimedOut
+            kind: io::ErrorKind::TimedOut,
+            code: None
         }),
         "{notes:?}"
     );
@@ -642,26 +643,6 @@ fn a_duplicate_of_a_higher_tier_is_not_a_reason_to_retry() {
 }
 
 #[test]
-fn previous_addresses_are_kept_for_24_hours_then_dropped() {
-    let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
-    let n = names(&[("a", Tier::Config)]);
-    assert_eq!(r.expand(t(0), &n).len(), 1);
-    lookup_err(r.lookup_mut(), "a", io::ErrorKind::TimedOut);
-    let day = 24 * 3600;
-    // Still inside the window, and the window counts from the last good answer.
-    assert_eq!(r.expand(t(3600), &n).len(), 1);
-    assert_eq!(r.expand(t(day), &n).len(), 1, "exactly 24 h is kept");
-    r.take_notes();
-    assert_eq!(r.expand(t(day + 1), &n).len(), 0, "past 24 h is dropped");
-    assert!(
-        r.take_notes()
-            .contains(&ResolveNote::PreviousExpired { name: "a".into() })
-    );
-    // Once dropped it stays dropped.
-    assert_eq!(r.expand(t(day + 2), &n).len(), 0);
-}
-
-#[test]
 fn a_good_answer_restarts_the_24_hour_window() {
     let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
     let n = names(&[("a", Tier::Config)]);
@@ -671,22 +652,205 @@ fn a_good_answer_restarts_the_24_hour_window() {
     assert_eq!(r.expand(t(40 * 3600), &n).len(), 1);
 }
 
+fn pool_calls(r: &Resolver<Fake, Own>) -> usize {
+    r.lookup
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| *c == "pool")
+        .count()
+}
+
+/// One pass the way the host runs it: expand, then mark.
+fn pass(r: &mut Resolver<Fake, Own>, at: u64, n: &[(String, Tier)]) -> Vec<SourceSpec> {
+    let out = r.expand(t(at), n);
+    r.mark_resolved(t(at));
+    out
+}
+
 #[test]
-fn not_found_drops_previous_addresses_at_once() {
+fn previous_addresses_are_kept_for_24_hours_then_dropped() {
     let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
     let n = names(&[("a", Tier::Config)]);
-    assert_eq!(r.expand(t(0), &n).len(), 1);
-    lookup_err(r.lookup_mut(), "a", io::ErrorKind::NotFound);
-    assert_eq!(r.expand(t(1), &n).len(), 0);
-    let notes = r.take_notes();
+    assert_eq!(pass(&mut r, 0, &n).len(), 1);
+    lookup_err(r.lookup_mut(), "a", io::ErrorKind::TimedOut);
+    let day = 24 * 3600;
+    assert_eq!(pass(&mut r, 3600, &n).len(), 1);
+    // A kept answer is not a reason to hurry.
+    assert!(!r.due(t(3600 + 60)));
+    assert_eq!(pass(&mut r, day, &n).len(), 1, "exactly 24 h is kept");
+    r.take_notes();
+    assert_eq!(pass(&mut r, day + 1, &n).len(), 0, "past 24 h is dropped");
     assert!(
-        notes
-            .iter()
-            .any(|x| matches!(x, ResolveNote::LookupFailed { .. }))
+        r.take_notes()
+            .contains(&ResolveNote::PreviousExpired { name: "a".into() })
     );
+    // Now the name is failing with nothing cached, so retry at 60 s.
+    assert!(!r.due(t(day + 1 + 59)));
+    assert!(r.due(t(day + 1 + 60)));
+    // Once dropped it stays dropped.
+    assert_eq!(pass(&mut r, day + 61, &n).len(), 0);
+}
+
+#[test]
+fn two_failures_in_a_row_still_retry() {
+    let mut f = Fake::default();
+    f.fail("a");
+    let mut r = resolver(f);
+    let n = names(&[("a", Tier::Config)]);
+    assert_eq!(pass(&mut r, 0, &n).len(), 0);
+    assert!(r.due(t(60)));
+    assert_eq!(pass(&mut r, 60, &n).len(), 0);
+    assert!(!r.due(t(60 + 119)));
+    assert!(r.due(t(60 + 120)), "second failure still retries");
+    pass(&mut r, 180, &n);
+    assert!(r.due(t(180 + 240)), "third failure still retries");
+    // No cache, so nothing is reported as kept.
     assert!(
-        !notes
+        !r.take_notes()
             .iter()
             .any(|x| matches!(x, ResolveNote::KeptPrevious { .. }))
+    );
+}
+
+#[test]
+fn a_failure_after_an_empty_answer_still_retries() {
+    let mut r = resolver(Fake::default().with("a", &["127.0.0.1"]));
+    let n = names(&[("a", Tier::Config)]);
+    pass(&mut r, 0, &n);
+    assert!(r.due(t(60)));
+    r.lookup_mut().fail("a");
+    pass(&mut r, 60, &n);
+    assert!(r.due(t(60 + 120)));
+}
+
+#[test]
+fn a_failing_name_does_not_make_the_pool_name_resolve_again() {
+    let mut f = Fake::default().with("pool", &["203.0.113.1", "203.0.113.2", "203.0.113.3"]);
+    f.fail("mine");
+    let mut r = resolver(f);
+    let n = names(&[("mine", Tier::Config), ("pool", Tier::Pool)]);
+    let first = pass(&mut r, 0, &n);
+    assert_eq!(pool_calls(&r), 1);
+    // Retry passes inside the hour. The pool answer would rotate if asked.
+    r.lookup_mut()
+        .set("pool", &["203.0.113.50", "203.0.113.51"]);
+    let mut at = 0;
+    for wait in [60, 120, 240, 480, 960] {
+        at += wait;
+        let out = pass(&mut r, at, &n);
+        assert_eq!(out, first, "pool ids and addresses stay put at {at}");
+    }
+    assert!(at < 3600);
+    assert_eq!(pool_calls(&r), 1, "the pool name was not asked again");
+    let mine_calls = r
+        .lookup
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| *c == "mine")
+        .count();
+    assert_eq!(mine_calls, 6);
+}
+
+#[test]
+fn a_full_pass_follows_after_an_hour() {
+    let mut f = Fake::default().with("pool", &["203.0.113.1"]);
+    f.fail("mine");
+    let mut r = resolver(f);
+    let n = names(&[("mine", Tier::Config), ("pool", Tier::Pool)]);
+    pass(&mut r, 0, &n);
+    pass(&mut r, 3600, &n);
+    assert_eq!(pool_calls(&r), 2);
+}
+
+#[test]
+fn a_changed_name_list_forces_a_full_pass() {
+    let mut f = Fake::default().with("pool", &["203.0.113.1"]);
+    f.fail("mine");
+    let mut r = resolver(f);
+    pass(
+        &mut r,
+        0,
+        &names(&[("mine", Tier::Config), ("pool", Tier::Pool)]),
+    );
+    pass(
+        &mut r,
+        60,
+        &names(&[
+            ("mine", Tier::Config),
+            ("pool", Tier::Pool),
+            ("x", Tier::Dhcp),
+        ]),
+    );
+    assert_eq!(pool_calls(&r), 2);
+}
+
+#[test]
+fn retry_interval_doubles_to_an_hour_and_resets_after_success() {
+    let mut f = Fake::default().with("pool", &["203.0.113.1"]);
+    f.fail("mine");
+    let mut r = resolver(f);
+    let n = names(&[("mine", Tier::Config), ("pool", Tier::Pool)]);
+    let mut at = 0;
+    pass(&mut r, at, &n);
+    for wait in [60, 120, 240, 480, 960, 1920, 3600, 3600] {
+        assert!(!r.due(t(at + wait - 1)), "not due before {wait}");
+        assert!(r.due(t(at + wait)), "due at {wait}");
+        at += wait;
+        pass(&mut r, at, &n);
+    }
+    // The name comes back. One clean pass resets the wait to an hour.
+    r.lookup_mut().set("mine", &["192.0.2.1"]);
+    let out = pass(&mut r, at, &n);
+    assert_eq!(out.len(), 2);
+    assert!(!r.due(t(at + 3599)));
+    assert!(r.due(t(at + 3600)));
+    // A new failing name with nothing cached starts again at 60 s.
+    r.lookup_mut().fail("x");
+    at += 3600;
+    let n2 = names(&[
+        ("mine", Tier::Config),
+        ("pool", Tier::Pool),
+        ("x", Tier::Dhcp),
+    ]);
+    pass(&mut r, at, &n2);
+    assert!(r.due(t(at + 60)) && !r.due(t(at + 59)));
+}
+
+#[test]
+fn not_found_does_not_drop_the_cache() {
+    // Windows reports NXDOMAIN and an offline network with one code, so only
+    // age may drop cached addresses.
+    let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
+    let n = names(&[("a", Tier::Config)]);
+    assert_eq!(pass(&mut r, 0, &n).len(), 1);
+    lookup_err(r.lookup_mut(), "a", io::ErrorKind::NotFound);
+    assert_eq!(pass(&mut r, 1, &n).len(), 1);
+    let notes = r.take_notes();
+    assert!(notes.contains(&ResolveNote::KeptPrevious { name: "a".into() }));
+}
+
+struct RawFail(i32);
+impl NameLookup for RawFail {
+    fn lookup(&self, _: &str) -> io::Result<Vec<IpAddr>> {
+        Err(io::Error::from_raw_os_error(self.0))
+    }
+}
+
+#[test]
+fn lookup_failure_note_carries_the_os_code() {
+    let mut r = Resolver::new(RawFail(11001), Own(Vec::new()));
+    r.expand(t(0), &names(&[("a.example", Tier::Config)]));
+    let notes = r.take_notes();
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            ResolveNote::LookupFailed {
+                code: Some(11001),
+                ..
+            }
+        )),
+        "{notes:?}"
     );
 }
