@@ -261,10 +261,6 @@ pub struct Engine {
     last_round: [Option<Mono>; 3],
     /// Start a round of this tier at the next chance.
     recheck: [bool; 3],
-    /// A higher tier that was usable on its last probe and is not active.
-    /// It is probed at `min_poll`. `due_probe` stops naming a tier once it is
-    /// stable, but the chooser only switches inside `observe`.
-    building: [bool; 3],
     /// Latest time seen. It never goes back.
     now: Mono,
     started: bool,
@@ -303,7 +299,6 @@ impl Engine {
             rounds: [None, None, None],
             last_round: [None; 3],
             recheck: [false; 3],
-            building: [false; 3],
             now: Mono::from_nanos(0),
             started: false,
             poll: cfg.min_poll,
@@ -329,7 +324,13 @@ impl Engine {
         let mut out = Vec::new();
         self.started = true;
         match ev {
-            Event::Tick(at) => self.advance(at),
+            Event::Tick(at) => {
+                self.advance(at);
+                // A probed tier can turn stable between observations.
+                let before = self.tiers.active();
+                self.tiers.tick(self.now);
+                self.note_tier_change(before, &mut out);
+            }
             Event::Sample(s) => self.on_sample(s, &mut out),
             Event::Failed(id, why) => self.on_failed(id, why, &mut out),
             Event::SourcesChanged(specs) => self.on_sources(specs, &mut out),
@@ -364,7 +365,7 @@ impl Engine {
                 wake.push(self.due_at(active, self.poll));
                 let probe = self.tiers.due_probe(now);
                 for t in TIERS.into_iter().filter(|&t| t < active) {
-                    let every = if probe == Some(t) || self.building[slot(t)] {
+                    let every = if probe == Some(t) {
                         self.cfg.min_poll
                     } else {
                         self.cfg.tier.reprobe_every
@@ -570,7 +571,7 @@ impl Engine {
         for t in TIERS.into_iter().filter(|&t| t < active) {
             // A tier building its stable run is probed at the fastest rate.
             // At `reprobe_every` each gap would restart its run.
-            let every = if probe == Some(t) || self.building[slot(t)] {
+            let every = if probe == Some(t) {
                 self.cfg.min_poll
             } else {
                 Duration::MAX
@@ -657,22 +658,25 @@ impl Engine {
         // tier. Its samples only veto steps.
         if before.is_none_or(|a| tier <= a) {
             self.tiers.observe(tier, sel.is_some(), self.now);
-            let after = self.tiers.active();
-            self.building[slot(tier)] = sel.is_some() && after != Some(tier);
-            if after != before {
-                out.push(Action::Log(LogEvent::TierChanged {
-                    from: before,
-                    to: after,
-                }));
-                self.poll = self.cfg.min_poll;
-                self.prev_offset = None;
-            }
+            self.note_tier_change(before, out);
         }
         if round.fresh
             && self.tiers.active() == Some(tier)
             && let Some(sel) = sel
         {
             self.update(tier, &sel, out);
+        }
+    }
+
+    fn note_tier_change(&mut self, before: Option<Tier>, out: &mut Vec<Action>) {
+        let after = self.tiers.active();
+        if after != before {
+            out.push(Action::Log(LogEvent::TierChanged {
+                from: before,
+                to: after,
+            }));
+            self.poll = self.cfg.min_poll;
+            self.prev_offset = None;
         }
     }
 

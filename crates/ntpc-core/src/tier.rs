@@ -117,6 +117,15 @@ impl TierChooser {
         self.reevaluate(now);
     }
 
+    /// Re-evaluates the tiers without a new observation.
+    ///
+    /// A probed tier stops being due once it is stable, so no observation
+    /// may arrive to make the switch. The engine calls this on every tick,
+    /// so the switch happens when the stable period ends.
+    pub fn tick(&mut self, now: Mono) {
+        self.reevaluate(now);
+    }
+
     /// The tier selection must stay inside, if any tier is working.
     #[must_use]
     pub fn active(&self) -> Option<Tier> {
@@ -412,6 +421,28 @@ mod tests {
         assert_eq!(c.due_probe(at(901)), Some(Tier::Config));
         c.observe(Tier::Config, false, at(901));
         assert_eq!(c.due_probe(at(902)), Some(Tier::Dhcp));
+    }
+
+    #[test]
+    fn tick_switches_when_stable_period_ends() {
+        let mut c = settled_dhcp();
+        c.observe(Tier::Config, true, at(700));
+        c.observe(Tier::Config, true, at(1000));
+        // Stable at 1300. No probe is due then, so only a tick can switch.
+        assert_eq!(c.due_probe(at(1300)), None);
+        c.tick(at(1299));
+        assert_eq!(c.active(), Some(Tier::Dhcp));
+        c.tick(at(1300));
+        assert_eq!(c.active(), Some(Tier::Config));
+    }
+
+    #[test]
+    fn tick_without_change_keeps_active_tier() {
+        let mut c = settled_dhcp();
+        c.tick(at(601));
+        assert_eq!(c.active(), Some(Tier::Dhcp));
+        c.tick(at(0));
+        assert_eq!(c.active(), Some(Tier::Dhcp));
     }
 
     #[test]
