@@ -15,5 +15,9 @@ toml.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+# The scripted ServiceControl for the install and uninstall tests.
+[dev-dependencies]
+ntpc-platform = { workspace = true, features = ["fake"] }
+
 [lints]
 workspace = true
