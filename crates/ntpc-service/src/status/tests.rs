@@ -131,17 +131,37 @@ fn non_finite_numbers_never_make_an_unreadable_file() {
     let back = parse(&to_json(&r)).expect("still readable");
     assert_eq!(back.last_offset_s, None);
     assert_eq!(back.last_step_s, None);
-    assert!(check(&r).is_ok());
-    // A required one is refused before anything is written.
+    // R103: a NaN drift is written as null and reads back as NaN.
     r.drift_ppm = f64::NAN;
-    assert!(check(&r).is_err());
+    assert!(check(&r).is_ok());
+    let text = to_json(&r);
+    assert!(text.contains("\"drift_ppm\": null"), "{text}");
+    let back = parse(&text).expect("null drift accepted");
+    assert!(back.drift_ppm.is_nan());
+    assert!(format_status(&back).contains("drift:              unknown"));
     let dir = std::env::temp_dir().join(format!("ntpc-status-nan-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("dir");
     let w = FileStatusWriter::new(&dir);
-    assert!(w.write(&r).is_err());
-    assert!(!w.path().exists(), "nothing written");
+    w.write(&r).expect("written");
+    assert!(read_status(&w.path()).expect("reads").drift_ppm.is_nan());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn null_is_refused_for_every_other_required_number() {
+    let text = to_json(&sample());
+    for (from, to) in [
+        ("\"uptime_s\": 3600", "\"uptime_s\": null"),
+        ("\"version\": 1", "\"version\": null"),
+        ("\"written_unix_s\": 1794268800", "\"written_unix_s\": null"),
+        ("\"sources_pool\": 4", "\"sources_pool\": null"),
+        ("\"queries\": 7", "\"queries\": null"),
+    ] {
+        let bad = text.replacen(from, to, 1);
+        assert_ne!(bad, text, "{from}");
+        assert!(parse(&bad).is_err(), "{to} accepted");
+    }
 }
 
 #[test]
