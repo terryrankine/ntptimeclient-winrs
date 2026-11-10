@@ -11,12 +11,12 @@ use std::time::Duration;
 /// The field is private. Build a value with [`Offset::from_secs`] or
 /// [`Offset::between`].
 ///
-/// ```compile_fail
+/// ```compile_fail,E0423
 /// use ntpc_core::Offset;
 /// let _ = Offset(1.0);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// use ntpc_core::Offset;
 /// let o = Offset::from_secs(1.0);
 /// let _ = o.0;
@@ -25,9 +25,12 @@ use std::time::Duration;
 pub struct Offset(f64);
 
 impl Offset {
-    /// Wraps a value in seconds.
+    /// Wraps a value in seconds. Finite values only.
+    ///
+    /// A debug build asserts that the value is finite.
     #[must_use]
     pub fn from_secs(secs: f64) -> Self {
+        debug_assert!(secs.is_finite(), "offset must be finite");
         Self(secs)
     }
 
@@ -37,21 +40,37 @@ impl Offset {
         self.0
     }
 
-    /// Remote time minus local time, both in seconds.
+    /// Remote time minus local time, both in seconds. Finite values only.
+    ///
+    /// A debug build asserts that both values are finite.
+    /// Subtract in a higher-precision domain (integer nanoseconds) before
+    /// converting. `f64` epoch seconds only resolve about 0.2 microseconds.
     #[must_use]
     pub fn between(remote_secs: f64, local_secs: f64) -> Self {
+        debug_assert!(
+            remote_secs.is_finite() && local_secs.is_finite(),
+            "times must be finite"
+        );
         Self(remote_secs - local_secs)
     }
 }
 
 /// Round-trip delay in seconds.
+///
+/// ```compile_fail,E0423
+/// use ntpc_core::Delay;
+/// let _ = Delay(1.0);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Delay(f64);
 
 impl Delay {
-    /// Wraps a value in seconds.
+    /// Wraps a value in seconds. Finite values only.
+    ///
+    /// A debug build asserts that the value is finite.
     #[must_use]
     pub fn from_secs(secs: f64) -> Self {
+        debug_assert!(secs.is_finite(), "delay must be finite");
         Self(secs)
     }
 
@@ -63,15 +82,23 @@ impl Delay {
 }
 
 /// Frequency error in parts per million.
+///
+/// ```compile_fail,E0423
+/// use ntpc_core::Ppm;
+/// let _ = Ppm(1.0);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Ppm(f64);
 
 impl Ppm {
     const PER_UNIT: f64 = 1e-6;
 
-    /// Wraps a value in parts per million.
+    /// Wraps a value in parts per million. Finite values only.
+    ///
+    /// A debug build asserts that the value is finite.
     #[must_use]
     pub fn new(ppm: f64) -> Self {
+        debug_assert!(ppm.is_finite(), "ppm must be finite");
         Self(ppm)
     }
 
@@ -87,9 +114,12 @@ impl Ppm {
         self.0 * Self::PER_UNIT
     }
 
-    /// Builds a value from a plain ratio.
+    /// Builds a value from a plain ratio. Finite values only.
+    ///
+    /// A debug build asserts that the value is finite.
     #[must_use]
     pub fn from_fraction(fraction: f64) -> Self {
+        debug_assert!(fraction.is_finite(), "fraction must be finite");
         Self(fraction / Self::PER_UNIT)
     }
 }
@@ -97,6 +127,11 @@ impl Ppm {
 /// A point on the monotonic clock, in nanoseconds.
 ///
 /// It counts awake time only. Suspend does not advance it.
+///
+/// ```compile_fail,E0423
+/// use ntpc_core::Mono;
+/// let _ = Mono(1);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mono(u64);
 
@@ -128,6 +163,11 @@ impl Mono {
 }
 
 /// Stable identity of one configured source.
+///
+/// ```compile_fail,E0423
+/// use ntpc_core::SourceId;
+/// let _ = SourceId(1);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceId(u32);
 
@@ -261,6 +301,20 @@ mod tests {
         );
         assert_eq!(m.checked_add(Duration::from_nanos(2)), None);
         assert_eq!(m.checked_add(Duration::MAX), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "offset must be finite")]
+    fn offset_rejects_nan_in_debug() {
+        let _ = Offset::from_secs(f64::NAN);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ppm must be finite")]
+    fn ppm_rejects_infinity_in_debug() {
+        let _ = Ppm::new(f64::INFINITY);
     }
 
     #[test]
