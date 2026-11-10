@@ -5,7 +5,7 @@
 - `ntpc-core`: the engine. Source selection, filtering, clock discipline, poll timing. No OS or network code.
 - `ntpc-platform`: Windows adapters. Clock, sockets, registry, DHCP.
 - `ntpc-service`: the service binary. It wires the core to the adapters.
-- `fuzz/`: `cargo-fuzz` targets. Outside the workspace.
+- `fuzz/`: `cargo-fuzz` targets. Outside the workspace. A future `fuzz/Cargo.toml` must have its own `[workspace]` table.
 
 ## Dependency rule
 
