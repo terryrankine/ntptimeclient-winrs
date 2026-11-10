@@ -29,9 +29,9 @@ const PHASE_TIME_CONSTANT_SECS: f64 = 2048.0;
 /// Equal to the phase time constant. A held phase term removes the offset
 /// at a fixed rate, so it reaches zero after one phase constant. Holding it
 /// longer pushes the clock past zero. In steady state the drift taught on
-/// the same round adds `gap * MAX_HOLD / T_i^2` of the offset. The learning
-/// gap is capped at 1024 s, so that is at most 1/8 and the overshoot within
-/// this window is at most 12.5 % of the offset. The engine must call
+/// the same round adds `gap * MAX_HOLD / T_i^2 = gap / 8192` of the offset.
+/// The learning gap is capped at 1280 s, so the overshoot within this window
+/// is at most 1280 / 8192 = 15.6 % of the offset. The engine must call
 /// [`Discipline::free_run`] if no update arrives within this window.
 pub const MAX_HOLD: Duration = Duration::from_secs(2048);
 
@@ -44,11 +44,13 @@ const DRIFT_TIME_CONSTANT_SECS: f64 = 2.0 * PHASE_TIME_CONSTANT_SECS;
 
 /// Longest gap between updates that still teaches the drift.
 ///
-/// 1024 s is the longest poll, so a normal round always learns. The cap
-/// makes the [`MAX_HOLD`] overshoot bound true: a gap of 1024 s adds at most
-/// 1/8 of the offset over a held window, where 2048 s would add 1/4. A
-/// longer gap means a missed poll or an outage. It still corrects the phase.
-const MAX_LEARN_INTERVAL_SECS: f64 = 1024.0;
+/// 1.25 times the longest poll of 1024 s. Real gaps at that poll run a little
+/// over 1024 s from round-trip time and scheduling jitter, and must still
+/// learn. The cap is inclusive: a gap of exactly 1280 s learns. It also
+/// bounds the [`MAX_HOLD`] overshoot, which is `gap / 8192` of the offset:
+/// at most 15.6 % here, where 2048 s would give 25 %. A longer gap means a
+/// missed poll or an outage. It still corrects the phase.
+const MAX_LEARN_INTERVAL_SECS: f64 = 1280.0;
 
 const PPM_PER_UNIT: f64 = 1e6;
 
@@ -142,8 +144,10 @@ pub struct Discipline {
     drift_ppm: f64,
     /// One step is allowed after start and after each resume.
     step_allowed: bool,
-    /// Time of the last update that taught the loop. `None` after start,
-    /// resume and free run, so the next sample does not teach the drift.
+    /// Time of the last accepted or vetoed round, set even when that round
+    /// did not teach the drift. It gives the next round its gap. A panic
+    /// refusal leaves it alone. `None` after start, resume and free run, so
+    /// the first sample after those does not teach the drift.
     last_update: Option<Mono>,
 }
 
@@ -271,7 +275,7 @@ impl Discipline {
     /// `error_bound` is not used. A wide-bound sample teaches at full gain.
     /// Accepted for v1: selection already drops falsetickers. One sample at
     /// the 128 ms threshold moves the drift by 0.5 ppm at a 64 s gap. The
-    /// worst case is 7.8 ppm at the 1024 s gap cap. The loop pulls it back.
+    /// worst case is 9.8 ppm at the 1280 s gap cap. The loop pulls it back.
     fn learn(&mut self, x: f64, now: Mono) {
         let Some(last) = self.last_update else {
             return;
@@ -539,78 +543,105 @@ mod tests {
         assert!((MAX_HOLD.as_secs_f64() - PHASE_TIME_CONSTANT_SECS).abs() < 1e-12);
     }
 
+    /// Overshoot bound after a held round: `MAX_LEARN_INTERVAL_SECS / 8192`.
+    fn hold_bound() -> f64 {
+        MAX_LEARN_INTERVAL_SECS * MAX_HOLD.as_secs_f64()
+            / (DRIFT_TIME_CONSTANT_SECS * DRIFT_TIME_CONSTANT_SECS)
+    }
+
+    /// True phase after one frequency is held for `hold` seconds. The drift
+    /// is right, so the only error is the phase. `prior_gap` adds an update
+    /// that many seconds before, which uses up the start step and lets a
+    /// linear offset teach the drift on the held round.
+    fn held(x0: f64, prior_gap: Option<u64>, hold: u64) -> f64 {
+        let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(20.0)));
+        let mut sim = Sim::new(x0, 20.0, 0.0);
+        sim.freq_ppm = 20.0;
+        if let Some(gap) = prior_gap {
+            freq(d.update(&sel(0.0), CrossCheck::NotRequired, at(0)));
+            sim.now = gap;
+        }
+        sim.poll(&mut d, hold);
+        sim.phase
+    }
+
+    #[test]
+    fn hold_bound_is_15_6_percent() {
+        assert!((hold_bound() - 0.156_25).abs() < 1e-12);
+    }
+
     #[test]
     fn skipped_poll_within_max_hold_does_not_cross_zero() {
-        // A 1024 s poll is skipped, so one frequency is held for `hold`
-        // seconds. The drift is right, so the only error is the phase.
-        // `prior` adds an update 1024 s before, which uses up the start step
-        // and lets a linear offset teach the drift on the held round.
-        fn held(x0: f64, prior: bool, hold: u64) -> f64 {
-            let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(20.0)));
-            let mut sim = Sim::new(x0, 20.0, 0.0);
-            sim.freq_ppm = 20.0;
-            if prior {
-                freq(d.update(&sel(0.0), CrossCheck::NotRequired, at(0)));
-                sim.now = 1024;
-            }
-            sim.poll(&mut d, hold);
-            sim.phase
-        }
+        // A 1024 s poll is skipped, so one frequency is held for MAX_HOLD.
         let hold = MAX_HOLD.as_secs();
 
         // Phase term alone: a first sync in the linear range, or a large
         // offset after the first sync. Neither teaches the drift.
         for (x0, prior) in [
-            (0.01, false),
-            (0.128, false),
-            (-0.1, false),
-            (0.5, true),
-            (5.0, true),
-            (-5.0, true),
+            (0.01, None),
+            (0.128, None),
+            (-0.1, None),
+            (0.5, Some(1024)),
+            (5.0, Some(1024)),
+            (-5.0, Some(1024)),
         ] {
             let p = held(x0, prior, hold);
             assert!(p * x0.signum() >= -1e-12, "x0 {x0}: crossed to {p}");
         }
 
-        // Steady state: the integral term adds gap * hold / T_i^2 = 1/8 of
-        // the offset on top of the phase term. The overshoot stays within
-        // 12.5 % of the offset.
-        for x0 in [0.01, 0.1, 0.128, -0.1] {
-            let p = held(x0, true, hold);
-            assert!(
-                p * x0.signum() >= -0.125 * x0.abs() - 1e-12,
-                "x0 {x0}: overshot to {p}"
-            );
+        // Steady state: the integral term adds gap / 8192 of the offset on
+        // top of the phase term. At the 1280 s cap that is 15.6 %.
+        for gap in [1024, 1280] {
+            for x0 in [0.01, 0.1, 0.128, -0.1] {
+                let p = held(x0, Some(gap), hold);
+                assert!(
+                    p * x0.signum() >= -0.156_25 * x0.abs() - 1e-12,
+                    "gap {gap} x0 {x0}: overshot to {p}"
+                );
+            }
         }
 
         // Holding twice as long crosses far. The window is what matters.
-        let p = held(0.1, false, 2 * hold);
+        let p = held(0.1, None, 2 * hold);
         assert!(p < -0.05, "expected a crossing, got {p}");
     }
 
-    /// Drift taught by one 0.1 s offset after a gap, in ppm.
-    fn taught(gap: u64) -> f64 {
+    /// Drift taught by one 0.1 s offset after a gap in nanoseconds, in ppm.
+    fn taught(gap_ns: u64) -> f64 {
         let mut d = Discipline::new(DisciplineConfig::default(), Some(Ppm::new(20.0)));
         freq(d.update(&sel(0.0), CrossCheck::NotRequired, at(0)));
-        freq(d.update(&sel(0.1), CrossCheck::NotRequired, at(gap)));
+        freq(d.update(&sel(0.1), CrossCheck::NotRequired, Mono::from_nanos(gap_ns)));
         d.drift().value() - 20.0
     }
 
+    /// The integral teach for a 0.1 s offset after `gap` seconds, in ppm.
+    fn integral(gap: f64) -> f64 {
+        0.1 * gap / (DRIFT_TIME_CONSTANT_SECS * DRIFT_TIME_CONSTANT_SECS) * 1e6
+    }
+
+    const NS: u64 = 1_000_000_000;
+
     #[test]
     fn learning_gap_exactly_at_cap_learns() {
-        let expected = 0.1 * 1024.0 / (DRIFT_TIME_CONSTANT_SECS * DRIFT_TIME_CONSTANT_SECS) * 1e6;
-        let got = taught(1024);
-        assert!(
-            (got - expected).abs() < 1e-9,
-            "taught {got}, want {expected}"
-        );
-        assert!(got > 6.0);
+        let got = taught(1280 * NS);
+        let want = integral(1280.0);
+        assert!((got - want).abs() < 1e-9, "taught {got}, want {want}");
+        assert!(got > 7.0);
+    }
+
+    #[test]
+    fn learning_gap_of_max_poll_plus_jitter_learns() {
+        // 1024 s poll plus 0.5 s of round trip and scheduling jitter.
+        let got = taught(1024 * NS + NS / 2);
+        let want = integral(1024.5);
+        assert!((got - want).abs() < 1e-9, "taught {got}, want {want}");
     }
 
     #[test]
     fn learning_gap_above_cap_is_skipped_and_hold_stays_bounded() {
-        assert!(taught(1025).abs() < 1e-12);
-        assert!(taught(2048).abs() < 1e-12);
+        assert!(taught(1280 * NS + 1).abs() < 1e-12);
+        assert!(taught(1281 * NS).abs() < 1e-12);
+        assert!(taught(2048 * NS).abs() < 1e-12);
         // A 2048 s gap, then the round is held for MAX_HOLD. Without the cap
         // the integral term would add 1/4 of the offset. With it, nothing.
         for x0 in [0.01, 0.1, 0.128, -0.1] {
@@ -623,7 +654,7 @@ mod tests {
             assert!((d.drift().value() - 20.0).abs() < 1e-12, "x0 {x0}: learned");
             let p = sim.phase;
             assert!(
-                p * x0.signum() >= -0.125 * x0.abs() - 1e-12,
+                p * x0.signum() >= -0.156_25 * x0.abs() - 1e-12,
                 "x0 {x0}: overshot to {p}"
             );
         }
