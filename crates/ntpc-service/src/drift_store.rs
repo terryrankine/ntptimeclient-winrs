@@ -8,8 +8,14 @@
 //! never a failure. [`DriftStore::load`] returns `None` and the reason is
 //! kept for [`FileDriftStore::last_load_note`], so the host can log it.
 //!
-//! The directory ACL is not set here. The platform crate applies it, and
-//! this type only creates the directory if it is missing.
+//! The directory ACL is not set here. The platform crate (Task 11) applies
+//! it, and this type only creates the directory if it is missing. `save`
+//! trusts the directory. The caller must have secured it first, including a
+//! directory that already existed, because anyone who can write there can
+//! plant files next to the drift file.
+//!
+//! Saves are serial only. Two concurrent saves share one temp name and can
+//! fail or clobber each other. The host has a single writer.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -151,8 +157,42 @@ fn parse(text: &str) -> Result<Ppm, LoadNote> {
     Ok(Ppm::new(value))
 }
 
+/// Keeps the full OS error (code and text). Neither holds a path or file text.
 fn io_error(step: &str, e: &io::Error) -> StoreError {
-    StoreError::Io(format!("{step}: {}", e.kind()))
+    StoreError::Io(format!("{step}: {e}"))
+}
+
+/// Windows `FILE_FLAG_OPEN_REPARSE_POINT`. Written out here because the
+/// constant lives in a crate we do not depend on.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// Creates the temp file, failing if anything is already at that path.
+///
+/// `create_new` never follows a link at the path, on any host. On Windows the
+/// reparse-point flag also makes the open act on a link itself, as a second
+/// guard. On other hosts only `create_new` applies (`O_EXCL`). The project
+/// targets Windows. This gate only keeps the crate compiling elsewhere.
+fn create_temp(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+/// Adds a failed cleanup to the error, so neither is lost.
+fn with_cleanup(step: &str, e: &io::Error, temp: &Path) -> StoreError {
+    match fs::remove_file(temp) {
+        Ok(()) => io_error(step, e),
+        Err(c) if c.kind() == io::ErrorKind::NotFound => io_error(step, e),
+        Err(c) => StoreError::Io(format!(
+            "{step}: {e}. Removing the temp file also failed: {c}"
+        )),
+    }
 }
 
 impl DriftStore for FileDriftStore {
@@ -187,24 +227,31 @@ impl DriftStore for FileDriftStore {
         }
         fs::create_dir_all(&self.dir).map_err(|e| io_error("create state directory", &e))?;
         let temp = self.temp_path();
-        let written = (|| -> io::Result<()> {
-            // Truncate, so a stale temp from a crash cannot leave a tail.
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp)?;
-            f.write_all(format!("{VERSION} {value}\n").as_bytes())?;
-            f.sync_all()
-        })();
-        if let Err(e) = written {
-            let _ = fs::remove_file(&temp);
-            return Err(io_error("write drift temp file", &e));
+        // A temp file from a crash is ours to remove. Anything that cannot be
+        // removed (a directory, a locked or read-only file) is an error.
+        match fs::remove_file(&temp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_error("remove old drift temp file", &e)),
         }
-        fs::rename(&temp, self.path()).map_err(|e| {
-            let _ = fs::remove_file(&temp);
-            io_error("replace drift file", &e)
-        })
+        let mut f = create_temp(&temp).map_err(|e| io_error("create drift temp file", &e))?;
+        // `{:?}` is the shortest text that reads back exactly. `{}` writes
+        // 5e-324 as 0.000...5 with over 300 digits.
+        if let Err(e) = f
+            .write_all(
+                format!(
+                    "{VERSION} {value:?}
+"
+                )
+                .as_bytes(),
+            )
+            .and_then(|()| f.sync_all())
+        {
+            drop(f);
+            return Err(with_cleanup("write drift temp file", &e, &temp));
+        }
+        drop(f);
+        fs::rename(&temp, self.path()).map_err(|e| with_cleanup("replace drift file", &e, &temp))
     }
 }
 
