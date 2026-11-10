@@ -50,7 +50,10 @@ pub const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(3600);
 /// name failed or gave no usable address.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long a name keeps its previous addresses after lookups start to fail.
+/// How long a name keeps its cached addresses after lookups start to fail.
+/// This is the only expiry. `Mono` counts awake time only and stands still
+/// during sleep, so the limit is 24 h of running time. A restart loses the
+/// cache, because it lives in memory only.
 pub const MAX_KEEP_PREVIOUS: Duration = Duration::from_secs(24 * 3600);
 
 /// Looks a name up. Blocking.
@@ -104,10 +107,14 @@ pub enum ResolveNote {
     LookupFailed {
         /// The name.
         name: String,
-        /// What the system said.
+        /// What the system said. On Windows most DNS failures are
+        /// `Uncategorized`, so log `code` as well.
         kind: io::ErrorKind,
+        /// The raw OS error code, for example 11001 for a name that is not
+        /// found or a network that is down. Windows uses one code for both.
+        code: Option<i32>,
     },
-    /// After a failed lookup the previous addresses are still used.
+    /// After a failed lookup the cached addresses are still used.
     KeptPrevious {
         /// The name.
         name: String,
@@ -163,6 +170,17 @@ pub fn is_usable_address(ip: IpAddr) -> bool {
     }
 }
 
+/// A cached lookup answer.
+#[derive(Debug, Clone)]
+struct Cached {
+    /// Usable addresses as the lookup returned them, never empty.
+    addrs: Vec<IpAddr>,
+    /// When the lookup last worked.
+    good_at: Mono,
+}
+
+type NameKey = (Tier, String);
+
 /// Expands names into sources with stable ids.
 #[derive(Debug)]
 pub struct Resolver<L, O> {
@@ -171,12 +189,20 @@ pub struct Resolver<L, O> {
     /// Ids of the addresses in the latest result only.
     ids: BTreeMap<IpAddr, SourceId>,
     next_id: Option<u32>,
-    /// Latest good answer per name and tier, kept for a failed lookup.
-    /// The `Mono` is when the answer was last good.
-    previous: BTreeMap<(Tier, String), (Vec<IpAddr>, Mono)>,
+    /// Latest good answer per name. Kept for a failed lookup and reused on a
+    /// retry pass. Empty answers are never stored.
+    cache: BTreeMap<NameKey, Cached>,
+    /// Names that failed or gave nothing usable and had no cache to fall back
+    /// on. The next retry pass looks up only these.
+    retry_names: BTreeSet<NameKey>,
+    /// Every name of the latest call. A different list forces a full pass.
+    last_names: BTreeSet<NameKey>,
+    /// Start of the latest full pass.
+    last_full_at: Option<Mono>,
+    /// Wait before the next pass while failures persist. `None` when healthy.
+    retry_interval: Option<Duration>,
     notes: Vec<ResolveNote>,
     resolved_at: Option<Mono>,
-    retry_soon: bool,
 }
 
 impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
@@ -187,10 +213,13 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
             own,
             ids: BTreeMap::new(),
             next_id: Some(0),
-            previous: BTreeMap::new(),
+            cache: BTreeMap::new(),
+            retry_names: BTreeSet::new(),
+            last_names: BTreeSet::new(),
+            last_full_at: None,
+            retry_interval: None,
             notes: Vec::new(),
             resolved_at: None,
-            retry_soon: false,
         }
     }
 
@@ -199,12 +228,20 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
         &mut self.lookup
     }
 
-    /// Resolves every name and returns the sources, sorted by tier then
-    /// address. Blocks. See the module note on timeouts.
+    /// Resolves names and returns the sources, sorted by tier then address.
+    /// Blocks. See the module note on timeouts.
     ///
-    /// `now` dates the answers, so a failed lookup can keep a name's previous
-    /// addresses for at most [`MAX_KEEP_PREVIOUS`]. A name that is not found
-    /// loses them at once. The call never fails as a whole. Look at [`Resolver::take_notes`] for what happened.
+    /// `now` dates the answers. A failed lookup keeps that name's cached
+    /// addresses for at most [`MAX_KEEP_PREVIOUS`].
+    ///
+    /// Retry pass: while some names keep failing, a call within an hour of
+    /// the last full pass, with the same names, looks up only the failing
+    /// names. The other names reuse their cached answers, so their ids stay
+    /// the same and a rotating pool name is not asked again. Any other call
+    /// is a full pass.
+    ///
+    /// The call never fails as a whole. Look at [`Resolver::take_notes`] for
+    /// what happened.
     pub fn expand(&mut self, now: Mono, names: &[(String, Tier)]) -> Vec<SourceSpec> {
         self.notes.clear();
         let own: BTreeSet<IpAddr> = self
@@ -214,6 +251,16 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
             .map(|a| a.to_canonical())
             .collect();
 
+        let name_set: BTreeSet<NameKey> = names.iter().map(|(n, t)| (*t, n.clone())).collect();
+        let retry_pass = !self.retry_names.is_empty()
+            && name_set == self.last_names
+            && self
+                .last_full_at
+                .is_some_and(|at| now.saturating_duration_since(at) < RE_RESOLVE_INTERVAL);
+        if !retry_pass {
+            self.last_full_at = Some(now);
+        }
+
         // Priority order first, so a higher tier claims a shared address.
         let mut ordered: Vec<&(String, Tier)> = names.iter().collect();
         ordered.sort_by_key(|(_, tier)| *tier);
@@ -221,14 +268,21 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
         let mut claimed: BTreeSet<IpAddr> = BTreeSet::new();
         let mut per_tier: BTreeMap<Tier, usize> = BTreeMap::new();
         let mut tier_dropped: BTreeMap<Tier, usize> = BTreeMap::new();
-        let mut next_previous = BTreeMap::new();
-        let mut retry = false;
+        let mut next_cache = BTreeMap::new();
+        let mut next_retry = BTreeSet::new();
         // (tier, address, label) in assignment order.
         let mut chosen: Vec<(Tier, IpAddr, &str)> = Vec::new();
 
         for (name, tier) in ordered {
-            let found = self.candidates(now, name, *tier, &own, &claimed);
-            retry |= found.retry;
+            let key = (*tier, name.clone());
+            let ask = !retry_pass || self.retry_names.contains(&key);
+            let found = self.candidates(now, &key, ask, &own, &claimed);
+            if found.retry {
+                next_retry.insert(key.clone());
+            }
+            if let Some(c) = found.cache {
+                next_cache.insert(key, c);
+            }
             let candidates = found.list;
             let room = MAX_PER_TIER - per_tier.get(tier).copied().unwrap_or(0);
             let mut keep = candidates.len();
@@ -247,12 +301,23 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
             *per_tier.entry(*tier).or_default() += kept.len();
             claimed.extend(kept.iter().copied());
             chosen.extend(kept.iter().map(|ip| (*tier, *ip, name.as_str())));
-            next_previous.insert((*tier, name.clone()), (kept.to_vec(), found.good_at));
         }
         for (tier, dropped) in tier_dropped {
             self.notes.push(ResolveNote::TierCapped { tier, dropped });
         }
-        self.previous = next_previous;
+        self.cache = next_cache;
+        self.last_names = name_set;
+        // Wait 60 s, then 120 s, doubling up to an hour while any name keeps
+        // failing. One clean pass resets it.
+        self.retry_interval = if next_retry.is_empty() {
+            None
+        } else {
+            Some(
+                self.retry_interval
+                    .map_or(RETRY_INTERVAL, |p| (p * 2).min(RE_RESOLVE_INTERVAL)),
+            )
+        };
+        self.retry_names = next_retry;
 
         let mut ids = BTreeMap::new();
         let mut out = Vec::with_capacity(chosen.len());
@@ -273,33 +338,43 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
         // freed ids.
         self.ids = ids;
         out.sort_by_key(|s| (s.tier, s.addr.ip()));
-        self.retry_soon = retry || out.is_empty();
         out
     }
 
     /// Usable, unclaimed addresses for one name. Known addresses first.
+    /// With `ask` false the cached answer is used and no lookup is made.
     fn candidates(
         &mut self,
         now: Mono,
-        name: &str,
-        tier: Tier,
+        key: &NameKey,
+        ask: bool,
         own: &BTreeSet<IpAddr>,
         claimed: &BTreeSet<IpAddr>,
     ) -> Candidates {
-        let mut good_at = now;
+        let name = key.1.as_str();
+        let mut cache: Option<Cached> = None;
         let mut retry = false;
         let raw: Vec<IpAddr> = if let Ok(literal) = name.parse::<IpAddr>() {
             vec![literal]
+        } else if !ask {
+            cache = self.cache.get(key).cloned();
+            cache.as_ref().map(|c| c.addrs.clone()).unwrap_or_default()
         } else {
             match self.lookup.lookup(name) {
                 Ok(list) => {
                     // An address claimed by an earlier name does not count
                     // here. A pool that repeats a config server is not a fault.
-                    if !list.iter().any(|a| usable(*a, own)) {
+                    let list = dedup_usable(list, own);
+                    if list.is_empty() {
                         self.notes.push(ResolveNote::NoUsableAddresses {
                             name: name.to_owned(),
                         });
                         retry = true;
+                    } else {
+                        cache = Some(Cached {
+                            addrs: list.clone(),
+                            good_at: now,
+                        });
                     }
                     list
                 }
@@ -307,46 +382,38 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
                     self.notes.push(ResolveNote::LookupFailed {
                         name: name.to_owned(),
                         kind: e.kind(),
+                        code: e.raw_os_error(),
                     });
-                    let old = self.previous.get(&(tier, name.to_owned()));
-                    // NotFound means the name does not exist. Old addresses
-                    // would be wrong, so they go at once. Any other failure
-                    // may be a blip, so they stay for a bounded time.
-                    let keep = old.filter(|(_, at)| {
-                        e.kind() != io::ErrorKind::NotFound
-                            && now.saturating_duration_since(*at) <= MAX_KEEP_PREVIOUS
-                    });
-                    if let Some((addrs, at)) = keep {
-                        good_at = *at;
+                    // Windows reports a missing name and a lost network with
+                    // the same code, so a failure never drops the cache at
+                    // once. Only age does.
+                    let old = self.cache.get(key);
+                    let fresh = old
+                        .filter(|c| now.saturating_duration_since(c.good_at) <= MAX_KEEP_PREVIOUS);
+                    if let Some(c) = fresh {
                         self.notes.push(ResolveNote::KeptPrevious {
                             name: name.to_owned(),
                         });
-                        addrs.clone()
+                        cache = Some(c.clone());
                     } else {
-                        if old.is_some() && e.kind() != io::ErrorKind::NotFound {
+                        if old.is_some() {
                             self.notes.push(ResolveNote::PreviousExpired {
                                 name: name.to_owned(),
                             });
                         }
                         retry = true;
-                        Vec::new()
                     }
+                    cache.as_ref().map(|c| c.addrs.clone()).unwrap_or_default()
                 }
             }
         };
-        let mut seen = BTreeSet::new();
-        let mut list: Vec<IpAddr> = raw
+        let mut list: Vec<IpAddr> = dedup_usable(raw, own)
             .into_iter()
-            .map(|a| a.to_canonical())
-            .filter(|a| usable(*a, own) && !claimed.contains(a) && seen.insert(*a))
+            .filter(|a| !claimed.contains(a))
             .collect();
         // Stable sort, so lookup order survives inside each group.
         list.sort_by_key(|a| !self.ids.contains_key(a));
-        Candidates {
-            list,
-            good_at,
-            retry,
-        }
+        Candidates { list, cache, retry }
     }
 
     fn id_for(&mut self, ip: IpAddr) -> Option<SourceId> {
@@ -360,13 +427,12 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
 
     /// True when it is time to call [`Resolver::expand`] again. Always true
     /// before the first [`Resolver::mark_resolved`].
+    ///
+    /// While names fail the wait is 60 s, then doubles each pass up to an
+    /// hour. Otherwise it is [`RE_RESOLVE_INTERVAL`].
     #[must_use]
     pub fn due(&self, now: Mono) -> bool {
-        let interval = if self.retry_soon {
-            RETRY_INTERVAL
-        } else {
-            RE_RESOLVE_INTERVAL
-        };
+        let interval = self.retry_interval.unwrap_or(RE_RESOLVE_INTERVAL);
         self.resolved_at
             .is_none_or(|at| now.saturating_duration_since(at) >= interval)
     }
@@ -386,14 +452,19 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
 /// Result of looking one name up.
 struct Candidates {
     list: Vec<IpAddr>,
-    /// When the answer behind `list` was last good.
-    good_at: Mono,
+    /// What to remember for next time.
+    cache: Option<Cached>,
     /// The name failed or gave nothing usable, so ask again soon.
     retry: bool,
 }
 
-fn usable(ip: IpAddr, own: &BTreeSet<IpAddr>) -> bool {
-    is_usable_address(ip) && !own.contains(&ip.to_canonical())
+/// Canonical, usable, own-free addresses with duplicates removed. Order kept.
+fn dedup_usable(list: Vec<IpAddr>, own: &BTreeSet<IpAddr>) -> Vec<IpAddr> {
+    let mut seen = BTreeSet::new();
+    list.into_iter()
+        .map(|a| a.to_canonical())
+        .filter(|a| is_usable_address(*a) && !own.contains(a) && seen.insert(*a))
+        .collect()
 }
 
 #[cfg(test)]
