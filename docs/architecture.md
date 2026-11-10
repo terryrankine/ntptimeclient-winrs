@@ -309,3 +309,16 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 ### Hard link count (`file_link_count`)
 
 - `GetFileInformationByHandle` on a duplicate of an open `File`. Works on read and append handles (tested). Stable `std` cannot read it on Windows. The host's log file sink uses it to refuse a file with more than one link (R75).
+
+## Service: Windows adapters (`ntpc-service::winimpl`, Task 14c-A)
+
+- `windows_deps(cfg, sinks)` builds the host's `HostDeps`, its `Inbox` and `HostControl`, the resume hook and the persistence flag. It does not start the loop. `HostDeps` holds boxed traits without `Send`, so call it on the thread that runs the host.
+- Start order: secure the state directory first, then build the log, then open the clock. The log file (`service.log`, rotated to `service.log.1`) is added only when the directory is secured. A log handle opened in a weak directory would block its replacement (R78). The host's own `StateDir::secure` returns the outcome of that one call.
+- `SecureOutcome`: `Kept` or `Absent` is `Ok`, `Dropped` is `RestoreDropped`, every `AclError` is `Refused` with a fixed reason class and no path. The host then runs with persistence off.
+- Clock: `WindowsClock` behind `ClockControl`, every call passed through once. Opening it is the only fatal step.
+- Time: monotonic is the unbiased interrupt time (awake only), wall is the precise system time.
+- `w32time` monitor: query rights only, true on any error or a missing service (R85).
+- DHCP: the per-adapter read. Only a real "no option 42" goes to the host's negative cache, never a failed adapter.
+- Network events: a watcher thread waits on the address subscription, sets a flag and wakes the loop. The host reads and clears the flag each turn.
+- Resume: the service control handler calls `ResumeNotifier::notify_resumed` on a resume power event. It sets the flag the host reads and wakes the loop.
+- Query workers raise their own thread to above normal before each query.
