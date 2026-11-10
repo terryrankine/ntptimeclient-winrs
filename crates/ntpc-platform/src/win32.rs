@@ -1021,6 +1021,63 @@ pub fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
     Ok(())
 }
 
+/// Tests only: makes the empty directory behind `handle` a junction to
+/// `target` (an absolute path) with `FSCTL_SET_REPARSE_POINT`, the way an
+/// attacker holding an old handle could. The handle needs
+/// `FILE_WRITE_DATA` (or `FILE_WRITE_ATTRIBUTES`).
+///
+/// # Errors
+/// The OS error if the call fails.
+#[cfg(test)]
+pub fn set_junction(handle: &OwnedHandle, target: &Path) -> io::Result<()> {
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    /// `FSCTL_SET_REPARSE_POINT` and `IO_REPARSE_TAG_MOUNT_POINT`.
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    // Substitute name `\??\target`, empty print name, both NUL-terminated.
+    let mut sub: Vec<u16> = "\\??\\".encode_utf16().collect();
+    sub.extend(target.as_os_str().encode_wide());
+    let sub_bytes = u16::try_from(sub.len() * 2)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target too long"))?;
+    let path_buffer = usize::from(sub_bytes) + 2 + 2;
+    let data_len = u16::try_from(8 + path_buffer)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target too long"))?;
+    let mut b = Vec::with_capacity(8 + usize::from(data_len));
+    b.extend_from_slice(&TAG_MOUNT_POINT.to_le_bytes());
+    b.extend_from_slice(&data_len.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    // Substitute name offset and length, print name offset and length.
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&sub_bytes.to_le_bytes());
+    b.extend_from_slice(&(sub_bytes + 2).to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    for u in &sub {
+        b.extend_from_slice(&u.to_le_bytes());
+    }
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    let len = u32::try_from(b.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target too long"))?;
+    let mut returned = 0u32;
+    // SAFETY: `b` is a filled REPARSE_DATA_BUFFER of `len` bytes that lives
+    // across the call. No output buffer and no OVERLAPPED are passed.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            b.as_ptr().cast::<c_void>(),
+            len,
+            ptr::null_mut(),
+            0,
+            &raw mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

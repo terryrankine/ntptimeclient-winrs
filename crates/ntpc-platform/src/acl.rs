@@ -13,10 +13,11 @@
 //!   exempt.
 //! - An existing directory must be owned by SYSTEM or Administrators. The
 //!   owner can always rewrite the DACL, so a foreign-owned directory is
-//!   refused, never re-ACLed. There is no remove-and-recreate path.
+//!   refused, never re-ACLed.
 //! - The DACL is protected (nothing inherited from the parent) and grants
 //!   SYSTEM and Administrators full control, inherited by files and
-//!   folders. Users get nothing: the directory holds only the drift value.
+//!   folders. Users get nothing: the directory holds only service state
+//!   (drift, the w32time restore record, status).
 //! - An existing directory is never re-ACLed (R78). A handle opened before a
 //!   DACL change keeps the rights it was granted, so a re-ACLed old object can
 //!   still be written, even turned into a junction, through such a handle.
@@ -65,7 +66,11 @@ const ALREADY_EXISTS: i32 = 183;
 const INVALID_OWNER: i32 = 1307;
 
 /// Why the state directory could not be secured.
+///
+/// Non-exhaustive: callers need a wildcard arm, so new refusals do not break
+/// them.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AclError {
     /// Only absolute local drive paths with plain components are accepted.
     #[error("state directory path must be an absolute local drive path")]
@@ -94,7 +99,7 @@ pub enum AclError {
     /// Securing a fresh directory failed after the old one was moved to
     /// quarantine, and moving it back failed too. Both errors are kept.
     #[error(
-        "state directory replacement failed ({cause}), and restoring the old directory failed ({rollback})"
+        "state directory replacement failed ({cause}), and moving the previous directory back failed ({rollback}). The previous directory was left under a sibling name ending in .old- and a hex suffix, and it may hold the restore record"
     )]
     RollbackFailed {
         /// Why the fresh directory could not be secured.
@@ -169,6 +174,28 @@ fn os(op: &'static str, e: &io::Error) -> AclError {
 /// best effort. It is empty and ours, and a half-secured directory must not
 /// be left behind.
 ///
+/// `RollbackFailed` recovery (R88): the window between the quarantine rename
+/// and the fresh create can be raced. A local user who creates a directory
+/// at the original name in that window makes both the create and the rename
+/// back fail. That needs a weak pre-existing directory and a user racing the
+/// window. The previous directory, possibly holding `restore.json`, is then
+/// left as `<name>.old-<hex>`. To recover: delete the squatter directory,
+/// rename `<name>.old-<hex>` back to `<name>`, and run again. The caller
+/// must refuse on `RollbackFailed` (install with its own exit code). The
+/// quarantine name is deliberately not in the error, so a script cannot be
+/// tricked into acting on a path an attacker chose. Task 12 treats it as
+/// "the record may be in quarantine".
+///
+/// The fast path trusts any directory whose DACL is exactly the secure one.
+/// An administrator must never re-ACL the state directory in place: a handle
+/// opened before such a change would keep its rights. Quarantine siblings
+/// `*.old-*` that stay behind are not cleaned up by the service. Removing
+/// them is an administrator step.
+///
+/// Deferred (m-5): a file created at `restore.json` between the inspection
+/// and the read can turn `Absent` into `Dropped`. That fails safe (install
+/// refuses), so it is left as it is.
+///
 /// A `subst` drive is accepted as a fixed drive. Pointing one at a user
 /// directory is an administrator misconfiguration (R79), like R74 below.
 ///
@@ -186,6 +213,7 @@ pub fn secure_state_dir(path: &Path) -> Result<Secured, AclError> {
 
 /// What `secure_state_dir` did with the w32time restore record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "install must refuse on RestoreRecord::Dropped"]
 pub struct Secured {
     /// The fate of `restore.json`.
     pub restore_record: RestoreRecord,
@@ -342,12 +370,15 @@ fn is_device_name(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy().to_ascii_uppercase();
     let stem = name.split('.').next().unwrap_or("").trim_end();
     match stem {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
         _ => {
-            let b = stem.as_bytes();
-            b.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && (b'1'..=b'9').contains(&b[3])
+            let mut chars = stem.chars();
+            let head: String = chars.by_ref().take(3).collect();
+            let digit = chars.next();
+            (head == "COM" || head == "LPT")
+                && chars.next().is_none()
+                // Windows also maps the superscript digits one, two and three.
+                && matches!(digit, Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'))
         }
     }
 }
@@ -648,25 +679,95 @@ fn inspect_children(dir: &OwnedHandle, path: &Path) -> Result<Vec<ChildObs>, Acl
 /// delete the quarantine best effort. If the fresh directory fails, move
 /// the old one back and report both errors if that fails too.
 fn quarantine_and_recreate(h: &OwnedHandle, path: &Path) -> Result<RestoreRecord, AclError> {
-    // Read the restore record before anything moves. Its bytes are carried,
-    // never the file itself.
-    let source = read_restore(path, &os_child_owner_trusted)?;
+    quarantine_with(&OsQuarantine, h, path)
+}
+
+/// The steps of the quarantine path that tests replace. The real versions
+/// are in [`OsQuarantine`]. A test cannot create a protected directory
+/// without elevation, so its `create_fresh` makes a plain directory instead.
+/// Everything else (read, clean, the quarantine rename, the rename back, the
+/// removal of the fresh directory by handle) stays real.
+trait QuarantineOps {
+    /// The restore record's owner is SYSTEM or Administrators.
+    fn restore_owner_ok(&self, h: &OwnedHandle) -> Result<bool, AclError>;
+    /// Creates and secures the fresh directory, returning its handle.
+    fn create_fresh(&self, path: &Path) -> Result<OwnedHandle, AclError>;
+    /// Writes `restore.json` into the fresh directory and verifies it.
+    fn write_restore(&self, dir: &Path, bytes: &[u8]) -> Result<(), AclError>;
+    /// Reads a written file back.
+    fn read_back(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Moves the old directory back to its name.
+    fn rename_back(&self, h: &OwnedHandle, path: &Path) -> io::Result<()>;
+    /// Deletes the emptied quarantine, best effort.
+    fn delete_quarantine(&self, h: &OwnedHandle);
+}
+
+struct OsQuarantine;
+
+impl QuarantineOps for OsQuarantine {
+    fn restore_owner_ok(&self, h: &OwnedHandle) -> Result<bool, AclError> {
+        os_child_owner_trusted(h)
+    }
+
+    fn create_fresh(&self, path: &Path) -> Result<OwnedHandle, AclError> {
+        create_fresh(path)
+    }
+
+    fn write_restore(&self, dir: &Path, bytes: &[u8]) -> Result<(), AclError> {
+        write_restore(dir, bytes, &|p| self.read_back(p))
+    }
+
+    fn read_back(&self, path: &Path) -> io::Result<Vec<u8>> {
+        os_read_back(path)
+    }
+
+    fn rename_back(&self, h: &OwnedHandle, path: &Path) -> io::Result<()> {
+        win32::rename_by_handle(h, path)
+    }
+
+    fn delete_quarantine(&self, h: &OwnedHandle) {
+        // Best effort, as R78 says. Delete through the handle, so no link is
+        // followed. A failure leaves an inert quarantine directory that
+        // nothing reads.
+        let _ = win32::delete_by_handle(h);
+    }
+}
+
+/// R78 and R80, in order:
+/// 1. read the restore record through its checked handle;
+/// 2. clean the other known files;
+/// 3. rename the old directory to `<name>.old-<hex>` through its handle;
+/// 4. create and secure the fresh directory;
+/// 5. carry the restore record into it.
+///
+/// If 4 or 5 fails, the fresh directory (if made) is deleted through its
+/// handle, and the old one is renamed back. If that fails too, the error is
+/// `RollbackFailed` and nothing in the quarantine is touched. On success the
+/// carried original is removed from the quarantine, and the quarantine is
+/// deleted only when no record was dropped. A dropped record stays there.
+fn quarantine_with(
+    ops: &impl QuarantineOps,
+    h: &OwnedHandle,
+    path: &Path,
+) -> Result<RestoreRecord, AclError> {
+    let source = read_restore(path, &|c| ops.restore_owner_ok(c))?;
     clean_known_children(h, path)?;
     let quarantine = rename_to_quarantine(h, path)?;
-    let result = create_fresh(path).and_then(|()| {
+    let result = ops.create_fresh(path).and_then(|fresh| {
         let carried = match &source {
             RestoreSource::Carry { bytes, .. } => {
-                write_restore(path, bytes, &os_read_back).map(|()| RestoreRecord::Kept)
+                ops.write_restore(path, bytes).map(|()| RestoreRecord::Kept)
             }
             RestoreSource::Dropped => Ok(RestoreRecord::Dropped),
             RestoreSource::Absent => Ok(RestoreRecord::Absent),
         };
         if carried.is_err() {
-            // The fresh directory is ours and `write_restore` removed its
-            // own file, so it is empty. Remove it before moving the old one
-            // back.
-            let _ = std::fs::remove_dir(path);
+            // `write_restore` removed its own file, so the fresh directory is
+            // empty. Delete it through its handle. The name is freed when the
+            // handle closes, just below, before the rename back.
+            let _ = win32::delete_by_handle(&fresh);
         }
+        drop(fresh);
         carried
     });
     match result {
@@ -674,15 +775,12 @@ fn quarantine_and_recreate(h: &OwnedHandle, path: &Path) -> Result<RestoreRecord
             if let RestoreSource::Carry { id, .. } = &source {
                 remove_carried_original(&quarantine, id);
             }
-            // Best effort, as R78 says: the old directory is empty unless a
-            // restore record was dropped or someone added to it through a
-            // held handle. Delete through the handle, so no link is
-            // followed. A failure leaves an inert quarantine directory that
-            // nothing reads.
-            let _ = win32::delete_by_handle(h);
+            if record != RestoreRecord::Dropped {
+                ops.delete_quarantine(h);
+            }
             Ok(record)
         }
-        Err(cause) => match win32::rename_by_handle(h, path) {
+        Err(cause) => match ops.rename_back(h, path) {
             Ok(()) => Err(cause),
             Err(e) => Err(AclError::RollbackFailed {
                 cause: cause.to_string(),
@@ -853,19 +951,26 @@ fn rename_to_quarantine(h: &OwnedHandle, path: &Path) -> Result<PathBuf, AclErro
     Err(os("quarantine", &e))
 }
 
-/// Creates a fresh directory at `path` with the secure descriptor and
-/// secures it. Refuses if anything already took the name. Removes it again
-/// if securing fails.
-fn create_fresh(path: &Path) -> Result<(), AclError> {
+/// Creates a fresh directory at `path` with the secure descriptor, secures
+/// it, and returns its handle. Refuses if anything already took the name
+/// (error 183). If securing fails it is deleted through its handle. Only
+/// when the open itself fails is it removed by path: it was created a moment
+/// ago with the secure DACL, so nobody unprivileged can have replaced it.
+fn create_fresh(path: &Path) -> Result<OwnedHandle, AclError> {
     require_trusted_token_owner()?;
     win32::create_secure_dir(path).map_err(|e| os("create", &e))?;
-    let result = win32::open_no_follow(path, DIR_RIGHTS)
-        .map_err(|e| os("open", &e))
-        .and_then(|h| secure_fresh(&h, path));
-    if result.is_err() {
-        let _ = std::fs::remove_dir(path);
+    let h = match win32::open_no_follow(path, DIR_RIGHTS) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::remove_dir(path);
+            return Err(os("open", &e));
+        }
+    };
+    if let Err(e) = secure_fresh(&h, path) {
+        let _ = win32::delete_by_handle(&h);
+        return Err(e);
     }
-    result
+    Ok(h)
 }
 
 /// Refuses unless the directory behind `dir` is empty.
@@ -1666,9 +1771,15 @@ mod tests {
         // dir, which is not under test here.
         let s = Scratch::new("elevated");
         let dir = s.0.join("state");
-        secure_final(&dir).unwrap();
+        assert_eq!(
+            secure_final(&dir).unwrap().restore_record,
+            RestoreRecord::Absent
+        );
         // The second call takes the already-exists path.
-        secure_final(&dir).unwrap();
+        assert_eq!(
+            secure_final(&dir).unwrap().restore_record,
+            RestoreRecord::Absent
+        );
         let h = win32::open_no_follow(&dir, READ_CONTROL | FILE_READ_ATTRIBUTES).unwrap();
         let sec = win32::read_security(&h).unwrap();
         assert!(owner_trusted(&sec) && dacl_is_secure(&sec), "{sec:?}");
@@ -1707,7 +1818,10 @@ mod tests {
         // A known file written by an Administrators token is kept.
         std::fs::write(dir.join("drift.txt"), b"2.0").unwrap();
         let kept = win32::link_info(&listing_handle(&dir)).unwrap();
-        secure_final(&dir).unwrap();
+        assert_eq!(
+            secure_final(&dir).unwrap().restore_record,
+            RestoreRecord::Absent
+        );
         let now = win32::link_info(&listing_handle(&dir)).unwrap();
         assert!(kept.same_file(&now), "fast path should keep the directory");
         assert!(dir.join("drift.txt").exists());
@@ -1716,7 +1830,7 @@ mod tests {
         assert_eq!(secure_final(&dir), Err(AclError::UnexpectedChild));
         // A user-owned known file cannot be planted from an elevated test
         // without changing an owner, so that row is covered by `decide`.
-        eprintln!("quarantine leftovers: {:?}", quarantine_leftovers(&s.0));
+        assert_eq!(quarantine_leftovers(&s.0), Vec::<String>::new());
     }
 
     fn quarantine_leftovers(dir: &Path) -> Vec<String> {
@@ -2189,6 +2303,275 @@ mod tests {
             return;
         }
         assert_eq!(same_object(&h, &dir), Err(AclError::Link));
+    }
+
+    #[test]
+    fn console_and_superscript_device_names_are_refused() {
+        for name in [
+            "CONIN$",
+            "conout$",
+            "CONOUT$.txt",
+            "COM\u{b9}",
+            "com\u{b2}.log",
+            "COM\u{b3}",
+            "LPT\u{b9}",
+            "lpt\u{b3} .x",
+        ] {
+            let p = PathBuf::from(r"C:\ProgramData").join(name);
+            assert_eq!(ancestors(&p), Err(AclError::ReservedName), "{name}");
+        }
+        // Only superscript one to three are device digits.
+        for name in ["COM\u{2074}", "LPT\u{b9}\u{b9}", "CONIN", "CONOUT$X"] {
+            let p = PathBuf::from(r"C:\ProgramData").join(name);
+            assert!(ancestors(&p).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn identity_check_refuses_the_same_object_turned_into_a_junction() {
+        // The I-2 case: a handle opened earlier sets a reparse point on the
+        // very object that was secured. File ID unchanged, reparse bit set.
+        let s = Scratch::new("selfjunction");
+        let dir = state_dir(&s);
+        let target = s.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let h = win32::open_no_follow(&dir, FILE_WRITE_DATA | FILE_READ_ATTRIBUTES).unwrap();
+        assert_eq!(same_object(&h, &dir), Ok(()));
+        win32::set_junction(&h, &target).unwrap();
+        assert_eq!(same_object(&h, &dir), Err(AclError::Link));
+    }
+
+    /// `FILE_WRITE_DATA`, for the junction test.
+    const FILE_WRITE_DATA: u32 = 0x0002;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Create {
+        /// A plain directory stands in for the protected one.
+        Plain,
+        /// The create fails, the name stays free.
+        Fail,
+        /// Someone squats the name in the window: a directory appears and
+        /// the create fails with 183.
+        Squat,
+    }
+
+    /// Stands in for the steps that need elevation. `create_fresh` replaces
+    /// `CreateDirectoryW` with the secure descriptor plus the fresh checks
+    /// by a plain `create_dir` and a handle. `write_restore` is the real
+    /// function unless `write_fails`. `read_back` is the real one unless
+    /// `read_back_differs`. The rename back and the quarantine delete are
+    /// real, and `deleted` records whether the delete ran.
+    struct FakeQ {
+        owner_ok: bool,
+        create: Create,
+        write_fails: bool,
+        read_back_differs: bool,
+        deleted: std::cell::Cell<bool>,
+    }
+
+    impl FakeQ {
+        fn new(create: Create) -> Self {
+            Self {
+                owner_ok: true,
+                create,
+                write_fails: false,
+                read_back_differs: false,
+                deleted: std::cell::Cell::new(false),
+            }
+        }
+    }
+
+    impl QuarantineOps for FakeQ {
+        fn restore_owner_ok(&self, _: &OwnedHandle) -> Result<bool, AclError> {
+            Ok(self.owner_ok)
+        }
+
+        fn create_fresh(&self, path: &Path) -> Result<OwnedHandle, AclError> {
+            match self.create {
+                Create::Plain => {
+                    std::fs::create_dir(path).map_err(|e| os("create", &e))?;
+                    win32::open_no_follow(path, DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+                        .map_err(|e| os("open", &e))
+                }
+                Create::Fail => Err(os("create", &io::Error::from_raw_os_error(5))),
+                Create::Squat => {
+                    std::fs::create_dir(path).unwrap();
+                    Err(os("create", &io::Error::from_raw_os_error(183)))
+                }
+            }
+        }
+
+        fn write_restore(&self, dir: &Path, bytes: &[u8]) -> Result<(), AclError> {
+            if self.write_fails {
+                return Err(AclError::RestoreCarryFailed {
+                    detail: "injected write failure".into(),
+                });
+            }
+            write_restore(dir, bytes, &|p| self.read_back(p))
+        }
+
+        fn read_back(&self, path: &Path) -> io::Result<Vec<u8>> {
+            if self.read_back_differs {
+                Ok(b"tampered".to_vec())
+            } else {
+                os_read_back(path)
+            }
+        }
+
+        fn rename_back(&self, h: &OwnedHandle, path: &Path) -> io::Result<()> {
+            win32::rename_by_handle(h, path)
+        }
+
+        fn delete_quarantine(&self, h: &OwnedHandle) {
+            self.deleted.set(true);
+            let _ = win32::delete_by_handle(h);
+        }
+    }
+
+    const RECORD: &[u8] = b"{\"w32time\":\"auto\"}";
+
+    /// A weak state directory with a drift file and, if asked, a restore
+    /// record. Runs the quarantine path and returns the result, the old
+    /// directory's identity and the quarantine names left in the scratch.
+    fn run_quarantine(
+        s: &Scratch,
+        ops: &FakeQ,
+        with_record: bool,
+    ) -> (Result<RestoreRecord, AclError>, win32::LinkInfo, PathBuf) {
+        let dir = state_dir(s);
+        std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
+        if with_record {
+            std::fs::write(dir.join("restore.json"), RECORD).unwrap();
+        }
+        let h = rename_handle(&dir);
+        let before = win32::link_info(&h).unwrap();
+        let r = quarantine_with(ops, &h, &dir);
+        drop(h);
+        (r, before, dir)
+    }
+
+    /// The old directory is back under its name, cleaned of the drift file,
+    /// with the restore record byte for byte, and no quarantine is left.
+    fn assert_rolled_back(s: &Scratch, dir: &Path, before: &win32::LinkInfo) {
+        let back = win32::link_info(&listing_handle(dir)).unwrap();
+        assert!(before.same_file(&back), "old directory not renamed back");
+        assert_eq!(std::fs::read(dir.join("restore.json")).unwrap(), RECORD);
+        assert!(!dir.join("drift.txt").exists());
+        assert_eq!(quarantine_leftovers(&s.0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rollback_after_a_read_back_mismatch() {
+        let s = Scratch::new("rbreadback");
+        let ops = FakeQ {
+            read_back_differs: true,
+            ..FakeQ::new(Create::Plain)
+        };
+        let (r, before, dir) = run_quarantine(&s, &ops, true);
+        assert!(
+            matches!(r, Err(AclError::RestoreCarryFailed { .. })),
+            "{r:?}"
+        );
+        assert_rolled_back(&s, &dir, &before);
+        assert!(!ops.deleted.get());
+    }
+
+    #[test]
+    fn rollback_after_a_write_failure() {
+        let s = Scratch::new("rbwrite");
+        let ops = FakeQ {
+            write_fails: true,
+            ..FakeQ::new(Create::Plain)
+        };
+        let (r, before, dir) = run_quarantine(&s, &ops, true);
+        assert!(
+            matches!(r, Err(AclError::RestoreCarryFailed { .. })),
+            "{r:?}"
+        );
+        assert_rolled_back(&s, &dir, &before);
+        assert!(!ops.deleted.get());
+    }
+
+    #[test]
+    fn rollback_after_a_create_failure() {
+        let s = Scratch::new("rbcreate");
+        let ops = FakeQ::new(Create::Fail);
+        let (r, before, dir) = run_quarantine(&s, &ops, true);
+        assert!(matches!(r, Err(AclError::Os { op: "create", .. })), "{r:?}");
+        assert_rolled_back(&s, &dir, &before);
+        assert!(!ops.deleted.get());
+    }
+
+    #[test]
+    fn squat_ends_in_rollback_failed_and_leaves_the_quarantine_untouched() {
+        let s = Scratch::new("rbsquat");
+        let ops = FakeQ::new(Create::Squat);
+        let (r, before, dir) = run_quarantine(&s, &ops, true);
+        let Err(AclError::RollbackFailed { cause, rollback }) = &r else {
+            panic!("{r:?}");
+        };
+        // Both errors are kept: the squatted create (183) and the failed
+        // rename back.
+        assert!(cause.contains("183"), "{cause}");
+        assert!(rollback.contains("os error"), "{rollback}");
+        let text = r.clone().unwrap_err().to_string();
+        assert!(text.contains(".old-") && !text.contains('\\'), "{text}");
+        // The squatter holds the name. The old directory is in quarantine,
+        // untouched, with the record byte for byte. No delete ran.
+        assert!(!before.same_file(&win32::link_info(&listing_handle(&dir)).unwrap()));
+        let left = quarantine_leftovers(&s.0);
+        assert_eq!(left.len(), 1);
+        let q = s.0.join(&left[0]);
+        assert!(before.same_file(&win32::link_info(&listing_handle(&q)).unwrap()));
+        assert_eq!(std::fs::read(q.join("restore.json")).unwrap(), RECORD);
+        assert!(!ops.deleted.get(), "the quarantine delete must not run");
+    }
+
+    #[test]
+    fn success_carries_the_record_and_deletes_the_quarantine() {
+        let s = Scratch::new("okcarry");
+        let ops = FakeQ::new(Create::Plain);
+        let (r, before, dir) = run_quarantine(&s, &ops, true);
+        assert_eq!(r, Ok(RestoreRecord::Kept));
+        let now = win32::link_info(&listing_handle(&dir)).unwrap();
+        assert!(
+            !before.same_file(&now),
+            "the fresh directory is a new object"
+        );
+        assert_eq!(std::fs::read(dir.join("restore.json")).unwrap(), RECORD);
+        assert!(!dir.join("drift.txt").exists());
+        assert!(ops.deleted.get());
+        assert_eq!(quarantine_leftovers(&s.0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn success_without_a_record_deletes_the_quarantine() {
+        let s = Scratch::new("okabsent");
+        let ops = FakeQ::new(Create::Plain);
+        let (r, _, dir) = run_quarantine(&s, &ops, false);
+        assert_eq!(r, Ok(RestoreRecord::Absent));
+        assert!(ops.deleted.get());
+        assert!(!dir.join("restore.json").exists());
+        assert_eq!(quarantine_leftovers(&s.0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_dropped_record_keeps_the_quarantine_and_its_record() {
+        let s = Scratch::new("okdropped");
+        let ops = FakeQ {
+            owner_ok: false,
+            ..FakeQ::new(Create::Plain)
+        };
+        let (r, _, dir) = run_quarantine(&s, &ops, true);
+        assert_eq!(r, Ok(RestoreRecord::Dropped));
+        assert!(!ops.deleted.get(), "the quarantine delete must not run");
+        assert!(!dir.join("restore.json").exists(), "dropped, not carried");
+        let left = quarantine_leftovers(&s.0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            std::fs::read(s.0.join(&left[0]).join("restore.json")).unwrap(),
+            RECORD
+        );
     }
 
     #[test]

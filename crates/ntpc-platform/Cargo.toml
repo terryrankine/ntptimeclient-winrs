@@ -27,6 +27,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_WindowsProgramming",
 ] }
 
+# Tests only: `DeviceIoControl` to turn a test directory into a junction.
+# Same crate, one more feature, so no new dependency.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_IO"] }
+
 # Cargo cannot combine `workspace = true` with overrides in one crate.
 # So this table repeats the workspace lints and changes only `unsafe_code`.
 # `deny` (not `forbid`) lets the `win32` module opt in. See src/lib.rs.
