@@ -1,0 +1,52 @@
+# ntptimeclient-winrs configuration. UNSIGNED PREVIEW.
+#
+# Every key is optional. An empty file gives the same values as this file.
+# An unknown key is an error, so a typo cannot silently leave a safety
+# setting at its default.
+#
+# Time sources are used in strict order. The config servers come first.
+# DHCP servers come next. The pool comes last. The first tier that has a
+# usable source is used on its own. The tiers are never mixed.
+
+# Your own time servers. Host names or IP addresses. At most 16.
+# The port is always 123. Use full DNS names or IP addresses. A bare name
+# such as "ntp" or a ".local" name may be answered by anyone on the LAN.
+# Default: none. Example:
+#   servers = ["time.example.com", "192.0.2.7"]
+servers = []
+
+# Use NTP servers offered by DHCP when no config server is usable.
+# Default: true.
+dhcp = true
+
+# The last-resort pool. It is also queried in observe-only mode while a
+# config or DHCP tier is active, as a cross-check. It never feeds the choice
+# of source in that case. Default: pool.ntp.org.
+pool = "pool.ntp.org"
+
+# A clock error above this many milliseconds may be corrected by one
+# step. A smaller error is corrected by slewing (a gentle change of clock
+# rate). Must be at least min_poll_s. Default: 128.
+step_threshold_ms = 128
+
+# A step above this many seconds is refused unless allow_panic_step is true.
+# Default: 1000.
+panic_threshold_s = 1000
+
+# Allow a step above panic_threshold_s. Leave this false unless you know why
+# you need it. Default: false.
+allow_panic_step = false
+
+# Shortest time between polls of a source, in seconds. 64 to 128.
+# Default: 64.
+min_poll_s = 64
+
+# Longest time between polls of a source, in seconds. At most 1024.
+# Default: 1024.
+max_poll_s = 1024
+
+# Where the service keeps its saved drift value. The installer secures this
+# folder so only SYSTEM and Administrators can write to it. It must be an
+# absolute path. Single quotes keep the backslashes literal.
+# Default: C:\ProgramData\ntptimeclient-winrs
+state_dir = 'C:\ProgramData\ntptimeclient-winrs'
