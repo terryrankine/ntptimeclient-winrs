@@ -259,6 +259,20 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 - The OS buffers are walked with bounds checks. Every pointer the OS returns must lie inside the buffer we passed, or the record is skipped. The adapter name must be a plain GUID string of at most 255 ASCII characters before it is widened.
 - Error text holds Win32 error codes only. No address, adapter name or GUID.
 
+### Per-adapter reads (`read_lease_servers_per_adapter`, R82)
+
+- Takes a skip set of `AdapterKey` values. A key is the adapter GUID plus the lease server (`Dhcpv4Server`), as `<GUID>/<address>`. A new lease from another server is a new key.
+- An adapter in the skip set is not asked. No DHCPINFORM goes out for it. When every leased adapter is skipped the DHCP client API is not started at all.
+- Each leased adapter appears once in the result, in the reader order above, with one outcome: `Servers`, `NoOption42` (no option, or an empty or malformed one), `Skipped`, or `Failed(code)`. The host negative-caches `NoOption42` only. A failure is not a "no 42" answer.
+- `Err(Request)` only when every adapter that was asked failed. Skipped adapters do not count.
+- `read_lease_servers` is now this read with nothing skipped, merged by `merged_servers`. Same adapters, order, caps and errors as before.
+- Keys hold a GUID and an address. They are for the cache only and are never logged.
+
+### Buffer walks (shared, `win32::adapters`)
+
+- One fetch helper for `GetAdaptersAddresses` (16 KiB first buffer, at most 1 MiB, four tries) serves the DHCP reader (`AF_INET`) and the own-address list (`AF_UNSPEC`).
+- One chain walker for every OS list. A node must lie wholly inside the buffer and be aligned for its type. The walk stops at a null or bad pointer, at a node it has seen already (a cyclic `Next`), and after 1024 nodes. Crafted-buffer tests cover a cyclic `Next`, a self loop, a pointer outside the buffer, a misaligned node, a short `Length` and a sockaddr outside the buffer (Task 13 review M7).
+
 ### Parser rules (`parse_option42`)
 
 - Input is the option data only (no code or length byte), as `DhcpRequestParams` returns it.
@@ -275,3 +289,23 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 - `wait(timeout)` blocks until a change, the timeout or a cancel. Bursts coalesce into one change. `WatchCanceller` wakes a blocked `wait` from another thread.
 - Drop: cancels waiters, then calls `CancelMibChangeNotify2`. Learn says the cancel must not run on the callback thread, else deadlock. That only makes sense if the cancel waits for a running callback. So the context is freed after the cancel returns. Inference, not stated outright. If the cancel fails, the context is leaked on purpose (a few bytes) and never freed under a live callback. The callback only takes a short mutex and never blocks, so the cancel cannot hang on it.
 - `LeaseTracker`: the first list counts as a change. The same set in another order is not a change, because the resolver keys sources by address and the reader's order is already deterministic. Any add or remove is a change. All removed is a change to empty. On a read error the host keeps the last good list. An error is not a lost lease.
+
+## Platform: own addresses and thread priority (Task 14c)
+
+### Own addresses (`net::own_addresses`)
+
+- `GetAdaptersAddresses(AF_UNSPEC)` with anycast, multicast, DNS servers and friendly names skipped. Read only, no packet.
+- Every unicast address of every adapter, IPv4 and IPv6, also of adapters that are down. The resolver drops these from every source list, so a superset is the safe side.
+- Parsed from `SOCKADDR_IN` and `SOCKADDR_IN6` bytes after the bounds checks above. Unknown families and the unspecified address are dropped. The IPv6 scope id is dropped.
+- Sorted, deduplicated and capped at 256, so the result is the same whatever order the OS lists adapters in.
+- Error text holds a Win32 code only. Nothing logs or prints an address.
+
+### Thread priority (`thread::set_current_thread_priority`)
+
+- `SetThreadPriority` and `GetThreadPriority` on the `GetCurrentThread` pseudo handle. Only the calling thread is touched. No process priority class, no other thread.
+- Query workers use `THREAD_PRIORITY_ABOVE_NORMAL` (1). Not time critical: a busy worker must not starve the machine.
+- The guard restores the previous level on drop, on the same thread (the guard is not `Send`). A short worker thread may `keep` the level for the rest of its life.
+
+### Hard link count (`file_link_count`)
+
+- `GetFileInformationByHandle` on a duplicate of an open `File`. Works on read and append handles (tested). Stable `std` cannot read it on Windows. The host's log file sink uses it to refuse a file with more than one link (R75).
