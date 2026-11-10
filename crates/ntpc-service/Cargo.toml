@@ -11,6 +11,9 @@ publish.workspace = true
 ntpc-core.workspace = true
 ntpc-platform.workspace = true
 getrandom.workspace = true
+toml.workspace = true
+serde.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
