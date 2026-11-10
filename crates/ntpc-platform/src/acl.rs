@@ -17,7 +17,7 @@
 //! - The DACL is protected (nothing inherited from the parent) and grants
 //!   SYSTEM and Administrators full control, inherited by files and
 //!   folders. Users get nothing: the directory holds only service state
-//!   (drift, the w32time restore record, status).
+//!   (drift, the w32time restore record, status, the service log).
 //! - An existing directory is never re-ACLed (R78). A handle opened before a
 //!   DACL change keeps the rights it was granted, so a re-ACLed old object can
 //!   still be written, even turned into a junction, through such a handle.
@@ -217,6 +217,9 @@ pub fn secure_state_dir(path: &Path) -> Result<Secured, AclError> {
 pub struct Secured {
     /// The fate of `restore.json`.
     pub restore_record: RestoreRecord,
+    /// The quarantine path ran (R78, R108): the old directory was replaced
+    /// by a fresh one, and its log, drift and status files are gone.
+    pub replaced: bool,
 }
 
 /// The w32time restore record (`restore.json`, Task 12) after securing.
@@ -236,6 +239,7 @@ pub enum RestoreRecord {
 impl Secured {
     const ABSENT: Self = Self {
         restore_record: RestoreRecord::Absent,
+        replaced: false,
     };
 }
 
@@ -565,7 +569,8 @@ fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<Secured, AclError> {
         return Err(AclError::UntrustedOwner);
     }
     let children = inspect_children(h, path)?;
-    let restore_record = match decide(dacl_is_secure(&sec), &children) {
+    let decision = decide(dacl_is_secure(&sec), &children);
+    let restore_record = match decision {
         Decision::Keep => {
             finish_keep(&OsOps, h, path)?;
             if children.iter().any(|c| c.restore) {
@@ -577,7 +582,10 @@ fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<Secured, AclError> {
         Decision::Refuse => return Err(AclError::UnexpectedChild),
         Decision::Quarantine => quarantine_and_recreate(h, path)?,
     };
-    Ok(Secured { restore_record })
+    Ok(Secured {
+        restore_record,
+        replaced: replaces(decision),
+    })
 }
 
 /// What a child is, as far as the rules care.
@@ -626,6 +634,12 @@ fn decide(dacl_exact: bool, children: &[ChildObs]) -> Decision {
     } else {
         Decision::Quarantine
     }
+}
+
+/// Whether a decision replaces the directory, for [`Secured::replaced`].
+/// Only the quarantine path does, and an error there returns before.
+fn replaces(d: Decision) -> bool {
+    d == Decision::Quarantine
 }
 
 fn kind_of(attributes: u32) -> ChildKind {
@@ -1004,15 +1018,22 @@ fn same_object(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
 ///   quarantine. The drift is only a starting hint and is relearnt.
 /// - `restore.json`, `restore.json.tmp`: w32time takeover record (Task 12).
 ///   Only `restore.json` is carried (R80). A `.tmp` is never carried.
-/// - `status.json`, `status.json.tmp`: status output (later task). Not
+/// - `status.json`, `status.json.tmp`: status output (Task 14). Not
 ///   carried. It is regenerated.
-pub const KNOWN_CHILDREN: [&str; 6] = [
+/// - `service.log`, `service.log.1`: the service log file and its one
+///   rotated copy (Task 14c, R100, `ntpc-service` `FileSink`). Plain files
+///   with one link, created by the service, so owned by SYSTEM or
+///   Administrators. Not carried: a quarantine starts a fresh log. Their
+///   size is never checked, so a growing log does not affect the fast path.
+pub const KNOWN_CHILDREN: [&str; 8] = [
     "drift.txt",
     "drift.txt.tmp",
     "restore.json",
     "restore.json.tmp",
     "status.json",
     "status.json.tmp",
+    "service.log",
+    "service.log.1",
 ];
 
 /// The one file carried into a fresh directory.
@@ -1771,15 +1792,13 @@ mod tests {
         // dir, which is not under test here.
         let s = Scratch::new("elevated");
         let dir = s.0.join("state");
-        assert_eq!(
-            secure_final(&dir).unwrap().restore_record,
-            RestoreRecord::Absent
-        );
+        let first = secure_final(&dir).unwrap();
+        assert_eq!(first.restore_record, RestoreRecord::Absent);
+        assert!(!first.replaced, "a new directory is not a replacement");
         // The second call takes the already-exists path.
-        assert_eq!(
-            secure_final(&dir).unwrap().restore_record,
-            RestoreRecord::Absent
-        );
+        let second = secure_final(&dir).unwrap();
+        assert_eq!(second.restore_record, RestoreRecord::Absent);
+        assert!(!second.replaced, "the fast path replaces nothing");
         let h = win32::open_no_follow(&dir, READ_CONTROL | FILE_READ_ATTRIBUTES).unwrap();
         let sec = win32::read_security(&h).unwrap();
         assert!(owner_trusted(&sec) && dacl_is_secure(&sec), "{sec:?}");
@@ -1800,10 +1819,9 @@ mod tests {
         std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
         std::fs::write(dir.join("restore.json"), b"{\"r\":1}").unwrap();
         let before = win32::link_info(&listing_handle(&dir)).unwrap();
-        assert_eq!(
-            secure_final(&dir).unwrap().restore_record,
-            RestoreRecord::Kept
-        );
+        let fixed = secure_final(&dir).unwrap();
+        assert_eq!(fixed.restore_record, RestoreRecord::Kept);
+        assert!(fixed.replaced, "the quarantine path ran");
         assert_eq!(
             std::fs::read(dir.join("restore.json")).unwrap(),
             b"{\"r\":1}"
@@ -2039,16 +2057,68 @@ mod tests {
     }
 
     #[test]
-    fn all_six_known_names_are_recognised() {
-        let s = Scratch::new("knownsix");
+    fn all_known_names_are_recognised() {
+        let s = Scratch::new("knownall");
         let dir = state_dir(&s);
         for n in KNOWN_CHILDREN {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
         let c = inspect(&dir);
-        assert_eq!(c.len(), 6);
-        assert!(c.iter().all(|o| o.known && o.kind == ChildKind::File));
+        assert_eq!(c.len(), KNOWN_CHILDREN.len());
+        assert_eq!(KNOWN_CHILDREN.len(), 8);
+        assert!(
+            c.iter()
+                .all(|o| o.known && o.kind == ChildKind::File && o.links == 1)
+        );
         assert_eq!(c.iter().filter(|o| o.restore).count(), 1);
+    }
+
+    #[test]
+    fn log_files_are_known_and_their_size_does_not_matter() {
+        // R100: the service log and its rotated copy live in the state
+        // directory. A big log observes exactly like a small one, so a
+        // growing log cannot move the decision.
+        assert!(KNOWN_CHILDREN.contains(&"service.log"));
+        assert!(KNOWN_CHILDREN.contains(&"service.log.1"));
+        let s = Scratch::new("logsize");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("service.log"), b"x").unwrap();
+        let small = inspect(&dir);
+        std::fs::write(dir.join("service.log"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        std::fs::write(dir.join("service.log.1"), vec![b'y'; 1024]).unwrap();
+        let big = inspect(&dir);
+        assert_eq!(big.len(), 2);
+        assert!(big.iter().all(|o| *o == small[0]), "size is not observed");
+        assert!(big.iter().all(|o| o.known && !o.restore));
+        // Trusted owner, one link: kept. The owner here is the test user,
+        // so the trusted case goes through the pure table.
+        let trusted: Vec<ChildObs> = big
+            .iter()
+            .map(|o| ChildObs {
+                owner_trusted: true,
+                ..*o
+            })
+            .collect();
+        assert_eq!(decide(true, &trusted), Decision::Keep);
+    }
+
+    #[test]
+    fn a_hard_linked_log_file_refuses() {
+        let s = Scratch::new("loghard");
+        let dir = state_dir(&s);
+        let outside = s.0.join("elsewhere.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::fs::hard_link(&outside, dir.join("service.log")).unwrap();
+        let c = inspect(&dir);
+        assert_eq!(c[0].links, 2);
+        assert_eq!(decide(true, &c), Decision::Refuse);
+    }
+
+    #[test]
+    fn only_the_quarantine_decision_replaces() {
+        assert!(replaces(Decision::Quarantine));
+        assert!(!replaces(Decision::Keep));
+        assert!(!replaces(Decision::Refuse));
     }
 
     #[test]

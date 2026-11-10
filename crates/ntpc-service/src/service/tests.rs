@@ -49,6 +49,10 @@ enum Behaviour {
     HostPanicked,
     /// Fails to build its adapters.
     DepsFail,
+    /// The clock cannot be opened.
+    ClockFail,
+    /// The account is refused.
+    AccountFail,
 }
 
 struct FakeLauncher {
@@ -102,6 +106,8 @@ impl Launcher for FakeLauncher {
         assert!(!sinks.is_empty(), "14c-A refuses an empty sink list");
         match self.behaviour {
             Behaviour::DepsFail => return Err(JobError::Deps("no clock".to_owned())),
+            Behaviour::ClockFail => return Err(JobError::Clock("privilege".to_owned())),
+            Behaviour::AccountFail => return Err(JobError::Account("owner".to_owned())),
             Behaviour::Panics => panic!("fake host panic"),
             _ => {}
         }
@@ -134,7 +140,11 @@ impl Launcher for FakeLauncher {
                 Ok(())
             }
             Behaviour::HostPanicked => Err(JobError::Host(HostError::Panicked("boom".to_owned()))),
-            Behaviour::EndsAtOnce | Behaviour::DepsFail | Behaviour::Panics => Ok(()),
+            Behaviour::EndsAtOnce
+            | Behaviour::DepsFail
+            | Behaviour::ClockFail
+            | Behaviour::AccountFail
+            | Behaviour::Panics => Ok(()),
         }
     }
 }
@@ -429,6 +439,8 @@ fn host_error_and_panic_map_to_codes() {
         (Behaviour::Panics, service_exit::PANICKED),
         (Behaviour::EndsAtOnce, service_exit::ENDED_UNASKED),
         (Behaviour::DepsFail, service_exit::DEPS_FAILED),
+        (Behaviour::ClockFail, service_exit::CLOCK),
+        (Behaviour::AccountFail, service_exit::ACCOUNT),
     ] {
         let (rig, _ctl, h) = start(FakeLauncher::new(b), Ok(Config::default()));
         assert_eq!(h.join().unwrap(), code, "{b:?}");

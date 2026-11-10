@@ -103,10 +103,23 @@ fn needs_escape(c: char) -> bool {
             // paragraph separators, bidi embeddings and overrides, word
             // joiner and invisible operators, bidi isolates and the
             // deprecated shaping controls, BOM, interlinear annotation
-            // controls and the tag characters.
+            // controls and the tag characters. Also the remaining Cf
+            // number and section marks (Arabic, Syriac, Kaithi, musical
+            // symbol beams) and the Hangul fillers, which show as blank.
             '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
                 | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{08E2}'
+                | '\u{115F}'
+                | '\u{1160}'
                 | '\u{180E}'
+                | '\u{3164}'
+                | '\u{FFA0}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{1D173}'..='\u{1D17A}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
@@ -393,6 +406,12 @@ fn open_append(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     if f.metadata()?.file_type().is_symlink() {
         return Err(io::Error::other("log path is a symbolic link or junction"));
+    }
+    // R75: a planted hard link would send our lines into a file someone
+    // else chose.
+    #[cfg(windows)]
+    if ntpc_platform::file_link_count(&f)? > 1 {
+        return Err(io::Error::other("log file has more than one hard link"));
     }
     Ok(f)
 }

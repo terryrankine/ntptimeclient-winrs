@@ -14,6 +14,7 @@ mod safe_open;
 pub mod service;
 pub mod status;
 pub mod transport;
+pub mod winimpl;
 
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-service";

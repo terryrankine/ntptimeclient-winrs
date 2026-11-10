@@ -24,7 +24,7 @@ use ntpc_service::host::{
     Inbox, JoinClass, JoinStateProvider, Msg, NetworkEvents, PowerEvents, SecureOutcome,
     ServiceMonitor, Spawn, StateDir, ThreadSpawn, Waiter,
 };
-use ntpc_service::logging::{LineLogger, MemorySink};
+use ntpc_service::logging::{LineLogger, LogSink, MemorySink};
 use ntpc_service::resolver::{NameLookup, OwnAddresses};
 use ntpc_service::status::{StatusReport, StatusWriter};
 use ntpc_service::transport::{TimeSource, Transport, TransportStats};
@@ -136,6 +136,21 @@ impl Waiter for FakeWaiter {
     }
 }
 
+/// Refuses every query thread, as a system out of threads would. Other
+/// jobs run inline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSpawn;
+
+impl Spawn for NoSpawn {
+    fn spawn(&self, name: &'static str, job: Box<dyn FnOnce() + Send + 'static>) -> bool {
+        if name == "ntpc-query" {
+            return false;
+        }
+        job();
+        true
+    }
+}
+
 /// Runs a job at once on the calling thread.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InlineSpawn;
@@ -170,6 +185,11 @@ pub struct World {
     pub commands: u64,
     /// The first `n` rate takes fail.
     pub fail_take: u32,
+    /// The first `n` rate resets fail.
+    pub fail_reset: u32,
+    /// A failing command moves fake time on by this many seconds inside
+    /// the call, as a slow failing system call would.
+    pub fail_advance_s: u64,
     pub log: Vec<(Mono, Cmd, bool)>,
 }
 
@@ -195,6 +215,8 @@ pub fn world(err: f64, need: f64) -> SharedWorld {
         fail_numbers: BTreeSet::new(),
         commands: 0,
         fail_take: 0,
+        fail_reset: 0,
+        fail_advance_s: 0,
         log: Vec::new(),
     }))
 }
@@ -202,6 +224,13 @@ pub fn world(err: f64, need: f64) -> SharedWorld {
 pub struct FakeClock {
     pub world: SharedWorld,
     pub time: FakeTime,
+}
+
+fn advance(time: &FakeTime, secs_on: u64) {
+    if secs_on > 0 {
+        let t = time.now();
+        time.set(Mono::from_nanos(t.as_nanos() + secs_on * SEC));
+    }
 }
 
 impl FakeClock {
@@ -214,6 +243,7 @@ impl FakeClock {
         let ok = !w.fail_numbers.contains(&n);
         w.log.push((now, cmd, ok));
         if !ok {
+            advance(&self.time, w.fail_advance_s);
             return Err(ClockError::Rejected("injected failure".into()));
         }
         match cmd {
@@ -242,7 +272,12 @@ impl Clock for FakeClock {
         let mut w = lock(&self.world);
         let now = self.time.now();
         w.settle(now);
-        w.log.push((now, Cmd::Reset, true));
+        let ok = w.fail_reset == 0;
+        w.fail_reset = w.fail_reset.saturating_sub(1);
+        w.log.push((now, Cmd::Reset, ok));
+        if !ok {
+            return Err(ClockError::Rejected("injected reset failure".into()));
+        }
         w.applied = 0.0;
         Ok(())
     }
@@ -466,6 +501,10 @@ pub struct FakeMonitor {
     pub running: Vec<(f64, f64)>,
     /// Panics on the first call at or after this time, seconds.
     pub panic_at: Option<f64>,
+    /// On the first call that says running, move fake time on this many
+    /// seconds inside the call.
+    pub advance_when_running_s: u64,
+    pub advanced: std::sync::atomic::AtomicBool,
     pub time: FakeTime,
     pub calls: Arc<Mutex<Vec<Mono>>>,
 }
@@ -475,11 +514,15 @@ impl ServiceMonitor for FakeMonitor {
         let now = self.time.now();
         lock(&self.calls).push(now);
         let t = as_secs(now);
+        let running = self.running.iter().any(|(a, b)| t >= *a && t < *b);
+        if running && !self.advanced.swap(true, Ordering::SeqCst) {
+            advance(&self.time, self.advance_when_running_s);
+        }
         assert!(
             !self.panic_at.is_some_and(|p| t >= p),
             "injected monitor panic"
         );
-        self.running.iter().any(|(a, b)| t >= *a && t < *b)
+        running
     }
 }
 
@@ -564,6 +607,19 @@ impl JoinStateProvider for FakeJoin {
     }
 }
 
+/// A memory sink that panics on any line holding `needle`.
+pub struct PanicSink {
+    pub inner: MemorySink,
+    pub needle: &'static str,
+}
+
+impl LogSink for PanicSink {
+    fn write_line(&self, line: &str) {
+        assert!(!line.contains(self.needle), "injected sink panic");
+        self.inner.write_line(line);
+    }
+}
+
 // ------------------------------------------------------------------ rig
 
 /// One host run with fakes. Change the public fields, then call `run`.
@@ -577,6 +633,7 @@ pub struct Rig {
     pub lookup: Arc<FakeLookup>,
     pub monitor_running: Vec<(f64, f64)>,
     pub monitor_panic_at: Option<f64>,
+    pub monitor_advance_s: u64,
     pub monitor_calls: Arc<Mutex<Vec<Mono>>>,
     pub network_at: Vec<f64>,
     pub power_at: Vec<(f64, f64)>,
@@ -585,7 +642,11 @@ pub struct Rig {
     pub state: SecureOutcome,
     pub join: JoinClass,
     pub sink: MemorySink,
+    /// The log sink panics on a line holding this text.
+    pub sink_panic_on: Option<&'static str>,
     pub threads: bool,
+    /// Every spawn fails.
+    pub no_spawn: bool,
     pub patience: Duration,
     pub hooks: Vec<(Mono, Hook)>,
     pub status_writer: Option<Box<dyn StatusWriter>>,
@@ -611,6 +672,7 @@ impl Rig {
             lookup: Arc::new(FakeLookup::pool(4)),
             monitor_running: Vec::new(),
             monitor_panic_at: None,
+            monitor_advance_s: 0,
             monitor_calls: Arc::new(Mutex::new(Vec::new())),
             network_at: Vec::new(),
             power_at: Vec::new(),
@@ -625,7 +687,9 @@ impl Rig {
             state: SecureOutcome::Ok,
             join: JoinClass::Workgroup,
             sink: MemorySink::new(),
+            sink_panic_on: None,
             threads: false,
+            no_spawn: false,
             patience: Duration::ZERO,
             hooks: Vec::new(),
             status_writer: None,
@@ -653,17 +717,23 @@ impl Rig {
         {
             self.hooks.push((secs(t), Box::new(|| {})));
         }
-        let logger = Arc::new(LineLogger::new(
-            Box::new(self.sink.clone()),
-            Arc::new(time.clone()),
-        ));
+        let sink: Box<dyn LogSink> = match self.sink_panic_on {
+            Some(needle) => Box::new(PanicSink {
+                inner: self.sink.clone(),
+                needle,
+            }),
+            None => Box::new(self.sink.clone()),
+        };
+        let logger = Arc::new(LineLogger::new(sink, Arc::new(time.clone())));
         let status: Box<dyn StatusWriter> = self.status_writer.take().unwrap_or_else(|| {
             Box::new(FakeStatus {
                 reports: Arc::clone(&self.reports),
                 time: time.clone(),
             })
         });
-        let spawn: Arc<dyn Spawn> = if self.threads {
+        let spawn: Arc<dyn Spawn> = if self.no_spawn {
+            Arc::new(NoSpawn)
+        } else if self.threads {
             Arc::new(ThreadSpawn)
         } else {
             Arc::new(InlineSpawn)
@@ -684,6 +754,8 @@ impl Rig {
             monitor: Box::new(FakeMonitor {
                 running: self.monitor_running.clone(),
                 panic_at: self.monitor_panic_at,
+                advance_when_running_s: self.monitor_advance_s,
+                advanced: std::sync::atomic::AtomicBool::new(false),
                 time: time.clone(),
                 calls: Arc::clone(&self.monitor_calls),
             }),

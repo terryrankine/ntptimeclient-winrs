@@ -312,18 +312,6 @@ impl LogSink for DiscardSink {
     }
 }
 
-/// Sends each line to several sinks, for example the Event Log and the
-/// console.
-pub struct TeeSink(pub Vec<Arc<dyn LogSink>>);
-
-impl LogSink for TeeSink {
-    fn write_line(&self, line: &str) {
-        for s in &self.0 {
-            s.write_line(line);
-        }
-    }
-}
-
 // ---------------------------------------------------------------- real
 
 /// The real Event Log, over `ntpc_platform::service_host::EventSource`.
