@@ -9,6 +9,7 @@ pub(crate) mod win32;
 
 pub mod clock;
 pub mod domain;
+pub mod w32time;
 
 /// State directory security. Windows only.
 #[cfg(windows)]
