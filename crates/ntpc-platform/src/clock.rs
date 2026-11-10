@@ -221,8 +221,6 @@ fn clock_error(op: &str, e: &std::io::Error) -> ClockError {
     const ACCESS_DENIED: i32 = 5;
     /// `ERROR_NOT_ALL_ASSIGNED`: the token lacks the privilege.
     const NOT_ALL_ASSIGNED: i32 = 1300;
-    /// `ERROR_PRIVILEGE_NOT_HELD`.
-    const PRIVILEGE_NOT_HELD: i32 = 1314;
     match e.raw_os_error() {
         Some(ACCESS_DENIED | NOT_ALL_ASSIGNED | PRIVILEGE_NOT_HELD) => ClockError::PermissionDenied,
         _ => ClockError::Rejected(format!("{op}: {e}")),

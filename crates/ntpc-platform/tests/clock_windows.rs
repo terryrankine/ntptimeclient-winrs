@@ -17,6 +17,7 @@
 #![cfg(windows)]
 
 use std::process::{Child, Command};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ntpc_core::{Clock, Offset, Ppm};
@@ -49,6 +50,18 @@ fn require_allowed() {
     if let Err(why) = allowed() {
         panic!("refusing to change the clock: {why}");
     }
+}
+
+/// One admin test at a time in this process, whatever `--test-threads`
+/// says. The clock and its rate are one global state.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    // A panic in an earlier test poisons the lock. Its guards have already
+    // undone what it did, so carry on.
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Owns the clock for one test. On drop it steps back by exactly the sum it
@@ -108,6 +121,7 @@ impl Drop for ChildGuard {
 #[test]
 #[ignore = "changes the system clock: elevated, throwaway VM only"]
 fn step_forward_then_back() {
+    let _serial = serial();
     let mut g = ClockGuard::new();
     let before = wall_now_ns();
     g.step(1.0);
@@ -123,6 +137,7 @@ fn step_forward_then_back() {
 #[test]
 #[ignore = "changes the system clock and its rate: elevated, throwaway VM only"]
 fn step_then_set_frequency_on_the_same_clock() {
+    let _serial = serial();
     // SetSystemTime disables the privilege before it returns (Learn). The
     // rate call after it must still succeed on the same WindowsClock.
     let mut g = ClockGuard::new();
@@ -142,6 +157,7 @@ fn step_then_set_frequency_on_the_same_clock() {
 #[test]
 #[ignore = "changes the system clock rate: elevated, throwaway VM only"]
 fn set_100_ppm_then_reset() {
+    let _serial = serial();
     let mut g = ClockGuard::new();
     eprintln!("initial state: {:?}", g.clock.initial_state());
     g.clock.set_frequency(Ppm::new(100.0)).unwrap();
@@ -172,10 +188,14 @@ fn kill_child_helper() {
     c.set_frequency(Ppm::new(100.0)).unwrap();
     eprintln!("child: 100 ppm set, waiting to be killed");
     // No reset guard here on purpose: the parent kills this process. The
-    // parent's ChildGuard resets the rate afterwards.
-    loop {
+    // parent's ChildGuard resets the rate afterwards. If the parent died
+    // first, stop by itself after about 60 s, leaving the rate set: the
+    // owner's recovery step resets it.
+    let end = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < end {
         std::thread::sleep(Duration::from_secs(1));
     }
+    eprintln!("child: no kill within 60 s, exiting");
 }
 
 fn spawn_child() -> ChildGuard {
@@ -194,6 +214,7 @@ fn spawn_child() -> ChildGuard {
 #[test]
 #[ignore = "changes the system clock rate and kills a process: elevated, throwaway VM only"]
 fn rate_after_kill_is_read_and_reset() {
+    let _serial = serial();
     // Start from a known nominal state.
     ClockGuard::new().clock.reset_frequency().unwrap();
     let mut child = spawn_child();
