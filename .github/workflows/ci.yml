@@ -19,33 +19,38 @@ jobs:
       matrix:
         os: [windows-latest, windows-2022]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7.0.1
+      # dtolnay/rust-toolchain stable branch, pinned by commit
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: pwsh scripts/check-deps.ps1
-      - uses: EmbarkStudios/cargo-deny-action@v2
 
   core-portable:
     name: core builds on linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      # dtolnay/rust-toolchain stable branch, pinned by commit
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo build -p ntpc-core
       - run: cargo test -p ntpc-core
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
 
   fuzz-smoke:
     name: fuzz smoke (nightly)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Find fuzz targets
         id: targets
         shell: bash
@@ -56,7 +61,10 @@ jobs:
           for f in "${files[@]}"; do names="$names $(basename "$f" .rs)"; done
           echo "names=${names# }" >> "$GITHUB_OUTPUT"
       - if: steps.targets.outputs.names != ''
-        uses: dtolnay/rust-toolchain@nightly
+        # dtolnay/rust-toolchain nightly branch, pinned by commit
+        uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04
+        with:
+          toolchain: nightly
       - if: steps.targets.outputs.names != ''
         run: cargo install cargo-fuzz --locked
       - if: steps.targets.outputs.names != ''

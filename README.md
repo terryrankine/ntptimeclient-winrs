@@ -1,16 +1,16 @@
 # ntptimeclient-winrs
 
-An open-source Windows service written in Rust. It keeps the system clock as close to correct as it can, all the time. Its job is to fix the clock, not to report that the clock is wrong. It takes time from the config file, then DHCP, then the global pool, and prefers slewing over stepping.
+An open-source Windows service written in Rust. It aims to keep the system clock as close to correct as it can, all the time. The aim is to fix the clock, not to report that the clock is wrong. The design aims to take time from the config file, then DHCP, then the global pool, and to prefer slewing over stepping.
 
 ## Status
 
-Pre-alpha. Unsigned previews only. Not for production machines.
+Pre-alpha. No releases yet. Previews, when they exist, will be unsigned. Not for production machines.
 
 ## Prerequisites
 
 - MSVC build tools (Visual Studio Build Tools with the C++ workload)
 - PowerShell 7
-- Rust stable (pinned by `rust-toolchain.toml`, minimum 1.88)
+- Rust, stable channel (`rust-toolchain.toml` says `stable`, which floats), minimum 1.88
 - `cargo-deny`
 - `cargo-fuzz` and a nightly toolchain, for fuzzing only
 - `gh`, for GitHub work

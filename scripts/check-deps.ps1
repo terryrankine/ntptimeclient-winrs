@@ -11,9 +11,18 @@ $allowed = @(
     'proc-macro2', 'quote', 'syn', 'unicode-ident'
 )
 
-$tree = & cargo tree -p ntpc-core -e normal --prefix none 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "cargo tree failed (exit $LASTEXITCODE):`n$($tree -join "`n")"
+# Cover build deps, every target and every feature. Default tree misses them.
+# stderr stays out of the package list: rustup prints info lines there.
+$errFile = New-TemporaryFile
+try {
+    $tree = & cargo tree -p ntpc-core -e normal,build --target all --all-features --prefix none 2>$errFile
+    $code = $LASTEXITCODE
+    $stderr = Get-Content -Raw $errFile
+} finally {
+    Remove-Item $errFile -ErrorAction SilentlyContinue
+}
+if ($code -ne 0) {
+    Write-Error "cargo tree failed (exit $code):`n$stderr"
     exit 1
 }
 
