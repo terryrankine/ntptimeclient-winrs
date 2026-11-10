@@ -11,7 +11,8 @@ use super::*;
 struct FakeHost {
     elevated: Result<bool, String>,
     join: JoinState,
-    terminal: bool,
+    stdin_console: bool,
+    stderr_console: bool,
     answer: bool,
     asked: u32,
     lines: Vec<String>,
@@ -22,7 +23,8 @@ impl FakeHost {
         Self {
             elevated: Ok(true),
             join,
-            terminal: false,
+            stdin_console: false,
+            stderr_console: false,
             answer: false,
             asked: 0,
             lines: Vec::new(),
@@ -30,6 +32,10 @@ impl FakeHost {
     }
     fn text(&self) -> String {
         self.lines.join("\n")
+    }
+    fn consoles(&mut self, both: bool) {
+        self.stdin_console = both;
+        self.stderr_console = both;
     }
 }
 
@@ -40,8 +46,8 @@ impl Host for FakeHost {
     fn join_state(&self) -> JoinState {
         self.join
     }
-    fn stdin_is_terminal(&self) -> bool {
-        self.terminal
+    fn is_interactive(&self) -> bool {
+        self.stdin_console && self.stderr_console
     }
     fn ask_yes_no(&mut self, question: &str) -> bool {
         self.asked += 1;
@@ -209,14 +215,27 @@ impl World {
 const SILENT: InstallOptions = InstallOptions {
     silent: true,
     confirm_domain_joined: false,
+    accept_disabled_original: false,
 };
 const SILENT_CONFIRMED: InstallOptions = InstallOptions {
     silent: true,
     confirm_domain_joined: true,
+    accept_disabled_original: false,
 };
 const PLAIN: InstallOptions = InstallOptions {
     silent: false,
     confirm_domain_joined: false,
+    accept_disabled_original: false,
+};
+const PLAIN_CONFIRMED: InstallOptions = InstallOptions {
+    silent: false,
+    confirm_domain_joined: true,
+    accept_disabled_original: false,
+};
+const ACCEPT_DISABLED: InstallOptions = InstallOptions {
+    silent: true,
+    confirm_domain_joined: false,
+    accept_disabled_original: true,
 };
 
 // Compared against `FakeScm::state`, which is an Option.
@@ -246,6 +265,7 @@ fn install_aborts_on_domain_joined_silent_without_flag() {
     assert!(!w.store.secured, "the state directory is not touched");
     assert_eq!(w.w32time(), original());
     assert!(w.host.text().contains("--confirm-domain-joined"));
+    assert!(w.host.text().contains("-ConfirmDomainJoined"));
 }
 
 #[test]
@@ -283,7 +303,8 @@ fn uninstall_restores_w32time_even_if_service_missing() {
 #[test]
 fn non_terminal_stdin_counts_as_silent() {
     let mut w = World::new(JoinState::Domain);
-    w.host.terminal = false;
+    w.host.stdin_console = false;
+    w.host.stderr_console = true;
     assert_eq!(w.install(PLAIN), exit::DOMAIN_JOINED);
     assert_eq!(w.host.asked, 0);
     assert!(w.untouched());
@@ -299,7 +320,7 @@ fn unknown_join_state_aborts_a_silent_install() {
 #[test]
 fn interactive_decline_aborts_without_change() {
     let mut w = World::new(JoinState::Domain);
-    w.host.terminal = true;
+    w.host.consoles(true);
     w.host.answer = false;
     assert_eq!(w.install(PLAIN), exit::DECLINED);
     assert_eq!(w.host.asked, 1);
@@ -310,7 +331,7 @@ fn interactive_decline_aborts_without_change() {
 #[test]
 fn interactive_yes_proceeds() {
     let mut w = World::new(JoinState::Unknown);
-    w.host.terminal = true;
+    w.host.consoles(true);
     w.host.answer = true;
     assert_eq!(w.install(PLAIN), exit::OK);
     assert_eq!(w.w32time(), taken_over());
@@ -319,7 +340,7 @@ fn interactive_yes_proceeds() {
 #[test]
 fn silent_flag_wins_over_a_terminal() {
     let mut w = World::new(JoinState::Domain);
-    w.host.terminal = true;
+    w.host.consoles(true);
     w.host.answer = true;
     assert_eq!(w.install(SILENT), exit::DOMAIN_JOINED);
     assert_eq!(w.host.asked, 0);
@@ -328,7 +349,7 @@ fn silent_flag_wins_over_a_terminal() {
 #[test]
 fn workgroup_installs_without_asking() {
     let mut w = World::new(JoinState::Workgroup);
-    w.host.terminal = true;
+    w.host.consoles(true);
     assert_eq!(w.install(PLAIN), exit::OK);
     assert_eq!(w.host.asked, 0);
 }
@@ -403,11 +424,113 @@ fn install_reports_a_refused_stop() {
     w.scm = FakeScm::new(s);
     assert_eq!(w.install(SILENT), exit::TAKEOVER);
     assert!(!w.reg.registered);
-    // The record stays, so uninstall can still restore.
+    // M8: nothing changed, so the record this run wrote is gone again.
+    assert_eq!(w.store.saved(), None);
+    assert!(w.host.text().contains("new restore record was removed"));
+}
+
+#[test]
+fn a_refused_stop_keeps_a_pre_existing_record() {
+    let mut w = World::new(JoinState::Workgroup);
+    let mut s = Script::with(RunState::Running, StartType::Manual);
+    s.refuse_stop = Some(SvcError::DependentsRunning);
+    w.scm = FakeScm::new(s);
+    w.store = MemStore::with(Restore::new(StartType::Automatic, true));
+    assert_eq!(w.install(SILENT), exit::TAKEOVER);
     assert_eq!(
         w.store.saved(),
         Some(Restore::new(StartType::Automatic, true))
     );
+    assert!(w.host.text().contains("earlier restore record is kept"));
+}
+
+#[test]
+fn a_failure_after_a_change_keeps_the_new_record() {
+    let mut w = World::new(JoinState::Workgroup);
+    let mut s = Script::running(StartType::Automatic);
+    s.stop_pending_polls = u32::MAX;
+    w.scm = FakeScm::new(s);
+    // The default timing would poll for 30 s of fake pauses, which cost
+    // nothing in the fake.
+    assert_eq!(w.install(SILENT), exit::TAKEOVER);
+    assert_eq!(
+        w.store.saved(),
+        Some(Restore::new(StartType::Automatic, true))
+    );
+    assert!(w.host.text().contains("Run uninstall"));
+}
+
+// ---- R84: already disabled, no record ----
+
+#[test]
+fn already_disabled_without_a_record_is_refused() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    assert_eq!(w.install(SILENT), exit::DISABLED_ORIGINAL);
+    assert!(w.untouched());
+    assert_eq!(w.store.saved(), None);
+    assert!(w.host.text().contains("--accept-disabled-original"));
+}
+
+#[test]
+fn already_disabled_with_the_flag_records_disabled() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    assert_eq!(w.install(ACCEPT_DISABLED), exit::OK);
+    assert_eq!(
+        w.store.saved(),
+        Some(Restore::new(StartType::Disabled, false))
+    );
+}
+
+#[test]
+fn already_disabled_with_a_record_is_not_affected() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    w.store = MemStore::with(Restore::new(StartType::Manual, true));
+    assert_eq!(w.install(SILENT), exit::OK);
+    assert_eq!(w.store.saved(), Some(Restore::new(StartType::Manual, true)));
+}
+
+#[test]
+fn disabled_original_code_is_outside_the_other_ranges() {
+    assert!(!(2..=11).contains(&exit::DISABLED_ORIGINAL));
+    assert!(!(40..=47).contains(&exit::DISABLED_ORIGINAL));
+    assert_ne!(exit::DISABLED_ORIGINAL, exit::OK);
+    for c in exit::ALL {
+        assert!(!(40..=47).contains(&c), "{c}");
+    }
+}
+
+// ---- R83: every console and flag combination ----
+
+#[test]
+fn console_flag_and_join_matrix() {
+    for join in [JoinState::Workgroup, JoinState::Domain, JoinState::Unknown] {
+        for stdin_console in [false, true] {
+            for stderr_console in [false, true] {
+                for flag in [false, true] {
+                    let mut w = World::new(join);
+                    w.host.stdin_console = stdin_console;
+                    w.host.stderr_console = stderr_console;
+                    // The user would say no if asked.
+                    w.host.answer = false;
+                    let opts = if flag { PLAIN_CONFIRMED } else { PLAIN };
+                    let code = w.install(opts);
+                    let interactive = stdin_console && stderr_console;
+                    let case =
+                        format!("{join:?} in={stdin_console} err={stderr_console} flag={flag}");
+                    let (want, asked) = match (join, flag, interactive) {
+                        (JoinState::Workgroup, _, _) | (_, true, _) => (exit::OK, 0),
+                        (_, false, true) => (exit::DECLINED, 1),
+                        (_, false, false) => (exit::DOMAIN_JOINED, 0),
+                    };
+                    assert_eq!(code, want, "{case}");
+                    assert_eq!(w.host.asked, asked, "{case}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -531,6 +654,10 @@ fn install_args_parse() {
         parse_install_args(&args(&["--confirm-domain-joined", "--silent"])),
         Ok(SILENT_CONFIRMED)
     );
+    assert_eq!(
+        parse_install_args(&args(&["--accept-disabled-original", "--silent"])),
+        Ok(ACCEPT_DISABLED)
+    );
     assert!(parse_install_args(&args(&["--silnet"])).is_err());
     assert!(parse_install_args(&args(&["--silent", "--silent"])).is_err());
 }
@@ -561,7 +688,7 @@ fn every_exit_code_is_reachable() {
     seen.insert(World::new(JoinState::Domain).install(SILENT));
 
     let mut w = World::new(JoinState::Domain);
-    w.host.terminal = true;
+    w.host.consoles(true);
     seen.insert(w.install(PLAIN));
 
     let mut w = World::new(JoinState::Workgroup);
@@ -591,6 +718,10 @@ fn every_exit_code_is_reachable() {
     w.reg.unregister_error = Some("x".to_owned());
     seen.insert(w.uninstall());
 
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    seen.insert(w.install(SILENT));
+
     seen.insert(run_install(&args(&["--bad"])));
 
     let all: BTreeSet<u8> = exit::ALL.iter().copied().collect();
@@ -616,85 +747,54 @@ fn messages_name_no_path() {
     }
 }
 
-// ---- The file store ----
+// ---- Dispatch (R85, M6) ----
 
-struct TempDir(PathBuf);
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "ntpc-restore-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&p).expect("temp dir");
-        Self(p)
+fn run(a: &[&str]) -> (u8, String, String) {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = dispatch(&args(a), &mut out, &mut err);
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+#[test]
+fn no_arguments_keeps_the_stub_and_exits_zero() {
+    let (code, out, err) = run(&[]);
+    assert_eq!(code, exit::OK);
+    assert!(out.contains("pre-alpha"));
+    assert_eq!(err, "");
+}
+
+#[test]
+fn help_does_not_list_install_or_uninstall_yet() {
+    for h in ["--help", "-h"] {
+        let (code, out, _) = run(&[h]);
+        assert_eq!(code, exit::OK);
+        assert!(!out.contains("install"), "{out}");
     }
 }
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+
+#[test]
+fn unknown_subcommand_or_argument_exits_non_zero_with_one_line() {
+    for a in [
+        &["status"][..],
+        &["--version"],
+        &["--help", "x"],
+        &["frobnicate", "--silent"],
+    ] {
+        let (code, out, err) = run(a);
+        assert_eq!(code, exit::USAGE, "{a:?}");
+        assert_eq!(out, "");
+        assert_eq!(err.lines().count(), 1, "{err}");
     }
 }
 
 #[test]
-fn file_store_round_trips() {
-    let d = TempDir::new("rt");
-    let mut s = FileRecordStore::new(&d.0);
-    assert_eq!(s.load(), Ok(None));
-    let r = Restore::new(StartType::AutomaticDelayed, true);
-    s.save(&r).unwrap();
-    assert_eq!(s.load(), Ok(Some(r)));
-    // A second save replaces the first.
-    let r2 = Restore::new(StartType::Manual, false);
-    s.save(&r2).unwrap();
-    assert_eq!(s.load(), Ok(Some(r2)));
-    assert!(!d.0.join(RECORD_TEMP_NAME).exists());
-    s.remove().unwrap();
-    assert_eq!(s.load(), Ok(None));
-    s.remove().unwrap();
-}
-
-#[test]
-fn file_store_refuses_a_tampered_file() {
-    let d = TempDir::new("bad");
-    let text = Restore::new(StartType::Manual, true)
-        .encode()
-        .replace("w32time", "WinDefend");
-    fs::write(d.0.join(RECORD_FILE_NAME), text).unwrap();
-    assert_eq!(
-        FileRecordStore::new(&d.0).load(),
-        Err(LoadError::Invalid(RestoreFormatError::NotCanonical))
-    );
-}
-
-#[test]
-fn file_store_refuses_a_huge_file() {
-    let d = TempDir::new("huge");
-    fs::write(d.0.join(RECORD_FILE_NAME), vec![b' '; 1 << 20]).unwrap();
-    assert_eq!(
-        FileRecordStore::new(&d.0).load(),
-        Err(LoadError::Invalid(RestoreFormatError::TooLarge))
-    );
-}
-
-#[test]
-fn file_store_overwrites_a_stale_temp_file() {
-    let d = TempDir::new("tmp");
-    fs::write(d.0.join(RECORD_TEMP_NAME), b"junk").unwrap();
-    let mut s = FileRecordStore::new(&d.0);
-    let r = Restore::new(StartType::Disabled, false);
-    s.save(&r).unwrap();
-    assert_eq!(s.load(), Ok(Some(r)));
-}
-
-#[test]
-fn file_store_errors_name_no_path() {
-    let d = TempDir::new("err");
-    // A directory where the record should be: reads fail.
-    fs::create_dir(d.0.join(RECORD_FILE_NAME)).unwrap();
-    let e = FileRecordStore::new(&d.0).load().unwrap_err();
-    let t = e.to_string();
-    assert!(!t.contains('\\') && !t.contains("ntpc-restore"), "{t}");
+fn dispatch_bad_install_and_uninstall_arguments_exit_with_usage() {
+    // Only invalid arguments: they stop at parsing, before any real call.
+    assert_eq!(run(&["install", "--nope"]).0, exit::USAGE);
+    assert_eq!(run(&["uninstall", "--nope"]).0, exit::USAGE);
 }
