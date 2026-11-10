@@ -344,18 +344,15 @@ impl FileStatusWriter {
     }
 }
 
-/// Refuses a report the reader would refuse. A required number that is not
-/// finite would be written as `null`, and the strict reader rejects that,
-/// so the `status` command would fail on every later read.
+/// Checks a report before it is written. Since R103 nothing is refused: a
+/// non-finite `drift_ppm` is written as `null`, which the reader accepts for
+/// that one field and reads back as NaN. Kept so the public name stays.
 ///
 /// # Errors
-/// A message naming the field.
+/// None at present.
 pub fn check(report: &StatusReport) -> Result<(), String> {
-    if report.drift_ppm.is_finite() {
-        Ok(())
-    } else {
-        Err("drift_ppm is not a finite number. Status not written".to_owned())
-    }
+    let _ = report;
+    Ok(())
 }
 
 impl StatusWriter for FileStatusWriter {
@@ -623,11 +620,6 @@ impl Fields {
         }
     }
 
-    fn f64(&mut self, key: &str) -> Result<f64, StatusError> {
-        self.opt_f64(key)?
-            .ok_or_else(|| StatusError::Invalid(format!("{key} is null")))
-    }
-
     fn bool(&mut self, key: &str) -> Result<bool, StatusError> {
         match self.take(key)? {
             Value::Bool(b) => Ok(b),
@@ -697,7 +689,9 @@ pub fn parse(text: &str) -> Result<StatusReport, StatusError> {
         Some(s) => Some(parse_tier(&s).ok_or_else(|| bad("unknown tier"))?),
     };
     let last_offset_s = f.opt_f64("last_offset_s")?;
-    let drift_ppm = f.f64("drift_ppm")?;
+    // R103: `null` means the writer had no finite drift. Only this required
+    // field accepts it. It reads back as NaN and prints as unknown.
+    let drift_ppm = f.opt_f64("drift_ppm")?.unwrap_or(f64::NAN);
     let last_good_age_s = f.opt_u64("last_good_age_s")?;
     let holdover = f.bool("holdover")?;
     let adjustment_allowed = f.bool("adjustment_allowed")?;
@@ -805,7 +799,14 @@ pub fn format_status(r: &StatusReport) -> String {
     let _ = writeln!(o, "uptime:             {} s", r.uptime_s);
     let _ = writeln!(o, "active tier:        {}", tier_label(r.active_tier));
     let _ = writeln!(o, "last offset:        {}", secs_text(r.last_offset_s));
-    let _ = writeln!(o, "drift:              {:+.3} ppm", r.drift_ppm);
+    if r.drift_ppm.is_finite() {
+        let _ = writeln!(o, "drift:              {:+.3} ppm", r.drift_ppm);
+    } else {
+        o.push_str(
+            "drift:              unknown
+",
+        );
+    }
     let _ = writeln!(
         o,
         "last good sample:   {}",

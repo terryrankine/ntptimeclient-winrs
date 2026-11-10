@@ -454,10 +454,8 @@ pub fn run(cfg: Config, deps: HostDeps, inbox: Inbox) -> Result<(), HostError> {
     // the default, which the workspace keeps.
     let looped = panic::catch_unwind(AssertUnwindSafe(|| while host.turn() {}));
     let message = looped.err().map(|payload| panic_text(payload.as_ref()));
-    if let Some(m) = &message {
-        host.log_panic(m);
-    }
-    let stopped = panic::catch_unwind(AssertUnwindSafe(|| host.shutdown()));
+    // The panic is logged inside the guarded stop, after the rate reset.
+    let stopped = panic::catch_unwind(AssertUnwindSafe(|| host.shutdown(message.as_deref())));
     match (message, stopped) {
         (None, Ok(())) => Ok(()),
         (Some(m), _) => Err(HostError::Panicked(m)),

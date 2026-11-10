@@ -22,10 +22,14 @@
 //!   every real query. A flood costs CPU for at most the timeout, and each
 //!   loop turn waits in the socket for a datagram, so the work is bounded
 //!   by what arrives.
-//! - One guard against a hot loop: [`MAX_IO_ERRORS_IN_ROW`] socket errors in
-//!   a row that are not about one datagram end the query as
-//!   [`QueryFailure::Unreachable`]. A broken socket fails at once on every
-//!   call, so without the guard the loop would spin until the deadline.
+//! - ICMP error reports of every kind (port, host and net unreachable, net
+//!   reset, which Windows uses for time exceeded) are counted as resets and
+//!   ignored. They are spoofable like datagrams.
+//! - Ruling R101: any other socket error does not end the query either. It
+//!   starts a short back-off sleep, 1 ms doubling to 50 ms, reset by a
+//!   datagram or a counted reset. A broken socket that fails at once on
+//!   every call so costs a few dozen calls per query, not a hot loop. Only
+//!   the deadline ends the query, as `Unreachable` if errors were seen.
 //! - The query returns at the first good reply or kiss-of-death, so the
 //!   request token and its socket are dropped then. A replay of that reply
 //!   reaches a closed port, and a later query has a new origin (Task 9 M4).
@@ -43,10 +47,31 @@ use ntpc_core::{Mono, QueryFailure, Sample, SourceId};
 use crate::logging::{Level, Logger};
 use crate::proto::{NtpTime, build_request, parse_response};
 
-/// Socket errors in a row, not tied to one datagram, that end a query as
-/// unreachable. A datagram, an ICMP report or a read timeout in between
-/// resets the count. Only a broken socket gets there.
+/// Kept for the name only. Since R101 no count of socket errors ends a
+/// query. They start a back-off instead, see [`ERROR_BACKOFF_MAX`].
 pub const MAX_IO_ERRORS_IN_ROW: u32 = 16;
+
+/// First back-off sleep after a socket error that is not about one datagram.
+pub const ERROR_BACKOFF_FIRST: Duration = Duration::from_millis(1);
+
+/// Longest back-off sleep. Short against the 5 s query timeout, so a
+/// passing fault costs little of the wait for the real reply.
+pub const ERROR_BACKOFF_MAX: Duration = Duration::from_millis(50);
+
+/// Windows `WSAENETUNREACH`, `WSAENETRESET` (also ICMP time exceeded) and
+/// `WSAEHOSTUNREACH`: ICMP reports, noise like a port unreachable.
+const ICMP_CODES: [i32; 3] = [10051, 10052, 10065];
+
+/// True for errors that report one ICMP packet.
+fn is_icmp(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    ) || e.raw_os_error().is_some_and(|c| ICMP_CODES.contains(&c))
+}
 
 /// Windows `WSAEMSGSIZE`: one datagram was longer than the buffer.
 const WSAEMSGSIZE: i32 = 10040;
@@ -255,12 +280,13 @@ impl UdpTransport {
             .map_err(|_| QueryFailure::Unreachable)?;
 
         let mut buf = [0u8; RECV_BUF];
-        let mut errors_in_row = 0u32;
+        let mut backoff = Duration::ZERO;
         let mut reset_seen = false;
+        let mut error_seen = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(if reset_seen {
+                return Err(if reset_seen || error_seen {
                     QueryFailure::Unreachable
                 } else {
                     QueryFailure::Timeout
@@ -274,7 +300,7 @@ impl UdpTransport {
                     // T4 first. Everything after this is not network delay.
                     let received = NtpTime::from_unix_nanos(self.time.wall_ns());
                     let at = self.time.mono();
-                    errors_in_row = 0;
+                    backoff = Duration::ZERO;
                     let bytes = buf.get(..n).unwrap_or(&[]);
                     match parse_response(bytes, from, &token, received, source, at) {
                         Ok(sample) => return Ok(sample),
@@ -286,27 +312,34 @@ impl UdpTransport {
                         }
                     }
                 }
-                Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => errors_in_row = 0,
-                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused => {
-                        // ICMP port unreachable on Windows. Spoofable, so it
-                        // never ends the wait. One arrives per ICMP packet.
-                        self.counters.resets.fetch_add(1, Ordering::Relaxed);
-                        reset_seen = true;
-                        errors_in_row = 0;
-                    }
-                    _ if e.raw_os_error() == Some(WSAEMSGSIZE) => {
-                        // One datagram too long for the buffer.
-                        self.counters.discarded.fetch_add(1, Ordering::Relaxed);
-                        errors_in_row = 0;
-                    }
-                    _ => {
-                        errors_in_row += 1;
-                        if errors_in_row >= MAX_IO_ERRORS_IN_ROW {
-                            return Err(QueryFailure::Unreachable);
-                        }
-                    }
-                },
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) if is_icmp(&e) => {
+                    // Spoofable, so it never ends the wait. One arrives per
+                    // ICMP packet, so this is bounded like a datagram.
+                    self.counters.resets.fetch_add(1, Ordering::Relaxed);
+                    reset_seen = true;
+                    backoff = Duration::ZERO;
+                }
+                Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
+                    // One datagram too long for the buffer.
+                    self.counters.discarded.fetch_add(1, Ordering::Relaxed);
+                    backoff = Duration::ZERO;
+                }
+                Err(_) => {
+                    // R101: wait a little, never end the query here.
+                    error_seen = true;
+                    backoff = if backoff.is_zero() {
+                        ERROR_BACKOFF_FIRST
+                    } else {
+                        (backoff * 2).min(ERROR_BACKOFF_MAX)
+                    };
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(backoff.min(left));
+                }
             }
         }
     }
@@ -371,6 +404,8 @@ mod tests {
     enum Step {
         Reset,
         Broken,
+        /// A raw Windows error code.
+        Raw(i32),
         Good,
     }
 
@@ -396,6 +431,7 @@ mod tests {
             match self.steps.borrow_mut().pop_front() {
                 Some(Step::Reset) => Err(io::ErrorKind::ConnectionReset.into()),
                 Some(Step::Broken) => Err(io::Error::other("socket broken")),
+                Some(Step::Raw(code)) => Err(io::Error::from_raw_os_error(code)),
                 Some(Step::Good) => {
                     let req = codec::decode(&self.request.borrow()).expect("request");
                     let now = NtpTime::from_unix_nanos(StdTimeSource::new().wall_ns()).to_bits();
@@ -448,23 +484,38 @@ mod tests {
     }
 
     #[test]
-    fn a_run_of_socket_errors_ends_as_unreachable() {
-        let steps: Vec<Step> = (0..100).map(|_| Step::Broken).collect();
-        let (r, calls, _) = run(steps);
-        assert_eq!(r, Err(QueryFailure::Unreachable));
-        assert_eq!(calls, MAX_IO_ERRORS_IN_ROW);
+    fn icmp_class_errors_are_noise() {
+        // WSAENETRESET (also time exceeded), net and host unreachable.
+        for code in ICMP_CODES {
+            let mut steps: Vec<Step> = (0..200).map(|_| Step::Raw(code)).collect();
+            steps.push(Step::Good);
+            let (r, calls, stats) = run(steps);
+            assert!(r.is_ok(), "{code}: {r:?}");
+            assert_eq!(calls, 201);
+            assert_eq!(stats.resets, 200);
+        }
     }
 
     #[test]
-    fn socket_errors_split_by_resets_do_not_end_the_query() {
-        let mut steps = Vec::new();
-        for _ in 0..5 {
-            steps.extend((1..MAX_IO_ERRORS_IN_ROW).map(|_| Step::Broken));
-            steps.push(Step::Reset);
-        }
+    fn unknown_errors_never_end_the_query() {
+        // R101: 200 unknown errors back off but a later reply still counts.
+        // The deadline is 100 ms, so give the script room: a few errors,
+        // then the reply.
+        let mut steps: Vec<Step> = (0..5).map(|_| Step::Broken).collect();
         steps.push(Step::Good);
         let (r, _, _) = run(steps);
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn a_persistent_error_backs_off_until_the_deadline() {
+        let steps: Vec<Step> = (0..10_000).map(|_| Step::Broken).collect();
+        let started = Instant::now();
+        let (r, calls, _) = run(steps);
+        assert_eq!(r, Err(QueryFailure::Unreachable));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        // 1, 2, 4, 8, 16, 32, then 50 ms sleeps fill 100 ms in under 20 calls.
+        assert!(calls < 20, "{calls} calls");
     }
 
     #[test]
