@@ -17,6 +17,10 @@
 //!   offset is `df * t * exp(-t / 4096)`. It peaks at `df * 4096 / e`, about
 //!   `df * 1507 s`. After 12 hours, `t / 4096 = 10.5`, so it is below
 //!   `3e-4 * df * 4096`: 25 us for 20 ppm. A 12 hour settle removes it.
+//! - Phase step. After a phase error `x0` appears, the same loop gives
+//!   `x0 * (1 - t / 4096) * exp(-t / 4096)`. It crosses zero once and
+//!   undershoots by at most `exp(-2) = 13.5 %` of `x0`, at 8192 s. So the
+//!   largest error after a phase step is the step itself.
 
 use ntpc_core::engine::{DisableReason, Engine, EngineConfig, LogEvent};
 use ntpc_core::sim::{Fault, ServerSpec, SimEvent, SimReport, SimWorld};
@@ -27,6 +31,12 @@ const HOUR: u64 = 3600;
 /// Settled error bound for healthy exact servers with the default jitter.
 /// See the module docs.
 const SETTLED: f64 = 0.004;
+
+/// REGRESSION PIN, not a derivation (ruling R51). The settled error of
+/// `converges_with_20ppm_drift` measured 0.19, 0.32 and 0.34 ms for seeds 1
+/// to 3. The pin is the largest plus half again. A change that crosses it
+/// is not wrong by itself, but must be explained.
+const SETTLED_PIN: f64 = 0.000_5;
 
 /// Peak offset per ppm of frequency error, `4096 / e` seconds.
 const TRANSIENT_PER_PPM: f64 = 4096.0 / std::f64::consts::E * 1e-6;
@@ -95,6 +105,7 @@ fn converges_with_20ppm_drift() {
         within("first.max_abs_error", first.max_abs_error, bound);
         let settled = w.run(&mut e, 12 * HOUR);
         within("settled.max_abs_error", settled.max_abs_error, SETTLED);
+        within("settled pin", settled.max_abs_error, SETTLED_PIN);
         // discipline::tests::learns_drift_from_stable_samples pins 2 ppm.
         let learned = e.status().drift.value();
         within("|learned - DRIFT|", (learned - DRIFT).abs(), 2.0);
@@ -125,7 +136,8 @@ fn converges_with_quantised_frequency_steps() {
     let bound = g * 1e-6 * (2048.0 / 2.0 + 1024.0) + SETTLED;
     within("settled.max_abs_error", settled.max_abs_error, bound);
     no_steps(&settled);
-    // Every applied rate is a whole number of quanta.
+    // Sim self-check, not an engine check: the world rounds every applied
+    // rate to a whole number of quanta.
     let q = settled.max_abs_frequency / g;
     within("|q - q.round()|", (q - q.round()).abs(), 1e-9);
 }
@@ -156,12 +168,13 @@ fn survives_one_falseticker_among_four() {
 fn kod_server_is_not_followed() {
     let mut w = world(13, 0.0);
     add_pool(&mut w, 3);
-    // A KoD reply carries no usable time. The offsets are set far out so
-    // any use of them would show.
+    // A KoD reply carries no reading, so nothing in it can move the clock.
+    // What this checks: the back-off counts for DENY and RATE, that the
+    // healthy sources keep polling, and that two silent sources among five
+    // leave the clock within the settled bound.
     w.add_server(
         "deny",
         ServerSpec {
-            offset: 30.0,
             fault: Fault::KodDeny,
             ..healthy(Tier::Pool)
         },
@@ -169,7 +182,6 @@ fn kod_server_is_not_followed() {
     w.add_server(
         "rate",
         ServerSpec {
-            offset: -30.0,
             fault: Fault::KodRate,
             ..healthy(Tier::Pool)
         },
@@ -288,8 +300,10 @@ fn first_boot_with_clock_one_hour_off_steps() {
     within("settled.max_abs_error", settled.max_abs_error, SETTLED);
     no_steps(&settled);
 
-    // Default config: the step is refused and the clock is held at the
-    // learned rate (ruling R20 and R25). With no saved drift that is
+    // DOCUMENTS CURRENT BEHAVIOUR FOR AN OPEN OWNER DECISION. Default
+    // config: the step is refused and the clock is held at the learned rate
+    // (R20 and R25 as built), so the clock stays an hour wrong. Change this
+    // half when the owner decides. With no saved drift the held rate is
     // nominal, so the error only moves by the 20 ppm drift: 0.432 s in 6 h.
     let mut w = world(23, -3600.0);
     add_pool(&mut w, 4);
@@ -309,95 +323,144 @@ fn first_boot_with_clock_one_hour_off_steps() {
     );
 }
 
-#[test]
-fn never_steps_during_normal_operation() {
-    let mut w = world(29, 0.0);
-    add_pool(&mut w, 2);
-    // A lossy path, a slow asymmetric path and a dead server.
-    w.add_server(
-        "lossy",
-        ServerSpec {
-            loss_rate: 0.2,
-            ..healthy(Tier::Pool)
-        },
-    );
-    w.add_server(
-        "far",
-        ServerSpec {
-            delay: 0.120,
-            asymmetry: 0.002,
-            jitter: 0.004,
-            ..healthy(Tier::Pool)
-        },
-    );
-    w.add_server(
-        "dead",
-        ServerSpec {
-            fault: Fault::Unreachable,
-            ..healthy(Tier::Pool)
-        },
-    );
-    // A busy machine warms up on day three and runs 5 ppm slower.
-    w.schedule(3 * 24 * HOUR, SimEvent::SetDrift(Ppm::new(DRIFT + 5.0)));
-    let mut e = engine(Some(DRIFT));
-    let r = w.run(&mut e, 7 * 24 * HOUR);
-    no_steps(&r);
-    // The 5 ppm change gives a 7.5 ms transient. At a 1024 s poll the loop
-    // first sees it one poll late, 5 ppm * 1024 s = 5.1 ms more. "far"
-    // has 4 ms legs, so its readings are off by up to 2 ms, plus 1 ms of
-    // asymmetry bias. Noise at that size gives 4 * 3 ms = 12 ms. Sum about
-    // 24.7 ms. A step needs 128 ms.
-    let bound = 5.0 * TRANSIENT_PER_PPM + 5.0e-6 * 1024.0 + 4.0 * 0.003;
-    within("r.max_abs_error", r.max_abs_error, bound);
-    assert!(queries(&r, "dead") > 0);
+/// A 200 ms outbound queuing spike on one reply in ten. It reads as a
+/// 100 ms offset: inside the 128 ms linear range, so a fed spike would also
+/// teach the drift, and large enough to show. Its delay of about 230 ms is
+/// over 3 times the path's best of about 32 ms, so the popcorn guard drops
+/// it.
+fn spiky(tier: Tier) -> ServerSpec {
+    ServerSpec {
+        spike_rate: 0.1,
+        spike: 0.200,
+        ..healthy(tier)
+    }
 }
 
+/// Why a correct engine never steps here: the start error is zero, so the
+/// first sync is under the threshold and spends the start step. After that
+/// the loop steps only after a resume, and there is none. Any step is a
+/// bug. The error bounds check that no bad reading moved the clock.
+#[test]
+fn never_steps_during_normal_operation() {
+    // A busy machine warms up on day three and runs 5 ppm slower. The 5 ppm
+    // change gives a 7.5 ms transient. At a 1024 s poll the loop first sees
+    // it one poll late, 5 ppm * 1024 s = 5.1 ms more.
+    let warm = 5.0 * TRANSIENT_PER_PPM + 5.0e-6 * 1024.0;
+    for seed in 1..=5 {
+        // A. One config server with spikes. The popcorn guard is its only
+        // defence. A source's first sample is never judged a spike, so a
+        // spiked first reading slews 100 ms / 2048 s = 49 ppm for one 64 s
+        // poll, 3.1 ms, and does not teach (no learning on the first
+        // update). Bound: warm-up plus that plus noise, 19.7 ms. With the
+        // guard bypassed the error reaches about 100 ms (see the report).
+        let mut w = world(seed, 0.0);
+        w.add_server("cfg", spiky(Tier::Config));
+        add_pool(&mut w, 4);
+        w.schedule(3 * 24 * HOUR, SimEvent::SetDrift(Ppm::new(DRIFT + 5.0)));
+        let mut e = engine(Some(DRIFT));
+        let r = w.run(&mut e, 7 * 24 * HOUR);
+        no_steps(&r);
+        let bound = warm + 0.100 / 2048.0 * 64.0 + SETTLED;
+        within("single spiky source", r.max_abs_error, bound);
+
+        // B. A pool tier with a spiky server, a server that turns 1 s false
+        // for an hour on day two, a lossy path, a slow asymmetric path and a
+        // dead server. The majority rejects the spikes and the turncoat.
+        // "far" has 4 ms legs, so its readings are off by up to 2 ms plus
+        // 1 ms of asymmetry bias. Noise at that size gives 4 * 3 ms = 12 ms.
+        // Bound: warm-up plus that, 24.7 ms.
+        let mut w = world(seed, 0.0);
+        add_pool(&mut w, 2);
+        w.add_server("spiky", spiky(Tier::Pool));
+        w.add_server("turncoat", healthy(Tier::Pool));
+        w.add_server(
+            "lossy",
+            ServerSpec {
+                loss_rate: 0.2,
+                ..healthy(Tier::Pool)
+            },
+        );
+        w.add_server(
+            "far",
+            ServerSpec {
+                delay: 0.120,
+                asymmetry: 0.002,
+                jitter: 0.004,
+                ..healthy(Tier::Pool)
+            },
+        );
+        w.add_server(
+            "dead",
+            ServerSpec {
+                fault: Fault::Unreachable,
+                ..healthy(Tier::Pool)
+            },
+        );
+        let liar = Fault::Falseticker(Offset::from_secs(1.0));
+        w.schedule(48 * HOUR, SimEvent::SetFault("turncoat".into(), liar));
+        w.schedule(
+            49 * HOUR,
+            SimEvent::SetFault("turncoat".into(), Fault::None),
+        );
+        w.schedule(3 * 24 * HOUR, SimEvent::SetDrift(Ppm::new(DRIFT + 5.0)));
+        let mut e = engine(Some(DRIFT));
+        let r = w.run(&mut e, 7 * 24 * HOUR);
+        no_steps(&r);
+        within("pool tier", r.max_abs_error, warm + 4.0 * 0.003);
+        assert!(queries(&r, "dead") > 0 && queries(&r, "turncoat") > 0);
+    }
+}
+
+/// The step is spent at start, so "no jump" cannot fail on its own here.
+/// The real checks: no tier change, the old lease is no longer asked, and
+/// the clock moves to the new servers' time by a slew.
 #[test]
 fn dhcp_lease_change_switches_sources_without_clock_jump() {
-    let mut w = world(31, 0.0);
+    // The clock starts 5 ms ahead, under the threshold, so the first sync
+    // slews it and spends the start step.
+    let mut w = world(31, 0.005);
     w.add_server("dhcp-a", healthy(Tier::Dhcp));
     w.add_server("dhcp-b", healthy(Tier::Dhcp));
     add_pool(&mut w, 4);
     let mut e = engine(Some(DRIFT));
-    let first = w.run(&mut e, 6 * HOUR);
+    let first = w.run(&mut e, 12 * HOUR);
     assert_eq!(e.status().active_tier, Some(Tier::Dhcp));
     no_steps(&first);
-    // The new network's servers read 3 ms ahead of true time. They are
-    // added to the network now and listed by the lease change.
+    within("first.final_error.abs()", first.final_error.abs(), SETTLED);
+    // The new network's servers read 20 ms ahead of true time. They are
+    // added to the network now and listed by the lease change. 20 ms is
+    // under the pool cross-check's 128 ms, so the pool does not object.
     let ahead = ServerSpec {
-        offset: 0.003,
+        offset: 0.020,
         ..healthy(Tier::Dhcp)
     };
     w.add_server("dhcp-c", ahead);
     w.add_server("dhcp-d", ahead);
     let list = ["dhcp-c", "dhcp-d", "pool-0", "pool-1", "pool-2", "pool-3"];
     w.schedule(
-        6 * HOUR,
+        12 * HOUR,
         SimEvent::SourcesChanged(list.iter().map(ToString::to_string).collect()),
     );
     let second = w.run(&mut e, 12 * HOUR);
     no_steps(&second);
     assert_eq!(e.status().active_tier, Some(Tier::Dhcp));
-    // No tier fell away during the change.
-    assert!(
-        !second
-            .logs
-            .iter()
-            .any(|(_, l)| matches!(l, LogEvent::TierChanged { .. }))
-    );
-    // The clock slews 3 ms toward the new servers. That is a phase step of
-    // 3 ms with no overshoot (damping 1), plus noise.
-    within(
-        "second.max_abs_error",
-        second.max_abs_error,
-        0.003 + SETTLED,
-    );
+    let changes = second
+        .logs
+        .iter()
+        .filter(|(_, l)| matches!(l, LogEvent::TierChanged { .. }))
+        .count();
+    assert_eq!(changes, 0, "no tier fell away during the change");
     assert_eq!(queries(&second, "dhcp-a"), 0, "old lease forgotten");
     assert!(queries(&second, "dhcp-c") > 0);
-    // Truth is 3 ms behind the new servers, so the error ends near +3 ms.
+    // A 20 ms phase step: the error rises to 20 ms and overshoots by at
+    // most 13.5 % (module docs), plus noise.
+    let bound = 0.020 * (1.0 + (-2.0_f64).exp()) + SETTLED;
+    within("second.max_abs_error", second.max_abs_error, bound);
+    // Truth is 20 ms behind the new servers. Ending there shows the clock
+    // follows the new lease, not the old one or the pool.
     within(
-        "(second.final_error - 0.003).abs()",
-        (second.final_error - 0.003).abs(),
+        "(second.final_error - 0.020).abs()",
+        (second.final_error - 0.020).abs(),
         SETTLED,
     );
 }
@@ -447,8 +510,8 @@ fn adjustment_disabled_by_w32time_then_reenabled_does_not_jump() {
     // Slewed within the cap. Zero quantisation, so the applied rate is the
     // command.
     within("back.max_abs_frequency", back.max_abs_frequency, 500.0);
-    // A phase error with damping 1 does not overshoot, so the error only
-    // shrinks from the 288 ms.
+    // A phase step undershoots by at most 13.5 % (module docs), so the
+    // largest error is the 288 ms at the re-enable.
     within("back.max_abs_error", back.max_abs_error, 0.288 + SETTLED);
     within("back.final_error.abs()", back.final_error.abs(), SETTLED);
     assert_eq!(
@@ -569,8 +632,9 @@ fn external_step_is_slewed_back_without_a_step() {
         let r = w.run(&mut e, 12 * HOUR);
         no_steps(&r);
         within("r.max_abs_frequency", r.max_abs_frequency, 500.0);
-        // The jump with damping 1 shrinks without overshoot. 12 hours is
-        // over 20 phase constants, so only the settled noise is left.
+        // A phase step undershoots by at most 13.5 % (module docs), so the
+        // largest error is the jump. 12 hours is over 20 phase constants, so
+        // only the settled noise is left.
         within("r.max_abs_error", r.max_abs_error, jump + SETTLED);
         within("r.final_error.abs()", r.final_error.abs(), SETTLED);
         assert_eq!(e.status().active_tier, Some(Tier::Dhcp));
