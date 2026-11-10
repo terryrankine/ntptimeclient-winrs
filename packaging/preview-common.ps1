@@ -11,8 +11,15 @@ scripts call it only for the exe, after the checks.
 
 The two scripts verify this file against SHA256SUMS before they dot-source it.
 That catches damage or a helper from another release. It does not stop a
-malicious edit, and there is a short gap between that hash and the load. The
-folder permission check (Test-LocationOrFail) is the control for that gap.
+malicious edit.
+
+PLAIN LIMIT: the folder permission check (Test-LocationOrFail) is code inside
+this very file, so it only runs after the file has been loaded. A folder that
+a hostile user could write BEFORE the run cannot be made safe by this script.
+The only real control is that the user extracts the zip into an admin-only
+folder, as the README says. The check is a second look that can catch a
+mistake. It is not a guard against a hostile local user. The exe repeats a
+stricter location check of its own and refuses with exit 20.
 #>
 Set-StrictMode -Version Latest
 
@@ -35,6 +42,11 @@ $script:ExitUnsafeFolder = 44
 $script:ExitDeclined = 45
 $script:ExitStateMismatch = 46
 $script:ExitUninstallStateMismatch = 47
+# The exe could not be started at all (blocked by Smart App Control, AppLocker,
+# antivirus, a bad file). Nothing ran, so nothing changed.
+$script:ExitCannotStart = 48
+# The exe's own codes are 0 to 33 (README has the table). The wrapper's are 40
+# to 48. They never overlap, so a code always says who spoke.
 
 # Principals allowed to hold write rights on the install folder.
 $script:TrustedSids = @(
@@ -157,12 +169,20 @@ function Get-ExeArguments {
     [OutputType([string[]])]
     param(
         [Parameter(Mandatory)][ValidateSet('install', 'uninstall')][string]$Command,
-        [switch]$ConfirmDomainJoined
+        [switch]$ConfirmDomainJoined,
+        [switch]$AcceptDisabledOriginal
     )
     $argList = @($Command)
     if ($ConfirmDomainJoined) {
         if ($Command -ne 'install') { throw '--confirm-domain-joined only applies to install.' }
         $argList += '--confirm-domain-joined'
+    }
+    # Same rule: only when the caller asked, never a default. The exe refuses
+    # (exit 12) when w32time is already disabled and it has no record, because
+    # a lost record must not become the new original.
+    if ($AcceptDisabledOriginal) {
+        if ($Command -ne 'install') { throw '--accept-disabled-original only applies to install.' }
+        $argList += '--accept-disabled-original'
     }
     , $argList
 }
@@ -197,16 +217,27 @@ function Invoke-ExeKeepingExitCode {
     $oldEap = $ErrorActionPreference
     $hadNative = Test-Path -Path Variable:PSNativeCommandUseErrorActionPreference
     if ($hadNative) { $oldNative = $PSNativeCommandUseErrorActionPreference }
+    $code = $null
+    # Cleared so a stale code from an earlier command cannot be read. The
+    # native command sets the global one.
+    $global:LASTEXITCODE = $null
     try {
         $ErrorActionPreference = 'Continue'
         $PSNativeCommandUseErrorActionPreference = $false
         & $Path @Arguments 2>&1 | ForEach-Object { Write-Host ([string]$_) }
-        $code = $LASTEXITCODE
+        $code = $global:LASTEXITCODE
+    } catch {
+        # Windows refused to start the exe (an application control policy such
+        # as Smart App Control or AppLocker, antivirus, a damaged file). The
+        # exe never ran, so nothing changed and there is no rollback to print.
+        Write-Host "The exe could not be started: $($_.Exception.Message)" -ForegroundColor Red
+        return $script:ExitCannotStart
     } finally {
         $ErrorActionPreference = $oldEap
         if ($hadNative) { $PSNativeCommandUseErrorActionPreference = $oldNative }
     }
-    if ($null -eq $code) { return 1 }
+    # No exit code at all means no process ran.
+    if ($null -eq $code) { return $script:ExitCannotStart }
     [int]$code
 }
 
@@ -261,20 +292,37 @@ function Get-W32TimeRegistryStart {
 }
 
 function Get-ServiceFacts {
-    # Read only. One service by name, or $null if it does not exist.
+    <#
+    Read only. One service by name.
+    - A service that is not there gives $null (a real "no such service").
+    - A CIM error gives an object with Unreadable = $true. That is NOT the
+      same as "no such service": a failed read must never look like a clean
+      state, or an uninstall could report a false success.
+    All objects have the same properties, so strict mode is safe.
+    #>
     param([Parameter(Mandatory)][string]$Name)
     try {
         $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
         if ($null -eq $svc) { return $null }
         [pscustomobject]@{
-            Name      = $Name
-            State     = [string]$svc.State
-            StartMode = [string]$svc.StartMode
-            PathName  = [string]$svc.PathName
-            StartName = [string]$svc.StartName
+            Name       = $Name
+            Unreadable = $false
+            Error      = ''
+            State      = [string]$svc.State
+            StartMode  = [string]$svc.StartMode
+            PathName   = [string]$svc.PathName
+            StartName  = [string]$svc.StartName
         }
     } catch {
-        $null
+        [pscustomobject]@{
+            Name       = $Name
+            Unreadable = $true
+            Error      = [string]$_.Exception.Message
+            State      = ''
+            StartMode  = ''
+            PathName   = ''
+            StartName  = ''
+        }
     }
 }
 
@@ -293,13 +341,17 @@ function Format-MachineState {
     param([Parameter(Mandatory)]$State)
     $lines = @()
     if ($null -eq $State.W32Time) {
-        $lines += 'w32time: not found or not readable'
+        $lines += 'w32time: not found'
+    } elseif ($State.W32Time.Unreadable) {
+        $lines += "w32time: UNREADABLE ($($State.W32Time.Error))"
     } else {
         $reg = if ($State.W32TimeStart) { $State.W32TimeStart } else { 'unreadable' }
         $lines += "w32time: State=$($State.W32Time.State) StartMode=$($State.W32Time.StartMode) registry start type=$reg"
     }
     if ($null -eq $State.Ours) {
         $lines += "$($script:PreviewServiceName): no such service"
+    } elseif ($State.Ours.Unreadable) {
+        $lines += "$($script:PreviewServiceName): UNREADABLE ($($State.Ours.Error))"
     } else {
         $lines += "$($script:PreviewServiceName): State=$($State.Ours.State) StartMode=$($State.Ours.StartMode)"
         $lines += "  binary path: $($State.Ours.PathName)"
@@ -312,28 +364,100 @@ function Test-InstallOutcome {
     <#
     Pure. Returns a list of problems with the state after an install that
     exited 0. An empty list means the state looks like an install happened.
-    It does not prove the install is correct.
+    It does not prove the install is correct. A state that could not be read
+    is a problem, never a pass.
     #>
     [OutputType([string[]])]
     param([Parameter(Mandatory)]$State)
     $problems = @()
-    if ($null -eq $State.Ours) { $problems += "the $($script:PreviewServiceName) service does not exist" }
+    if ($null -eq $State.Ours) {
+        $problems += "the $($script:PreviewServiceName) service does not exist"
+    } elseif ($State.Ours.Unreadable) {
+        $problems += "the $($script:PreviewServiceName) service could not be read: $($State.Ours.Error)"
+    }
     if ($null -ne $State.W32Time) {
-        if ($State.W32Time.State -eq 'Running') { $problems += 'w32time is still running' }
-        if ($State.W32TimeStart -and $State.W32TimeStart -ne 'disabled') { $problems += "w32time start type is $($State.W32TimeStart), not disabled" }
-        if (-not $State.W32TimeStart -and $State.W32Time.StartMode -ne 'Disabled') { $problems += "w32time StartMode is $($State.W32Time.StartMode), not Disabled" }
+        if ($State.W32Time.Unreadable) {
+            $problems += "w32time could not be read: $($State.W32Time.Error)"
+        } else {
+            if ($State.W32Time.State -eq 'Running') { $problems += 'w32time is still running' }
+            if ($State.W32TimeStart -and $State.W32TimeStart -ne 'disabled') { $problems += "w32time start type is $($State.W32TimeStart), not disabled" }
+            if (-not $State.W32TimeStart -and $State.W32Time.StartMode -ne 'Disabled') { $problems += "w32time StartMode is $($State.W32Time.StartMode), not Disabled" }
+        }
     }
     $problems
 }
 
 function Test-UninstallOutcome {
     # Pure. What w32time should be after an uninstall is in the exe's record,
-    # which the script does not read. So only the service is judged here.
+    # which the script does not read. So only the service is judged here. An
+    # unreadable service is a problem: the script cannot say it is gone.
     [OutputType([string[]])]
     param([Parameter(Mandatory)]$State)
     $problems = @()
-    if ($null -ne $State.Ours) { $problems += "the $($script:PreviewServiceName) service still exists" }
+    if ($null -ne $State.Ours) {
+        if ($State.Ours.Unreadable) {
+            $problems += "the $($script:PreviewServiceName) service could not be read, so its removal is unconfirmed: $($State.Ours.Error)"
+        } else {
+            $problems += "the $($script:PreviewServiceName) service still exists"
+        }
+    }
+    if ($null -ne $State.W32Time -and $State.W32Time.Unreadable) {
+        $problems += "w32time could not be read: $($State.W32Time.Error)"
+    }
     $problems
+}
+
+# ---------------------------------------------------------------------------
+# What an exe exit code means
+# ---------------------------------------------------------------------------
+
+function Get-ExeExitClass {
+    <#
+    Pure. Maps the exe's exit code to a class and a precise message.
+    Classes:
+      Success         0
+      NothingChanged  the exe refused before it changed anything
+      Unsure          the exe's own text says whether anything changed (9)
+      AfterTakeover   install failed after w32time was taken over (19, 21)
+      MayHaveChanged  something may have changed: read the exe output and the
+                      real state, and use the manual rollback if needed
+    The codes are the exe's table (README-PREVIEW.txt). 22 to 30 and 32 are
+    status, config and run codes that install and uninstall do not return,
+    so they fall into MayHaveChanged with a note.
+    #>
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][int]$Code,
+        [Parameter(Mandatory)][ValidateSet('install', 'uninstall')][string]$Command
+    )
+    $mk = { param($class, $msg) [pscustomobject]@{ Class = $class; Message = $msg } }
+    switch ($Code) {
+        0 { return (& $mk 'Success' 'The exe exited with code 0.') }
+        2 { return (& $mk 'NothingChanged' 'Exit 2: usage error. Nothing was changed. This is a bug in the wrapper or a mismatched exe.') }
+        3 { return (& $mk 'NothingChanged' 'Exit 3: the exe says it is not elevated. Nothing was changed. Run from an elevated PowerShell.') }
+        4 { return (& $mk 'NothingChanged' 'Exit 4: this machine is domain joined and the run was silent. Nothing was changed. Re-run with -ConfirmDomainJoined only if you accept the effect on domain time.') }
+        5 { return (& $mk 'NothingChanged' 'Exit 5: the question was declined or timed out. Nothing was changed.') }
+        6 { return (& $mk 'NothingChanged' 'Exit 6: the state directory is not usable. Nothing was changed. Read the exe message.') }
+        7 { return (& $mk 'NothingChanged' 'Exit 7: the restore record is invalid. Nothing was changed. Read the exe message before you delete anything.') }
+        9 { return (& $mk 'Unsure' 'Exit 9: registering the service failed. The exe text says whether nothing changed or w32time was put back. Read it above and check the state below.') }
+        12 { return (& $mk 'NothingChanged' 'Exit 12: w32time is already disabled and there is no restore record. Nothing was changed. If w32time really was disabled before you started, re-run with -AcceptDisabledOriginal. A lost record must not become the new original, so be sure.') }
+        13 { return (& $mk 'NothingChanged' 'Exit 13: a previous record was dropped. Nothing was changed. Read the exe message.') }
+        16 { return (& $mk 'NothingChanged' 'Exit 16: the state path is bad. Nothing was changed.') }
+        20 { return (& $mk 'NothingChanged' 'Exit 20: the exe location is not admin-only. Nothing was changed. The exe checks its file, every file in its folder, every parent, and refuses subfolders, links and non-fixed drives. Extract into a new folder created from an elevated shell and run from there. If the bad file is named above, fix its owner or rights.') }
+        31 { return (& $mk 'NothingChanged' 'Exit 31: a service with our name exists and is not ours. Nothing was changed. Do not delete it blindly. Find out what it is.') }
+        33 { return (& $mk 'NothingChanged' 'Exit 33: the token default owner is not trusted. Nothing was changed. Run from a normal elevated Administrators shell.') }
+        19 { return (& $mk 'AfterTakeover' 'Exit 19: registering the service failed AFTER w32time was taken over. The exe tries to put w32time back. Read its text above and check below that w32time is back.') }
+        21 { return (& $mk 'AfterTakeover' 'Exit 21: the service registered but did not start. The exe put w32time back and set our service to manual (demand) start. Check below. Re-running install sets it up again. Read the Event Log for the reason.') }
+        8 { return (& $mk 'MayHaveChanged' 'Exit 8: taking over w32time failed. It may be half done.') }
+        10 { return (& $mk 'MayHaveChanged' 'Exit 10: restoring w32time failed. w32time may not be restored, and our service was kept.') }
+        11 { return (& $mk 'MayHaveChanged' 'Exit 11: removing the service failed. w32time may be restored but the service remains.') }
+        14 { return (& $mk 'MayHaveChanged' 'Exit 14: the exe tried to roll back and the rollback failed. The restore record may be in a quarantine folder next to the state directory. Do not delete anything until you have read the exe text.') }
+        15 { return (& $mk 'MayHaveChanged' 'Exit 15: carrying the old record forward failed. The state may be half done.') }
+        17 { return (& $mk 'MayHaveChanged' 'Exit 17: the restore record is not trusted (owner or links). The exe did not use it. Check the state below and the state directory owner.') }
+        18 { return (& $mk 'MayHaveChanged' 'Exit 18: no restore record and w32time is disabled. Nothing was restored, so w32time is still disabled. Restore it by hand from your own record.') }
+        1 { return (& $mk 'MayHaveChanged' 'Exit 1: not in the exe table. Some Windows blocks give this. Read the output above and the state below. Nothing is known to have changed.') }
+        default { return (& $mk 'MayHaveChanged' "Exit ${Code}: not an install or uninstall code in the exe table. Read the output above and the state below.") }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -341,11 +465,19 @@ function Test-UninstallOutcome {
 # ---------------------------------------------------------------------------
 
 function Get-RollbackCommand {
-    # The concrete w32time restore line, or text saying none can be given.
+    <#
+    The concrete w32time restore line, or text saying none can be given.
+    If w32time was ALREADY disabled before the install, a restore line would
+    leave it disabled and so would not undo anything the user may expect. The
+    exe also refuses that case without -AcceptDisabledOriginal (exit 12). So
+    the script warns and prints no misleading line.
+    #>
     [OutputType([string])]
     param([AllowNull()][string]$StartKeyword)
     if ([string]::IsNullOrEmpty($StartKeyword)) {
         'The original w32time start type could not be read. No default is guessed. Read it from restore.json in the state directory, or from a record you made before the install.'
+    } elseif ($StartKeyword -eq 'disabled') {
+        'WARNING: w32time was already DISABLED before this install. Restoring "disabled" would not give you time sync back. No restore line is printed. If you want Windows time sync, choose a start type yourself and treat that as your decision, not as a restore. The exe needs -AcceptDisabledOriginal in this case (exit 12 without it).'
     } else {
         "sc.exe config w32time start= $StartKeyword"
     }
@@ -450,35 +582,123 @@ function Get-PathSecurityInfo {
     [pscustomobject]@{ Owner = (& $toSid ([System.Security.Principal.NTAccount]$acl.Owner)); Aces = @($aces) }
 }
 
+function Get-HardLinkCount {
+    # Read only. Number of names a file has, or $null if it cannot be read.
+    # fsutil is used because PowerShell has no property for it.
+    [OutputType([object])]
+    param([Parameter(Mandatory)][string]$Path)
+    $fsutil = Join-Path -Path $env:SystemRoot -ChildPath 'System32\fsutil.exe'
+    try {
+        $out = & $fsutil hardlink list $Path 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        @($out | Where-Object { $_ -and $_.Trim() }).Count
+    } catch {
+        $null
+    }
+}
+
+function Get-LocationFacts {
+    <#
+    Read only. Collects the facts about the install folder that the pure
+    check needs: the drive type, every entry in the folder (hidden ones
+    included) with its kind, reparse flag and link count, whether the folder
+    is itself a reparse point, and each parent up to the drive root with its
+    reparse flag.
+    #>
+    param([Parameter(Mandatory)][string]$Folder)
+    $reparse = { param($item) (([int]$item.Attributes) -band 0x400) -ne 0 }
+    $root = [System.IO.Path]::GetPathRoot($Folder)
+    $driveType = 'NotLocal'
+    if ($root -match '^[A-Za-z]:\\$') {
+        try { $driveType = [string](New-Object System.IO.DriveInfo($root)).DriveType } catch { $driveType = 'Unknown' }
+    }
+    $self = Get-Item -LiteralPath $Folder -Force -ErrorAction Stop
+    $entries = @()
+    foreach ($e in @(Get-ChildItem -LiteralPath $Folder -Force -ErrorAction Stop)) {
+        $isDir = [bool]$e.PSIsContainer
+        $links = $null
+        if (-not $isDir) { $links = Get-HardLinkCount -Path $e.FullName }
+        $entries += [pscustomobject]@{ Path = $e.FullName; IsDirectory = $isDir; IsReparse = (& $reparse $e); LinkCount = $links }
+    }
+    $parents = @()
+    $parent = Split-Path -Parent $Folder
+    while ($parent) {
+        $item = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
+        $parents += [pscustomobject]@{ Path = $parent; IsReparse = (& $reparse $item) }
+        $next = Split-Path -Parent $parent
+        if ($next -eq $parent) { break }
+        $parent = $next
+    }
+    [pscustomobject]@{
+        Folder          = $Folder
+        FolderIsReparse = (& $reparse $self)
+        DriveType       = $driveType
+        Entries         = $entries
+        Parents         = $parents
+    }
+}
+
+function Get-LocationProblem {
+    <#
+    Pure. Takes the facts from Get-LocationFacts and returns the reasons the
+    folder is not acceptable. This is meant to be at least as strict as the
+    exe's own check where the script can see it: a fixed local drive, no
+    subfolders, no reparse points (junctions, symlinks) in the folder, its
+    files or its parents, and no file with more than one link. A link count
+    that cannot be read counts as a problem.
+    #>
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)]$Facts)
+    $bad = @()
+    if ($Facts.DriveType -ne 'Fixed') { $bad += "the folder is on a drive of type $($Facts.DriveType), not a fixed local drive" }
+    if ($Facts.FolderIsReparse) { $bad += "$($Facts.Folder) is a junction or symbolic link" }
+    foreach ($e in @($Facts.Entries)) {
+        if ($e.IsDirectory) { $bad += "subfolder not allowed: $($e.Path)"; continue }
+        if ($e.IsReparse) { $bad += "link or reparse point not allowed: $($e.Path)" }
+        if ($null -eq $e.LinkCount) { $bad += "cannot read the link count of $($e.Path)" }
+        elseif ([int]$e.LinkCount -gt 1) { $bad += "file has $($e.LinkCount) links (more than 1): $($e.Path)" }
+    }
+    foreach ($p in @($Facts.Parents)) {
+        if ($p.IsReparse) { $bad += "parent is a junction or symbolic link: $($p.Path)" }
+    }
+    $bad
+}
+
 function Test-LocationOrFail {
     <#
     Returns a list of reasons the install folder is not safe to run an
-    elevated exe from. Empty means it passed. Checks, all read only:
-    the folder, the exe and the helper (write rights and owner), then each
-    parent folder up to the drive root (rename, delete and permission rights
-    and owner). Why: a process at the user's own privilege that can write
-    there could swap the exe or the helper between the hash check and the
-    run, and the service may run from this path as SYSTEM.
+    elevated exe from. Empty means it passed. All read only.
+    1. Folder facts (Get-LocationProblem): fixed drive, no subfolders, no
+       reparse points, no hard links.
+    2. Owner and write rights of the folder and of EVERY file in it (the
+       exe, the helper, the config and any other shipped file).
+    3. Each parent up to the drive root: owner, and rights that allow rename,
+       delete or permission change.
+    Why: a process at the user's own privilege that can write there could
+    swap a file between the hash check and the run, and the service runs from
+    this path as SYSTEM. PLAIN LIMIT: this code runs from the folder it
+    checks. A folder that a hostile user could write before the run cannot be
+    made safe by this check. See the note at the top of this file.
     #>
     [OutputType([string[]])]
-    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Paths, [Parameter(Mandatory)][string]$Folder)
+    param([Parameter(Mandatory)][string]$Folder)
     $reasons = @()
-    $targets = @($Folder) + @($Paths)
+    try { $facts = Get-LocationFacts -Folder $Folder } catch {
+        return @("cannot read the folder: $($_.Exception.Message)")
+    }
+    $reasons += @(Get-LocationProblem -Facts $facts)
+    $targets = @($Folder) + @($facts.Entries | Where-Object { -not $_.IsDirectory } | ForEach-Object { $_.Path })
     foreach ($p in $targets) {
         try { $info = Get-PathSecurityInfo -Path $p } catch { $reasons += "cannot read permissions of ${p}: $($_.Exception.Message)"; continue }
         if (-not (Test-OwnerTrusted -Owner $info.Owner)) { $reasons += "owner of $p is $($info.Owner), not SYSTEM, Administrators or TrustedInstaller" }
         foreach ($b in (Get-UnsafeAce -Aces $info.Aces)) { $reasons += "$p : $b" }
     }
-    $parent = Split-Path -Parent $Folder
-    while ($parent) {
-        try { $info = Get-PathSecurityInfo -Path $parent } catch { $reasons += "cannot read permissions of ${parent}: $($_.Exception.Message)"; break }
+    foreach ($par in @($facts.Parents)) {
+        try { $info = Get-PathSecurityInfo -Path $par.Path } catch { $reasons += "cannot read permissions of $($par.Path): $($_.Exception.Message)"; break }
         # The drive root is owned by SYSTEM or TrustedInstaller on a normal
         # install, so the same owner rule applies.
-        if (-not (Test-OwnerTrusted -Owner $info.Owner)) { $reasons += "owner of parent $parent is $($info.Owner), not trusted" }
-        foreach ($b in (Get-UnsafeAce -Aces $info.Aces -Mask $script:AncestorMask)) { $reasons += "parent $parent : $b" }
-        $next = Split-Path -Parent $parent
-        if ($next -eq $parent) { break }
-        $parent = $next
+        if (-not (Test-OwnerTrusted -Owner $info.Owner)) { $reasons += "owner of parent $($par.Path) is $($info.Owner), not trusted" }
+        foreach ($b in (Get-UnsafeAce -Aces $info.Aces -Mask $script:AncestorMask)) { $reasons += "parent $($par.Path) : $b" }
     }
     $reasons
 }
@@ -506,12 +726,11 @@ function Test-ExeOrFail {
     }
     if ($RequireTrustedLocation) {
         $folder = Split-Path -Parent $ExePath
-        $helper = Join-Path -Path $folder -ChildPath 'preview-common.ps1'
-        $reasons = @(Test-LocationOrFail -Folder $folder -Paths @($ExePath, $helper))
+        $reasons = @(Test-LocationOrFail -Folder $folder)
         if ($reasons.Count -gt 0) {
-            Write-Host 'REFUSED: this folder can be changed by someone other than SYSTEM or Administrators.' -ForegroundColor Red
+            Write-Host 'REFUSED: this folder is not safe to run an elevated exe from.' -ForegroundColor Red
             $reasons | ForEach-Object { Write-Host "  $_" }
-            Write-Host 'A program running as an ordinary user could replace the exe after the checks and before it runs as administrator.'
+            Write-Host 'A program running as an ordinary user could replace a file after the checks and before it runs as administrator. The exe repeats a stricter check and would refuse with exit 20.'
             Write-Host 'Extract the zip into a folder that only administrators can write (for example one created from an elevated shell under C:\Program Files) and run the script from there.'
             return $script:ExitUnsafeFolder
         }

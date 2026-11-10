@@ -25,6 +25,12 @@ domain-joined machine aborts, per the design. What an interactive install
 does is up to the exe. Only pass this if you understand that w32time is how
 the domain keeps time.
 
+.PARAMETER AcceptDisabledOriginal
+Passes --accept-disabled-original to the exe. Needed only if w32time is
+already disabled and the exe has no restore record (exit 12). Use it only if
+w32time really was disabled before you started. A lost record must not become
+the new original. Never passed by default.
+
 .PARAMETER WhatIf
 Runs the checks and prints what would run. Calls nothing.
 
@@ -37,7 +43,8 @@ machine policy. -NoProfile stops a user profile from running elevated.
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$AcceptPreviewRisk,
-    [switch]$ConfirmDomainJoined
+    [switch]$ConfirmDomainJoined,
+    [switch]$AcceptDisabledOriginal
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -45,7 +52,10 @@ $ErrorActionPreference = 'Stop'
 # Check the helper against SHA256SUMS before it is loaded and run elevated.
 # This catches damage, or a helper from another release. It does not stop a
 # malicious edit, and the file could still change between this hash and the
-# load. The folder permission check later is the control for that.
+# load. PLAIN LIMIT: the folder permission check lives inside the helper, so
+# it runs only after the helper is loaded. A folder that was writable by a
+# hostile user before this run cannot be made safe by this script. Extracting
+# into an admin-only folder, as the README says, is the only real control.
 try {
     $helperPath = Join-Path -Path $PSScriptRoot -ChildPath 'preview-common.ps1'
     $sumsText = [System.IO.File]::ReadAllText((Join-Path -Path $PSScriptRoot -ChildPath 'SHA256SUMS'))
@@ -77,7 +87,7 @@ $sums = Join-Path -Path $PSScriptRoot -ChildPath 'SHA256SUMS'
 $pre = Test-ExeOrFail -ExePath $exe -SumsPath $sums -RequireTrustedLocation
 if ($pre -ne 0) { exit $pre }
 
-$exeArgs = Get-ExeArguments -Command install -ConfirmDomainJoined:$ConfirmDomainJoined
+$exeArgs = Get-ExeArguments -Command install -ConfirmDomainJoined:$ConfirmDomainJoined -AcceptDisabledOriginal:$AcceptDisabledOriginal
 
 # Read before the exe runs. The exe changes w32time, and this is the only
 # record of the original start type that does not depend on the exe.
@@ -92,6 +102,9 @@ Write-Host 'Keep this. restore.json written by the exe is the authority when it 
 if ($ConfirmDomainJoined) {
     Write-Host 'WARNING: -ConfirmDomainJoined given. A domain-joined machine will not be refused.' -ForegroundColor Yellow
 }
+if ($AcceptDisabledOriginal) {
+    Write-Host 'WARNING: -AcceptDisabledOriginal given. If w32time is disabled and there is no record, the disabled state becomes the original.' -ForegroundColor Yellow
+}
 
 if (-not $PSCmdlet.ShouldProcess("`"$exe`" $($exeArgs -join ' ')", 'Run the installer (stops and disables w32time, installs the service)')) {
     if ($WhatIfPreference) {
@@ -103,12 +116,23 @@ if (-not $PSCmdlet.ShouldProcess("`"$exe`" $($exeArgs -join ' ')", 'Run the inst
 }
 
 $code = Invoke-ExeKeepingExitCode -Path $exe -Arguments $exeArgs
+if ($code -eq $script:ExitCannotStart) {
+    # Windows would not start the exe (Smart App Control, AppLocker, antivirus).
+    # It never ran, so nothing changed and there is no rollback to print.
+    Write-Host 'Nothing was changed: the exe did not run. See README-PREVIEW.txt (blocked by Smart App Control or AppLocker).' -ForegroundColor Red
+    exit $code
+}
 if ($code -ne 0) {
+    $class = Get-ExeExitClass -Code $code -Command install
     Write-Host ''
-    Write-Host "The installer exited with code $code. It may have stopped halfway." -ForegroundColor Red
+    Write-Host $class.Message -ForegroundColor Red
     Write-Host 'State now (read only):'
     Format-MachineState -State (Get-MachineState) | ForEach-Object { Write-Host "  $_" }
-    Write-Host (Get-ManualRollbackText -StartKeyword $rollbackKeyword)
+    # No rollback text when the exe says it changed nothing. It would send the
+    # user to undo something that never happened.
+    if ($class.Class -ne 'NothingChanged') {
+        Write-Host (Get-ManualRollbackText -StartKeyword $rollbackKeyword)
+    }
     exit $code
 }
 
