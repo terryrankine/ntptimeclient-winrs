@@ -57,8 +57,6 @@ pub const ID_INFO: u32 = 1;
 pub const ID_WARN: u32 = 2;
 /// Event id of an error line.
 pub const ID_ERROR: u32 = 3;
-/// Event id of the service wrapper's own start and stop lines.
-pub const ID_SERVICE: u32 = 10;
 
 /// Longest event text, in characters. Learn allows 31,839 per string. A
 /// log line is at most about 530, so this only bounds a bug.
@@ -230,12 +228,6 @@ impl EventLogSink {
     #[must_use]
     pub fn counts(&self) -> Arc<EventCounts> {
         self.counts.clone()
-    }
-
-    /// Writes one event of the given type directly, skipping the level
-    /// parse. Used by the service wrapper for its own start and stop lines.
-    pub fn event(&self, event_type: u16, id: u32, text: &str) {
-        self.enqueue(Item::Event(event_type, id, event_text(text)));
     }
 
     fn enqueue(&self, item: Item) -> bool {

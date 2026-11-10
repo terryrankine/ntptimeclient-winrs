@@ -14,7 +14,9 @@ use crate::config::Config;
 use crate::event_log::{DiscardSink, EventLogSink, RealEventApi, RealRegistry};
 use crate::logging::{ConsoleSink, LineLogger, LogSink, Logger};
 use crate::registration::{ExeLocator, RealExeLocator, RealScm, SERVICE_NAME, ScmRegistration};
-use crate::service::{DepsLauncher, JobError, Launcher, ServiceRun, Started, real::service_main};
+use crate::service::{
+    DepsLauncher, JobError, Launcher, Preflight, ServiceRun, Started, real::service_main,
+};
 use crate::transport::StdTimeSource;
 use crate::winimpl::{ResumeNotifier, WinDepsError, windows_deps};
 
@@ -70,6 +72,14 @@ fn exe_dir() -> Result<PathBuf, String> {
     exe.parent()
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| "the running exe has no folder".to_owned())
+}
+
+/// `path`, or the default config path next to the exe.
+fn config_path(path: Option<PathBuf>) -> Result<PathBuf, String> {
+    match path {
+        Some(p) => Ok(p),
+        None => exe_dir().map(|d| default_config_path(&d)),
+    }
 }
 
 /// The config at `path`, or the default location. Prints its warnings.
@@ -141,7 +151,24 @@ fn own_service_running() -> Result<bool, String> {
     }
 }
 
-fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
+/// R111 and the courtesy SCM check. The guard must live until `run` ends.
+fn run_guards(err: &mut dyn Write) -> Result<ntpc_platform::instance::InstanceGuard, u8> {
+    let guard = match ntpc_platform::instance::acquire() {
+        Ok((guard, None)) => guard,
+        Ok((guard, Some(why))) => {
+            let _ = writeln!(
+                err,
+                "Warning: {why}. Going on without the lock. The service check below still runs."
+            );
+            guard
+        }
+        Err(e) => {
+            let _ = writeln!(err, "Not starting: {e}.");
+            return Err(exit::RUN_CONFLICT);
+        }
+    };
+    // A courtesy check on top of the lock, for a service from an older
+    // build that did not take it.
     match own_service_running() {
         Ok(false) => {}
         Ok(true) => {
@@ -150,17 +177,50 @@ fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
                 "The {SERVICE_NAME} service is running. Stop it first: two instances must not \
                  adjust one clock."
             );
-            return exit::RUN_CONFLICT;
+            return Err(exit::RUN_CONFLICT);
         }
         Err(e) => {
             let _ = writeln!(
                 err,
                 "Cannot tell whether the {SERVICE_NAME} service runs ({e}). Not starting."
             );
-            return exit::RUN_CONFLICT;
+            return Err(exit::RUN_CONFLICT);
         }
     }
-    let cfg = match config_for(config, err) {
+    Ok(guard)
+}
+
+/// I1 for `run`: the config file must be administrators-only. Then loads it.
+fn run_config(config: Option<PathBuf>, err: &mut dyn Write) -> Result<Config, u8> {
+    // I1: the config decides the time sources, so it must be
+    // administrators-only like the exe.
+    let path = match config_path(config) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return Err(exit::CONFIG);
+        }
+    };
+    let reasons = ntpc_platform::install_location::check_config_location(&path);
+    if !reasons.is_empty() {
+        let _ = writeln!(
+            err,
+            "Not starting: the config file must be changeable by administrators only."
+        );
+        for r in reasons {
+            let _ = writeln!(err, "  {r}");
+        }
+        return Err(exit::RUN_LOCATION);
+    }
+    config_for(Some(path), err)
+}
+
+fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
+    let _instance = match run_guards(err) {
+        Ok(g) => g,
+        Err(code) => return code,
+    };
+    let cfg = match run_config(config, err) {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -195,7 +255,8 @@ fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
     if let Err(e) = ntpc_platform::service_host::set_console_handler(Box::new(handler)) {
         let _ = writeln!(
             err,
-            "Cannot install the Ctrl+C handler (OS error {}). Not starting: Ctrl+C would skip              the clock rate reset.",
+            "Cannot install the Ctrl+C handler (OS error {}). Not starting: Ctrl+C would skip \
+             the clock rate reset.",
             e.raw_os_error().unwrap_or(-1)
         );
         return exit::RUN_FAILED;
@@ -236,7 +297,32 @@ fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
 
 fn service(err: &mut dyn Write) -> u8 {
     let make = || {
-        let config = exe_dir().and_then(|d| load_config(&default_config_path(&d)));
+        // I1 and R111, before the config is read: the exe, its folder,
+        // every file in it (the config included) must be
+        // administrators-only, and no other instance may run.
+        let exe = RealExeLocator.exe();
+        let reasons = match &exe {
+            Ok(p) => RealExeLocator.check(p),
+            Err(e) => vec![e.clone()],
+        };
+        let (instance, unguarded) = match ntpc_platform::instance::acquire() {
+            Ok((g, why)) => (Some(g), why),
+            Err(_) => (None, None),
+        };
+        let preflight = if !reasons.is_empty() {
+            Err(Preflight::UnsafeLocation(reasons))
+        } else if instance.is_none() {
+            Err(Preflight::OtherInstance)
+        } else {
+            Ok(())
+        };
+        let config = match (&preflight, exe) {
+            (Ok(()), Ok(p)) => match p.parent() {
+                Some(d) => load_config(&default_config_path(d)),
+                None => Err("the running exe has no folder".to_owned()),
+            },
+            _ => Err("not read: the start checks failed".to_owned()),
+        };
         let event_sink = RealEventApi::open()
             .and_then(|api| EventLogSink::start(Box::new(api)))
             .ok()
@@ -257,12 +343,21 @@ fn service(err: &mut dyn Write) -> u8 {
             }),
             None => Box::new(|_| {}),
         };
+        if let Some(why) = unguarded {
+            logger.log(
+                crate::logging::Level::Warn,
+                "instance_lock",
+                &format!("{why}. Running without the instance lock"),
+            );
+        }
         ServiceRun {
             config,
             launcher: Arc::new(launcher()),
             logger,
             sinks: vec![sink],
             drain,
+            preflight,
+            hold: instance.map(|g| Box::new(g) as Box<dyn std::any::Any + Send + Sync>),
         }
     };
     match ntpc_platform::service_host::run_dispatcher(

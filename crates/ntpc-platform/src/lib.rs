@@ -17,6 +17,9 @@ pub mod dhcp;
 /// Is the installed exe where only administrators can change it.
 pub mod install_location;
 
+/// One clock-adjusting instance per machine (R111).
+pub mod instance;
+
 /// Service process calls: dispatcher, status, registration, Event Log.
 /// Windows only.
 #[cfg(windows)]

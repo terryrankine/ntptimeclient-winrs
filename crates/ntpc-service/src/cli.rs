@@ -133,12 +133,19 @@ pub mod exit {
     /// Install: the exe is somewhere a non-administrator can change it
     /// (its file, its folder or a parent folder). Nothing changed.
     pub const EXE_LOCATION: u8 = 20;
-    /// Install: registered, but our service did not start. It starts at the
-    /// next boot. `w32time` stays taken over.
+    /// Install: registered, but our service did not reach `RUNNING`
+    /// (R109). `w32time` was put back, the registration is kept. The text
+    /// gives the service exit code and points at the Event Log.
     pub const START_FAILED: u8 = 21;
+    /// Install or uninstall: a service with our name exists but its image
+    /// path is not ours (R110). Nothing changed.
+    pub const FOREIGN_SERVICE: u8 = 31;
+    /// Install: this prompt's token gives new files an untrusted owner
+    /// (M10). Nothing changed.
+    pub const TOKEN_OWNER: u8 = 33;
 
     /// Every code, for tests.
-    pub const ALL: [u8; 21] = [
+    pub const ALL: [u8; 23] = [
         OK,
         USAGE,
         NOT_ELEVATED,
@@ -160,6 +167,8 @@ pub mod exit {
         REGISTER_FAILED,
         EXE_LOCATION,
         START_FAILED,
+        FOREIGN_SERVICE,
+        TOKEN_OWNER,
     ];
 }
 
@@ -416,6 +425,10 @@ pub enum NotReady {
     /// The exe location fails the administrators-only check (exit 20). Each
     /// entry is one reason, without a path.
     UnsafeLocation(Vec<String>),
+    /// A service with our name is not ours (exit 31, R110).
+    Foreign(String),
+    /// The token would give new files an untrusted owner (exit 33, M10).
+    TokenOwner(String),
 }
 
 /// Our own service registration. The real one is
@@ -441,12 +454,17 @@ pub trait Registration {
     /// # Errors
     /// Why it failed.
     fn unregister(&mut self) -> Result<OwnService, String>;
-    /// Starts our service. Does not wait for it to run. Already running
-    /// counts as success.
+    /// Starts our service and waits until it reports `RUNNING` (R109).
+    /// Already running counts as success.
     ///
     /// # Errors
-    /// Why it failed.
+    /// Why it failed, with the service exit code when it stopped.
     fn start_service(&mut self) -> Result<(), String>;
+    /// R110: an existing service with our name must run our exe.
+    ///
+    /// # Errors
+    /// Why it is not ours.
+    fn check_ours(&self) -> Result<(), String>;
 }
 
 /// Everything install and uninstall act on.
@@ -489,6 +507,18 @@ pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
                  Program Files) and run install from there.",
             );
             return exit::EXE_LOCATION;
+        }
+        Err(NotReady::Foreign(e)) => {
+            d.host
+                .say(&format!("Install refused, nothing changed: {e}."));
+            return exit::FOREIGN_SERVICE;
+        }
+        Err(NotReady::TokenOwner(e)) => {
+            d.host.say(&format!(
+                "Install refused, nothing changed: {e}. Run install from an elevated prompt \
+                 of an account whose new files are owned by Administrators."
+            ));
+            return exit::TOKEN_OWNER;
         }
     }
     if let Some(code) = require_elevated(d.host, "Install") {
@@ -629,30 +659,36 @@ fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
         d.host.say(&format!(
             "Registering the service failed: {e}. Putting w32time back."
         ));
-        match restore(&mut *d.scm, &record) {
-            Ok(_) => match d.store.remove() {
-                Ok(()) => d.host.say("w32time was put back as it was."),
-                Err(e) => d.host.say(&format!(
-                    "w32time was put back as it was. The restore record could not be removed ({e})."
-                )),
-            },
-            Err(e) => d.host.say(&format!(
-                "w32time was NOT put back: {e}. The restore record is kept. Run uninstall."
-            )),
-        }
+        put_w32time_back(d, record);
         return exit::REGISTER_FAILED;
     }
     d.host.say("Service registered.");
     if let Err(e) = d.reg.start_service() {
         d.host.say(&format!(
-            "Installed, but starting the service failed: {e}. It starts at the next boot. \
-             Until then this machine has no time sync. Start it by hand with: sc.exe start {}",
-            crate::registration::SERVICE_NAME
+            "The service did not start: {e}. Putting w32time back so this machine keeps time \
+             sync. The service registration is kept: fix the cause, then run install again."
         ));
+        put_w32time_back(d, record);
         return exit::START_FAILED;
     }
     d.host.say("Installed and started.");
     exit::OK
+}
+
+/// Restores `w32time` from `record` after a later install step failed,
+/// and removes the record when that worked. Says what happened.
+fn put_w32time_back(d: &mut Deps<'_>, record: Restore) {
+    match restore(&mut *d.scm, &record) {
+        Ok(_) => match d.store.remove() {
+            Ok(()) => d.host.say("w32time was put back as it was."),
+            Err(e) => d.host.say(&format!(
+                "w32time was put back as it was. The restore record could not be removed ({e})."
+            )),
+        },
+        Err(e) => d.host.say(&format!(
+            "w32time was NOT put back: {e}. The restore record is kept. Run uninstall."
+        )),
+    }
 }
 
 /// R84: no record and `w32time` already disabled. Refuse unless the flag
@@ -732,6 +768,9 @@ impl Registration for PendingRegistration {
     }
     fn start_service(&mut self) -> Result<(), String> {
         Err(NOT_AVAILABLE.to_owned())
+    }
+    fn check_ours(&self) -> Result<(), String> {
+        Ok(())
     }
 }
 

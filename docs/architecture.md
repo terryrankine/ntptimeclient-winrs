@@ -374,7 +374,7 @@ Each line names its source. "Learn" means the linked Microsoft Learn page. "Meas
 
 - Source key `HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\ntptimeclient-winrs` with `EventMessageFile` (`REG_SZ` or `REG_EXPAND_SZ`) and `TypesSupported` (`REG_DWORD`, "Unused") (Learn, Event Sources). A source name "cannot contain the backslash character". Without a message file "the Event Viewer cannot map any event identifiers ... and will display an error" (Learn).
 - Message file: `%SystemRoot%\System32\EventCreate.exe`, `TypesSupported` 7. Measured (read only): its message table maps ids 1 to 1001 to `%1`, and sources made by `eventcreate` use this file with 7. Learn only says `eventcreate /id` takes "any number from 1 to 1000". So the trick is undocumented: a guess that it keeps working. If not, the text still travels as the insertion string.
-- Ids: 1 information, 2 warning, 3 error, 10 the wrapper's own lines. Debug lines never go to the Event Log.
+- Ids: 1 information, 2 warning, 3 error. The wrapper's own lines use the same ids (M6: the separate id 10 was dropped). Debug lines never go to the Event Log.
 - `ReportEventW` (Learn): types `ERROR 1`, `WARNING 2`, `INFORMATION 4`. "Each string is limited to 31,839 characters". "%n" in a string "is treated as an insertion string". Ours caps at 2,048 characters, escapes control characters again and writes `%` as `\u{25}`.
 - The logger never waits on the Event Log: a 256-line queue and one writer thread. A full queue drops and counts. A failed write is counted. Neither stops the service.
 - Install registers the source after the service. Uninstall removes it after the service, also when the service was already gone. A source key this run created is removed again if writing it fails.
@@ -416,7 +416,7 @@ Process exit codes. `cli::exit` (install and uninstall) and `app::exit` (the res
 | 18 | Uninstall: no usable record and `w32time` disabled |
 | 19 | Registering failed after the takeover |
 | 20 | Exe location not administrators-only. Nothing changed |
-| 21 | Installed, but our service did not start |
+| 21 | Registered, but our service did not reach `RUNNING` within 30 s (R109). `w32time` was put back, the registration is kept, the text gives the service exit code |
 | 22 | `status`: no `status.json` |
 | 23 | `status`: `status.json` not valid or unreadable |
 | 24 | `status`: access denied, run elevated |
@@ -425,9 +425,12 @@ Process exit codes. `cli::exit` (install and uninstall) and `app::exit` (the res
 | 27 | `run`: host adapters not built |
 | 28 | `run`: the host ended with an error |
 | 29 | `service`: dispatcher failed |
-| 30 | `run`: our service is running, or its state cannot be read |
+| 30 | `run`: another instance holds the instance lock (R111), or our service is running, or its state cannot be read |
+| 31 | Install or uninstall: a service with our name exists whose image path is not ours (R110). Nothing changed |
+| 32 | `run`: the config file is not administrators-only (I1) |
+| 33 | Install: this prompt's token gives new files an untrusted owner (M10). Nothing changed |
 
-Service-specific exit codes (`dwServiceSpecificExitCode`, with `dwWin32ExitCode` 1066): 1 config, 2 host adapters not built, 3 host panicked, 4 stop timed out, 5 host ended unasked, 6 host thread not started, 8 clock not opened, 9 service account refused (R106), 7 building the adapters failed. 0 is a normal stop.
+Service-specific exit codes (`dwServiceSpecificExitCode`, with `dwWin32ExitCode` 1066): 1 config, 2 host adapters not built, 3 host panicked, 5 host ended unasked, 6 host thread not started, 7 building the adapters failed (other reason), 8 clock not opened, 9 service account refused (R106), 10 unsafe location of the exe, a file next to it or the config (I1), 11 another instance holds the lock (R111), 12 the wrapper panicked while building the run (M1). 0 is a normal stop. 4 is retired (M2): a requested stop that runs out of time ends with 0 and an Event Log error, so the failure actions do not start the service again after an administrator's own stop.
 
 ### Coupling with Task 14c-A
 
@@ -470,3 +473,18 @@ Service-specific exit codes (`dwServiceSpecificExitCode`, with `dwWin32ExitCode`
 - Resume: the service control handler calls `ResumeNotifier::notify_resumed` on both `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND`. It sets the flag the host reads and wakes the loop. Notifications within 5 s of the last counted one are one resume (R107). The window is measured in wall time, because monotonic time stops during sleep. A wall clock that went back counts as a new resume.
 - Log file failure: the first time `service.log` cannot be written, the other sinks get one Error line saying so. Later failures only count.
 - Query workers raise their own thread to above normal before each query.
+
+### Fix round 1 (Task 14c-B review)
+
+- I1, location at every start: the service checks, before it reads the config, the exe, its folder, every parent and every file directly in the exe folder (owner SYSTEM, Administrators or TrustedInstaller, no write right for anyone else, no reparse point, at most one hard link for a file). Failure is service code 10 with an Event Log line, and the config is not read. Install runs the same check (exit 20). `run` checks the config file it uses, its folder and parents (exit 32). A missing config file passes: it means the defaults.
+- Why every file in the exe folder: the exe imports system DLLs only, but the loader searches the exe folder first for a DLL it does not find as a known DLL, and the Task 15 scripts there run elevated. One rule for every file is simpler than guessing which names matter. Sub folders are skipped (nothing is loaded from them). Measured: System32 files are hard links into WinSxS, so the link rule would refuse a System32 copy in place. An extracted zip gives single-link files.
+- I2 (R109): `start_service` waits up to 30 s for `RUNNING`, polling every 250 ms through the injectable pause. `STOPPED` or no `RUNNING` in time: install exits 21, prints the Win32 and service exit codes and points at the Application log, puts `w32time` back through the restore path and keeps our registration. A re-install stops a running service before `ChangeServiceConfigW` (the change applies at the next start) and starts it again afterwards.
+- R110: `QueryServiceConfigW` reads the image path of an existing service of our name. Only `"<folder>\ntptimeclient-winrs.exe" service` (one pair of quotes, case-insensitive) is ours. Anything else: install and uninstall refuse with exit 31 and change nothing.
+- R111: `Global\ntptimeclient-winrs-clock`, a named mutex held by `run` and the service for their whole life. Learn (`CreateMutexW`): an existing name returns `ERROR_ALREADY_EXISTS`, the object goes when the last handle closes, and "a malicious user can create this mutex before you do". Learn (Kernel object namespaces): only file mappings and symbolic links need `SeCreateGlobalPrivilege` in the global namespace, so any user can create a mutex there. Our mutex grants only SYSTEM and Administrators. An existing one counts as another instance only when its owner is SYSTEM or Administrators. One owned by anyone else, or one that refuses us, is a squat: the run goes on without the lock and warns, so a squatter cannot stop time sync. `run` keeps the SCM query as a courtesy check. Service code 11, `run` exit 30.
+- M1: a panic while building the run or inside `run_service` reports `STOPPED` with code 12. A failed handler registration has no status handle, so it writes one Event Log error and returns.
+- M3: while the host builds its adapters the start checkpoint goes up every poll, only within the start hint, so a hung build still looks hung.
+- M4: `%` in the exe path is refused (the SCM may expand environment variables in an image path).
+- M7: the restricted SID and non-LocalSystem refusal is checked on create, update and configure alike.
+- M9: an exe with more than one hard link is refused (the location rule above).
+- M10: install refuses (exit 33) when the token's default owner is not SYSTEM or Administrators (`default_owner_is_trusted`), because the state directory and the record it creates would not be trusted later.
+- M11: the VM tests read back `QueryServiceConfigW` and `QueryServiceConfig2W` (account, quoted path, start type, privileges, SID type, failure actions). Written, not run.

@@ -177,6 +177,14 @@ fn start(
     launcher: FakeLauncher,
     config: Result<Config, String>,
 ) -> (Rig, Arc<Controller>, std::thread::JoinHandle<u32>) {
+    start_with(launcher, config, Ok(()))
+}
+
+fn start_with(
+    launcher: FakeLauncher,
+    config: Result<Config, String>,
+    preflight: Result<(), Preflight>,
+) -> (Rig, Arc<Controller>, std::thread::JoinHandle<u32>) {
     let api = Arc::new(RecordingApi::default());
     let sink = MemorySink::new();
     let drained = Arc::new(AtomicBool::new(false));
@@ -189,6 +197,8 @@ fn start(
         logger: logger(&sink),
         sinks: vec![Arc::new(sink.clone())],
         drain: Box::new(move |_| d.store(true, Ordering::SeqCst)),
+        preflight,
+        hold: None,
     };
     let h = std::thread::spawn(move || run_service(core, run));
     (Rig { api, sink, drained }, controller, h)
@@ -371,6 +381,14 @@ fn running_is_reported_only_after_the_host_handed_over() {
     assert!(!rig.api.states().contains(&State::Running));
     hold.store(true, Ordering::SeqCst);
     wait_for(&rig.api, State::Running);
+    // M3: the start checkpoint counted up while the host was being built.
+    let starts = rig
+        .api
+        .all()
+        .iter()
+        .filter(|x| x.state == State::StartPending)
+        .count();
+    assert!(starts >= 3, "{:?}", rig.api.all());
     let _ = ctl.handle(raw::CONTROL_STOP, 0);
     assert_eq!(h.join().unwrap(), service_exit::OK);
 }
@@ -463,7 +481,17 @@ fn a_host_that_ignores_stop_is_given_up_within_the_wait_hint() {
     wait_for(&rig.api, State::Running);
     let t = Instant::now();
     let _ = ctl.handle(raw::CONTROL_STOP, 0);
-    assert_eq!(h.join().unwrap(), service_exit::STOP_TIMEOUT);
+    // M2: the stop was asked for, so the code is 0 (no failure restart)
+    // and the Event Log says the host did not stop in time.
+    assert_eq!(h.join().unwrap(), service_exit::OK);
+    assert!(
+        rig.sink
+            .lines()
+            .iter()
+            .any(|l| l.contains("did not stop in time")),
+        "{:?}",
+        rig.sink.lines()
+    );
     let took = t.elapsed();
     assert!(took < fast().stop_hint, "{took:?}");
     let r = rig.api.all();
@@ -494,6 +522,8 @@ fn stop_during_start_never_reports_running() {
         logger: logger(&sink),
         sinks: vec![Arc::new(sink.clone())],
         drain: Box::new(|_| {}),
+        preflight: Ok(()),
+        hold: None,
     };
     assert_eq!(run_service(core, run), service_exit::OK);
     let r = api.all();
@@ -581,4 +611,87 @@ fn the_controller_handler_never_panics_on_any_input() {
             let _ = core.controller.handle(c, e);
         }
     }
+}
+
+// ---- I1 and R111: preflight ----
+
+#[test]
+fn an_unsafe_location_stops_before_the_host_with_its_code() {
+    let l = FakeLauncher::new(Behaviour::UntilShutdown);
+    let ran = l.ran.clone();
+    let (rig, _ctl, h) = start_with(
+        l,
+        Err("not read".to_owned()),
+        Err(Preflight::UnsafeLocation(vec![
+            "the config file is not owned by SYSTEM, Administrators or TrustedInstaller".to_owned(),
+        ])),
+    );
+    assert_eq!(h.join().unwrap(), service_exit::LOCATION);
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(!rig.api.states().contains(&State::Running));
+    assert!(
+        rig.sink
+            .lines()
+            .iter()
+            .any(|l| l.contains("the config file")),
+        "{:?}",
+        rig.sink.lines()
+    );
+}
+
+#[test]
+fn another_instance_stops_before_the_host_with_its_code() {
+    let l = FakeLauncher::new(Behaviour::UntilShutdown);
+    let ran = l.ran.clone();
+    let (rig, _ctl, h) = start_with(l, Ok(Config::default()), Err(Preflight::OtherInstance));
+    assert_eq!(h.join().unwrap(), service_exit::ALREADY_RUNNING);
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_never_backwards(&rig.api.all());
+}
+
+#[test]
+fn the_held_lock_lives_until_the_run_ends() {
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let api = Arc::new(RecordingApi::default());
+    let core = new_core(api, fast());
+    let sink = MemorySink::new();
+    let run = ServiceRun {
+        config: Ok(Config::default()),
+        launcher: Arc::new(FakeLauncher::new(Behaviour::EndsAtOnce)),
+        logger: logger(&sink),
+        sinks: vec![Arc::new(sink.clone())],
+        drain: Box::new(|_| {}),
+        preflight: Ok(()),
+        hold: Some(Box::new(Flag(dropped.clone()))),
+    };
+    assert!(!dropped.load(Ordering::SeqCst));
+    let _ = run_service(core, run);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn service_exit_codes_are_distinct() {
+    let all = [
+        service_exit::OK,
+        service_exit::CONFIG,
+        service_exit::HOST_NOT_BUILT,
+        service_exit::PANICKED,
+        service_exit::ENDED_UNASKED,
+        service_exit::THREAD,
+        service_exit::DEPS_FAILED,
+        service_exit::CLOCK,
+        service_exit::ACCOUNT,
+        service_exit::LOCATION,
+        service_exit::ALREADY_RUNNING,
+        service_exit::INTERNAL,
+    ];
+    let set: std::collections::BTreeSet<u32> = all.iter().copied().collect();
+    assert_eq!(set.len(), all.len());
+    assert!(!set.contains(&4), "4 is retired (M2)");
 }

@@ -95,8 +95,9 @@ pub mod service_exit {
     pub const HOST_NOT_BUILT: u32 = 2;
     /// The host loop or its shutdown panicked.
     pub const PANICKED: u32 = 3;
-    /// The host did not finish within the stop budget.
-    pub const STOP_TIMEOUT: u32 = 4;
+    // 4 is retired (M2). A requested stop that runs out of time now ends
+    // with 0: the administrator asked for the stop, so the failure actions
+    // must not start the service again. The Event Log says it timed out.
     /// The host ended without being asked to.
     pub const ENDED_UNASKED: u32 = 5;
     /// The host thread could not be started.
@@ -107,6 +108,13 @@ pub mod service_exit {
     pub const CLOCK: u32 = 8;
     /// The service account is not `LocalSystem` or cannot be checked (R106).
     pub const ACCOUNT: u32 = 9;
+    /// The exe, its folder, a file in it or the config file can be changed
+    /// by a non-administrator (I1). Checked at every start.
+    pub const LOCATION: u32 = 10;
+    /// Another instance holds the instance lock (R111).
+    pub const ALREADY_RUNNING: u32 = 11;
+    /// Building the run panicked before the host started (M1).
+    pub const INTERNAL: u32 = 12;
 }
 
 /// A reported state. The order is the only order reports may take.
@@ -300,6 +308,14 @@ impl Reporter {
         true
     }
 
+    /// A checkpoint bump while starting (M3). Nothing once running.
+    pub fn start_progress(&self) {
+        let mut i = self.lock();
+        if i.last == Some(State::StartPending) {
+            self.send(&mut i, State::StartPending, service_exit::OK);
+        }
+    }
+
     /// A checkpoint bump while stopping.
     pub fn stop_progress(&self) {
         let mut i = self.lock();
@@ -460,6 +476,21 @@ pub struct ServiceRun {
     pub sinks: Vec<Arc<dyn LogSink>>,
     /// Waits for queued log lines to be written, before `STOPPED`.
     pub drain: Box<dyn Fn(Duration) + Send + Sync>,
+    /// The checks made before the config was loaded: location (I1) and
+    /// instance lock (R111).
+    pub preflight: Result<(), Preflight>,
+    /// Kept alive for the whole run, for example the instance lock.
+    pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Why the service may not start, found before the config is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preflight {
+    /// The exe, its folder, a file in it or the config file is not
+    /// administrators-only. Each entry is one reason, without a path.
+    UnsafeLocation(Vec<String>),
+    /// Another instance holds the instance lock.
+    OtherInstance,
 }
 
 /// The parts made before the handler is registered.
@@ -531,6 +562,29 @@ fn start_and_wait(
     run: &ServiceRun,
 ) -> u32 {
     let logger = run.logger.as_ref();
+    match &run.preflight {
+        Ok(()) => {}
+        Err(Preflight::UnsafeLocation(reasons)) => {
+            log(
+                logger,
+                Level::Error,
+                &format!(
+                    "cannot start: a non-administrator can change what runs or what it reads: \
+                     {}",
+                    reasons.join("; ")
+                ),
+            );
+            return service_exit::LOCATION;
+        }
+        Err(Preflight::OtherInstance) => {
+            log(
+                logger,
+                Level::Error,
+                "cannot start: another instance is already adjusting the clock",
+            );
+            return service_exit::ALREADY_RUNNING;
+        }
+    }
     let cfg = match &run.config {
         Ok(c) => c.clone(),
         Err(e) => {
@@ -578,6 +632,7 @@ fn start_and_wait(
     }
 
     let mut stop_seen: Option<Instant> = None;
+    let started_at = Instant::now();
     let result = loop {
         match rx.recv_timeout(timing.poll) {
             Ok(r) => break Some(r),
@@ -593,9 +648,14 @@ fn start_and_wait(
                     "the host did not stop in time. Stopping anyway. The next start resets \
                      the clock rate",
                 );
-                return service_exit::STOP_TIMEOUT;
+                // M2: the stop was asked for, so no failure restart.
+                return service_exit::OK;
             }
             reporter.stop_progress();
+        } else if started_at.elapsed() + timing.poll < timing.start_hint {
+            // M3: progress while the host builds its adapters, bounded by
+            // the start hint, so a hung build is still seen as hung.
+            reporter.start_progress();
         }
     };
     map_result(result, reporter.stop_requested(), logger)

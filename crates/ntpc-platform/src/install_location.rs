@@ -73,6 +73,9 @@ pub struct Facts {
     pub dacl: Option<Vec<Ace>>,
     /// The object is a reparse point.
     pub reparse: bool,
+    /// Hard links. A file with more than one can be changed through
+    /// another name in a folder nobody checked (M9, R105).
+    pub links: u32,
 }
 
 /// Which role the object plays.
@@ -84,12 +87,22 @@ pub enum Role {
     Folder,
     /// A parent folder above that.
     Ancestor,
+    /// The config file (I1). Read as `LocalSystem` at every start, so it
+    /// decides the time sources and `allow_panic_step`.
+    Config,
+    /// The folder of a config file named with `--config`.
+    ConfigFolder,
+    /// Any other file in the exe folder. A DLL there could be loaded by
+    /// the exe, and the scripts there run elevated.
+    FolderFile,
 }
 
 impl Role {
     const fn mask(self) -> u32 {
         match self {
-            Role::Exe | Role::Folder => WRITE_MASK,
+            Role::Exe | Role::Folder | Role::Config | Role::ConfigFolder | Role::FolderFile => {
+                WRITE_MASK
+            }
             Role::Ancestor => ANCESTOR_MASK,
         }
     }
@@ -99,7 +112,14 @@ impl Role {
             Role::Exe => "the exe",
             Role::Folder => "the exe folder",
             Role::Ancestor => "a parent folder",
+            Role::Config => "the config file",
+            Role::ConfigFolder => "the config folder",
+            Role::FolderFile => "a file in the exe folder",
         }
+    }
+
+    const fn is_file(self) -> bool {
+        matches!(self, Role::Exe | Role::Config | Role::FolderFile)
     }
 }
 
@@ -111,6 +131,9 @@ pub fn judge(role: Role, f: &Facts) -> Vec<String> {
     let what = role.label();
     if f.reparse {
         out.push(format!("{what} is a link or reparse point"));
+    }
+    if role.is_file() && f.links > 1 {
+        out.push(format!("{what} has more than one hard link"));
     }
     if f.owner != Some(Who::Trusted) {
         out.push(format!(
@@ -142,79 +165,133 @@ pub fn judge(role: Role, f: &Facts) -> Vec<String> {
     out
 }
 
-/// Checks the exe at `exe` (an absolute, already resolved path), its folder
-/// and every parent up to the drive root. Read only. Empty means safe.
-///
-/// # Errors
-/// None. A path that cannot be read is a reason, not an error: unreadable
-/// counts as unsafe.
+/// Reads the facts of one path without following a link.
 #[cfg(windows)]
-#[must_use]
-pub fn check_exe_location(exe: &Path) -> Vec<String> {
+fn read_facts(p: &Path) -> std::io::Result<Facts> {
     use crate::win32;
-
-    /// `READ_CONTROL`, enough for owner and DACL.
-    const READ_CONTROL: u32 = 0x0002_0000;
+    /// `READ_CONTROL | FILE_READ_ATTRIBUTES`: owner, DACL, attributes and
+    /// the link count.
+    const ACCESS: u32 = 0x0002_0000 | 0x80;
     /// `FILE_ATTRIBUTE_REPARSE_POINT`.
     const ATTR_REPARSE: u32 = 0x400;
+    let h = win32::open_no_follow(p, ACCESS)?;
+    let tag = win32::attribute_tag(&h)?;
+    let link = win32::link_info(&h)?;
+    let sec = win32::read_security(&h)?;
+    let who = |pr: win32::Principal| match pr {
+        win32::Principal::System
+        | win32::Principal::Administrators
+        | win32::Principal::TrustedInstaller => Who::Trusted,
+        win32::Principal::Other => Who::Other,
+    };
+    Ok(Facts {
+        owner: sec.owner.map(who),
+        dacl: sec.dacl.map(|v| {
+            v.into_iter()
+                .map(|a| Ace {
+                    ace_type: a.ace_type,
+                    flags: a.flags,
+                    mask: a.mask,
+                    who: who(a.principal),
+                })
+                .collect()
+        }),
+        reparse: tag.attributes & ATTR_REPARSE != 0,
+        links: link.links,
+    })
+}
+
+#[cfg(windows)]
+fn judge_path(role: Role, p: &Path, out: &mut Vec<String>) {
+    match read_facts(p) {
+        Ok(f) => out.extend(judge(role, &f)),
+        Err(e) => out.push(format!(
+            "cannot read the permissions of {}: OS error {}",
+            role.label(),
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+}
+
+/// The file, its folder and every parent up to the drive root.
+#[cfg(windows)]
+fn check_chain(file: &Path, file_role: Role, folder_role: Role) -> Vec<String> {
     /// `DRIVE_FIXED`.
     const DRIVE_FIXED: u32 = 3;
-
-    let read = |p: &Path| -> std::io::Result<Facts> {
-        let h = win32::open_no_follow(p, READ_CONTROL)?;
-        let tag = win32::attribute_tag(&h)?;
-        let sec = win32::read_security(&h)?;
-        let who = |pr: win32::Principal| match pr {
-            win32::Principal::System
-            | win32::Principal::Administrators
-            | win32::Principal::TrustedInstaller => Who::Trusted,
-            win32::Principal::Other => Who::Other,
-        };
-        Ok(Facts {
-            owner: sec.owner.map(who),
-            dacl: sec.dacl.map(|v| {
-                v.into_iter()
-                    .map(|a| Ace {
-                        ace_type: a.ace_type,
-                        flags: a.flags,
-                        mask: a.mask,
-                        who: who(a.principal),
-                    })
-                    .collect()
-            }),
-            reparse: tag.attributes & ATTR_REPARSE != 0,
-        })
-    };
-
     let mut out = Vec::new();
-    if !exe.is_absolute() {
-        out.push("the exe path is not absolute".to_owned());
+    if !file.is_absolute() {
+        out.push(format!("the path of {} is not absolute", file_role.label()));
         return out;
     }
-    let mut steps: Vec<(Role, &Path)> = vec![(Role::Exe, exe)];
-    let mut cur = exe.parent();
-    let mut role = Role::Folder;
+    let mut steps: Vec<(Role, &Path)> = vec![(file_role, file)];
+    let mut cur = file.parent();
+    let mut role = folder_role;
     while let Some(p) = cur {
         steps.push((role, p));
         role = Role::Ancestor;
         cur = p.parent();
     }
     if let Some((_, root)) = steps.last()
-        && win32::drive_type(root) != DRIVE_FIXED
+        && crate::win32::drive_type(root) != DRIVE_FIXED
     {
-        out.push("the exe is not on a fixed local drive".to_owned());
+        out.push(format!(
+            "{} is not on a fixed local drive",
+            file_role.label()
+        ));
     }
     for (role, p) in steps {
-        match read(p) {
-            Ok(f) => out.extend(judge(role, &f)),
-            Err(e) => out.push(format!(
-                "cannot read the permissions of {}: OS error {}",
-                role.label(),
-                e.raw_os_error().unwrap_or(-1)
-            )),
-        }
+        judge_path(role, p, &mut out);
     }
     out
+}
+
+/// Checks the exe at `exe` (an absolute, already resolved path), its folder,
+/// every parent up to the drive root, and every other file directly in the
+/// exe folder (the config file, DLLs, the scripts). Read only. Empty means
+/// safe. A path that cannot be read counts as unsafe.
+#[cfg(windows)]
+#[must_use]
+pub fn check_exe_location(exe: &Path) -> Vec<String> {
+    let mut out = check_chain(exe, Role::Exe, Role::Folder);
+    let Some(folder) = exe.parent() else {
+        return out;
+    };
+    match std::fs::read_dir(folder) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    out.push("cannot list the exe folder".to_owned());
+                    continue;
+                };
+                let path = entry.path();
+                if path.file_name() == exe.file_name() {
+                    continue;
+                }
+                // A plain sub folder is not loaded from. A link of any kind
+                // is judged, and refused as a reparse point.
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() && !t.is_symlink() => {}
+                    _ => judge_path(Role::FolderFile, &path, &mut out),
+                }
+            }
+        }
+        Err(e) => out.push(format!(
+            "cannot list the exe folder: OS error {}",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+    out
+}
+
+/// Checks a config file, its folder and every parent (I1). A missing file
+/// passes: it means the defaults. Read only.
+#[cfg(windows)]
+#[must_use]
+pub fn check_config_location(config: &Path) -> Vec<String> {
+    match std::fs::symlink_metadata(config) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        _ => check_chain(config, Role::Config, Role::ConfigFolder),
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +312,7 @@ mod tests {
             owner: Some(Who::Trusted),
             dacl: Some(aces),
             reparse: false,
+            links: 1,
         }
     }
 
@@ -307,6 +385,7 @@ mod tests {
             owner: Some(Who::Trusted),
             dacl: None,
             reparse: false,
+            links: 1,
         };
         assert_eq!(judge(Role::Exe, &f).len(), 1);
     }
@@ -346,10 +425,43 @@ mod tests {
                 ace(9, 0, 0, Who::Other),
             ]),
             reparse: true,
+            links: 3,
         };
         for r in judge(Role::Folder, &f) {
             assert!(!r.contains('\\') && !r.contains(':'), "{r}");
         }
+    }
+
+    #[test]
+    fn a_hard_linked_file_fails_but_a_folder_count_is_ignored() {
+        let mut f = facts(vec![]);
+        f.links = 2;
+        for r in [Role::Exe, Role::Config, Role::FolderFile] {
+            assert_eq!(judge(r, &f).len(), 1, "{r:?}");
+        }
+        assert_eq!(judge(Role::Folder, &f), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_config_owned_by_a_user_or_writable_by_users_fails() {
+        let mut f = facts(program_files_like());
+        f.owner = Some(Who::Other);
+        assert_eq!(judge(Role::Config, &f).len(), 1);
+        // Users with Modify, as a loose ACL on a copied file has.
+        let f = facts(vec![
+            ace(ALLOWED, 0, 0x001F_01FF, Who::Trusted),
+            ace(ALLOWED, 0, 0x0013_01BF, Who::Other),
+        ]);
+        assert_eq!(judge(Role::Config, &f).len(), 1);
+        assert_eq!(judge(Role::FolderFile, &f).len(), 1);
+    }
+
+    #[test]
+    fn an_admin_only_config_passes() {
+        assert_eq!(
+            judge(Role::Config, &facts(program_files_like())),
+            Vec::<String>::new()
+        );
     }
 
     // Read-only checks on the real file system.
@@ -361,9 +473,15 @@ mod tests {
             || std::path::PathBuf::from(r"C:\Windows"),
             std::path::PathBuf::from,
         );
+        // Measured: System32 files are hard links into WinSxS, so the link
+        // rule refuses them. That is right for an install folder. Here only
+        // the owner and ACL rules are checked on a real admin-only chain.
         let exe = root.join("System32").join("cmd.exe");
-        let reasons = check_exe_location(&exe);
-        assert!(reasons.is_empty(), "{reasons:?}");
+        let reasons: Vec<String> = check_chain(&exe, Role::Exe, Role::Folder)
+            .into_iter()
+            .filter(|r| !r.contains("hard link"))
+            .collect();
+        assert_eq!(reasons, Vec::<String>::new());
     }
 
     #[cfg(windows)]
@@ -378,6 +496,68 @@ mod tests {
         let _ = std::fs::remove_file(&exe);
         let _ = std::fs::remove_dir(&dir);
         assert_ne!(reasons, Vec::<String>::new());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_config_passes_and_a_system_file_passes() {
+        let root = std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        );
+        assert_eq!(
+            check_config_location(&root.join("System32").join("ntpc-no-such-config.toml")),
+            Vec::<String>::new()
+        );
+        let reasons: Vec<String> = check_config_location(&root.join("System32").join("cmd.exe"))
+            .into_iter()
+            .filter(|r| !r.contains("hard link"))
+            .collect();
+        assert_eq!(reasons, Vec::<String>::new());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_user_owned_or_hard_linked_config_fails() {
+        let dir = std::env::temp_dir().join(format!("ntpc-cfgloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, b"dhcp = true").unwrap();
+        let owned = check_config_location(&cfg);
+        assert!(
+            owned
+                .iter()
+                .any(|r| r.contains("the config file is not owned")),
+            "{owned:?}"
+        );
+        let link = dir.join("second-name.toml");
+        std::fs::hard_link(&cfg, &link).unwrap();
+        let linked = check_config_location(&cfg);
+        assert!(
+            linked.iter().any(|r| r.contains("more than one hard link")),
+            "{linked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_loose_file_next_to_the_exe_fails_the_exe_check() {
+        let dir = std::env::temp_dir().join(format!("ntpc-folderfiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("ntptimeclient-winrs.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        std::fs::write(dir.join("helper.dll"), b"x").unwrap();
+        let reasons = check_exe_location(&exe);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("a file in the exe folder")),
+            "{reasons:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

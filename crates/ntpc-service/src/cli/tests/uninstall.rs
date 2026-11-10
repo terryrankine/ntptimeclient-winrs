@@ -324,3 +324,14 @@ fn a_successful_uninstall_never_starts_our_service() {
     assert_eq!(w.uninstall(), exit::OK);
     assert_eq!(w.reg.start_calls, 0);
 }
+
+#[test]
+fn uninstall_refuses_a_foreign_service_and_changes_nothing() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.store = MemStore::with(Restore::new(StartType::Manual, true));
+    w.reg.foreign = true;
+    assert_eq!(w.uninstall(), exit::FOREIGN_SERVICE);
+    assert!(!w.reg.stopped);
+    assert_eq!(w.reg.unregister_calls, 0);
+    assert!(!w.scm.mutated());
+}

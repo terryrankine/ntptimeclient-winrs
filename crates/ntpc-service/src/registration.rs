@@ -71,16 +71,14 @@ pub const MAX_EXE_PATH: usize = 32_767;
 /// How long `stop_service` waits for our service to stop.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Poll interval while waiting.
-const STOP_POLL: Duration = Duration::from_millis(250);
-
 /// Why an exe path cannot become an image path.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum QuoteError {
     /// Not absolute with a drive letter.
     #[error("the exe path is not an absolute local path")]
     NotLocalAbsolute,
-    /// Holds a double quote or a NUL, which would break the quoting.
+    /// Holds a double quote, a NUL or a `%`, which would break the quoting
+    /// or be expanded.
     #[error("the exe path holds a quote or NUL character")]
     BadCharacter,
     /// Ends in a backslash: inside quotes it would escape the closing quote.
@@ -103,7 +101,9 @@ pub enum QuoteError {
 /// [`QuoteError`].
 pub fn quote_image_path(exe: &Path) -> Result<String, QuoteError> {
     let s = exe.to_str().ok_or(QuoteError::BadCharacter)?;
-    if s.contains('"') || s.contains('\0') {
+    // `%` too (M4): the SCM may expand environment variables in an image
+    // path, so a literal `%` could turn into something else.
+    if s.contains('"') || s.contains('\0') || s.contains('%') {
         return Err(QuoteError::BadCharacter);
     }
     let b = s.as_bytes();
@@ -207,8 +207,35 @@ pub fn service_spec(exe: &Path) -> Result<ServiceSpec, QuoteError> {
 pub enum RunState {
     /// Stopped.
     Stopped,
-    /// Running, or starting, stopping, pausing.
-    Active,
+    /// Start pending.
+    Starting,
+    /// Running.
+    Running,
+    /// Stop pending, or paused, pausing, continuing.
+    Stopping,
+}
+
+/// The status a query sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SvcStatus {
+    /// The state.
+    pub state: RunState,
+    /// `dwWin32ExitCode`.
+    pub win32_exit: u32,
+    /// `dwServiceSpecificExitCode`.
+    pub specific_exit: u32,
+}
+
+impl SvcStatus {
+    /// A status with no exit code.
+    #[must_use]
+    pub const fn of(state: RunState) -> Self {
+        Self {
+            state,
+            win32_exit: 0,
+            specific_exit: 0,
+        }
+    }
 }
 
 /// A service control failure. No path, machine or user in the text.
@@ -281,11 +308,17 @@ pub trait ScmApi {
     /// # Errors
     /// [`ScmError::NotFound`] when it is not there.
     fn delete(&mut self, name: &str) -> Result<(), ScmError>;
-    /// The run state. Read only.
+    /// The status with exit codes. Read only.
     ///
     /// # Errors
     /// [`ScmError::NotFound`] when it is not there.
-    fn run_state(&self, name: &str) -> Result<RunState, ScmError>;
+    fn status(&self, name: &str) -> Result<SvcStatus, ScmError>;
+    /// The registered image path, `None` when there is no such service.
+    /// Read only.
+    ///
+    /// # Errors
+    /// [`ScmError`].
+    fn image_path(&self, name: &str) -> Result<Option<String>, ScmError>;
     /// Sends stop. Does not wait.
     ///
     /// # Errors
@@ -310,8 +343,33 @@ pub trait ExeLocator {
     /// Why it could not be found.
     fn exe(&self) -> Result<PathBuf, String>;
     /// Reasons the location is not administrators-only. Empty means safe.
+    /// Covers the exe, its folder, its parents and every file in the
+    /// folder (the config file included, I1).
     fn check(&self, exe: &Path) -> Vec<String>;
+    /// Whether this process's token gives new files a trusted owner
+    /// (SYSTEM or Administrators). Install creates the state directory and
+    /// the restore record with it (M10).
+    ///
+    /// # Errors
+    /// Why it could not be read.
+    fn owner_trusted(&self) -> Result<bool, String>;
 }
+
+/// R110: the image path install writes, `"<folder>\ntptimeclient-winrs.exe" service`.
+/// An existing service of our name with anything else is not ours and is
+/// never touched. Case-insensitive, as Windows paths are.
+#[must_use]
+pub fn is_our_image_path(p: &str) -> bool {
+    const TAIL: &str = "\\ntptimeclient-winrs.exe\" service";
+    p.starts_with('"')
+        && p.matches('"').count() == 2
+        && p.len() > TAIL.len() + 1
+        && p.is_char_boundary(p.len() - TAIL.len())
+        && p[p.len() - TAIL.len()..].eq_ignore_ascii_case(TAIL)
+}
+
+/// How long `start_service` waits for `RUNNING` (R109).
+pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The real [`Registration`].
 pub struct ScmRegistration<'a> {
@@ -323,6 +381,7 @@ pub struct ScmRegistration<'a> {
     /// no time sync, so install refuses until it is.
     host_ready: Result<(), String>,
     stop_timeout: Duration,
+    start_timeout: Duration,
 }
 
 impl<'a> ScmRegistration<'a> {
@@ -339,13 +398,15 @@ impl<'a> ScmRegistration<'a> {
             locator,
             host_ready,
             stop_timeout: STOP_TIMEOUT,
+            start_timeout: START_TIMEOUT,
         }
     }
 
-    /// Changes the stop wait, for tests.
+    /// Changes the stop and start waits, for tests.
     #[must_use]
-    pub fn with_stop_timeout(mut self, d: Duration) -> Self {
-        self.stop_timeout = d;
+    pub fn with_timeouts(mut self, stop: Duration, start: Duration) -> Self {
+        self.stop_timeout = stop;
+        self.start_timeout = start;
         self
     }
 
@@ -371,11 +432,58 @@ impl<'a> ScmRegistration<'a> {
             ),
         }
     }
+
+    /// Sends stop if needed and waits for `STOPPED`. True if it was
+    /// running (or starting) and is now stopped.
+    fn stop_and_wait(&mut self) -> Result<bool, String> {
+        match self.scm.status(SERVICE_NAME) {
+            Err(ScmError::NotFound) => return Err("absent".to_owned()),
+            Err(e) => return Err(format!("reading the service state failed: {e}")),
+            Ok(s) if s.state == RunState::Stopped => return Ok(false),
+            Ok(_) => {}
+        }
+        match self.scm.stop(SERVICE_NAME) {
+            Ok(()) | Err(ScmError::NotActive) => {}
+            Err(e) => return Err(format!("stopping the service failed: {e}")),
+        }
+        let mut waited = Duration::ZERO;
+        loop {
+            match self.scm.status(SERVICE_NAME) {
+                Ok(s) if s.state == RunState::Stopped => return Ok(true),
+                Err(ScmError::NotFound) => return Ok(true),
+                Ok(_) => {}
+                Err(e) => return Err(format!("reading the service state failed: {e}")),
+            }
+            if waited >= self.stop_timeout {
+                return Err(format!(
+                    "the service did not stop within {} s",
+                    self.stop_timeout.as_secs()
+                ));
+            }
+            self.scm.pause(POLL);
+            waited += POLL;
+        }
+    }
 }
+
+/// Poll interval while waiting for a state.
+const POLL: Duration = Duration::from_millis(250);
 
 impl Registration for ScmRegistration<'_> {
     fn ready(&self) -> Result<(), NotReady> {
         self.host_ready.clone().map_err(NotReady::NotBuilt)?;
+        match self.locator.owner_trusted() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(NotReady::TokenOwner(
+                    "this prompt gives new files an owner other than SYSTEM or Administrators, \
+                     so the state directory would not be trusted later"
+                        .to_owned(),
+                ));
+            }
+            Err(e) => return Err(NotReady::TokenOwner(e)),
+        }
+        self.check_ours().map_err(NotReady::Foreign)?;
         let exe = self.locator.exe().map_err(NotReady::NotBuilt)?;
         service_spec(&exe).map_err(|e| NotReady::UnsafeLocation(vec![e.to_string()]))?;
         let reasons = self.locator.check(&exe);
@@ -386,12 +494,36 @@ impl Registration for ScmRegistration<'_> {
         }
     }
 
+    fn check_ours(&self) -> Result<(), String> {
+        match self.scm.image_path(SERVICE_NAME) {
+            Ok(None) => Ok(()),
+            Ok(Some(p)) if is_our_image_path(&p) => Ok(()),
+            Ok(Some(_)) => Err(format!(
+                "a service named {SERVICE_NAME} exists but does not run this program's exe \
+                 with the service argument. It is left alone. Check it with: sc.exe qc \
+                 {SERVICE_NAME}"
+            )),
+            Err(e) => Err(format!("reading the existing service failed: {e}")),
+        }
+    }
+
     fn register(&mut self) -> Result<(), String> {
         let spec = self.spec()?;
         let created = match self.scm.create(&spec) {
             Ok(()) => true,
             Err(ScmError::Exists) => {
-                // A re-install. Point the existing entry at this exe.
+                // A re-install. Learn: config changes apply at the next
+                // start, so stop a running service first, then update it.
+                // Install starts it again afterwards.
+                match self.stop_and_wait() {
+                    Ok(_) => {}
+                    Err(e) if e == "absent" => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "the running service could not be stopped to update it: {e}"
+                        ));
+                    }
+                }
                 self.scm
                     .update(&spec)
                     .map_err(|e| format!("updating the existing service failed: {e}"))?;
@@ -420,31 +552,11 @@ impl Registration for ScmRegistration<'_> {
     }
 
     fn stop_service(&mut self) -> Result<OwnService, String> {
-        match self.scm.run_state(SERVICE_NAME) {
-            Err(ScmError::NotFound) => return Ok(OwnService::Absent),
-            Err(e) => return Err(format!("reading the service state failed: {e}")),
-            Ok(RunState::Stopped) => return Ok(OwnService::WasStopped),
-            Ok(RunState::Active) => {}
-        }
-        match self.scm.stop(SERVICE_NAME) {
-            Ok(()) | Err(ScmError::NotActive) => {}
-            Err(e) => return Err(format!("stopping the service failed: {e}")),
-        }
-        let mut waited = Duration::ZERO;
-        loop {
-            match self.scm.run_state(SERVICE_NAME) {
-                Ok(RunState::Stopped) | Err(ScmError::NotFound) => return Ok(OwnService::Present),
-                Ok(RunState::Active) => {}
-                Err(e) => return Err(format!("reading the service state failed: {e}")),
-            }
-            if waited >= self.stop_timeout {
-                return Err(format!(
-                    "the service did not stop within {} s",
-                    self.stop_timeout.as_secs()
-                ));
-            }
-            self.scm.pause(STOP_POLL);
-            waited += STOP_POLL;
+        match self.stop_and_wait() {
+            Ok(true) => Ok(OwnService::Present),
+            Ok(false) => Ok(OwnService::WasStopped),
+            Err(e) if e == "absent" => Ok(OwnService::Absent),
+            Err(e) => Err(e),
         }
     }
 
@@ -467,150 +579,46 @@ impl Registration for ScmRegistration<'_> {
         }
     }
 
+    /// Starts the service and waits for `RUNNING` (R109). `StartService`
+    /// returns once the process connects, so a service that fails while
+    /// building its adapters is seen only here.
     fn start_service(&mut self) -> Result<(), String> {
         match self.scm.start(SERVICE_NAME) {
-            Ok(()) | Err(ScmError::AlreadyRunning) => Ok(()),
-            Err(e) => Err(format!("starting the service failed: {e}")),
+            Ok(()) | Err(ScmError::AlreadyRunning) => {}
+            Err(e) => return Err(format!("starting the service failed: {e}")),
+        }
+        let mut waited = Duration::ZERO;
+        loop {
+            match self.scm.status(SERVICE_NAME) {
+                Ok(s) if s.state == RunState::Running => return Ok(()),
+                Ok(s) if s.state == RunState::Stopped => {
+                    return Err(format!(
+                        "the service stopped right after it started (exit code {}, service \
+                         exit code {}). The Application event log, source {SERVICE_NAME}, \
+                         says why",
+                        s.win32_exit, s.specific_exit
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("reading the service state failed: {e}")),
+            }
+            if waited >= self.start_timeout {
+                return Err(format!(
+                    "the service did not report running within {} s. The Application event \
+                     log, source {SERVICE_NAME}, may say why",
+                    self.start_timeout.as_secs()
+                ));
+            }
+            self.scm.pause(POLL);
+            waited += POLL;
         }
     }
 }
 
-// ---------------------------------------------------------------- real
-
-/// The real SCM, over `ntpc_platform::service_host` and the `w32time`
-/// wrappers for stop, start and query.
 #[cfg(windows)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RealScm;
-
+mod real;
 #[cfg(windows)]
-fn scm_err(op: &'static str, e: &std::io::Error) -> ScmError {
-    ScmError::from_code(op, e.raw_os_error().unwrap_or(-1))
-}
-
-#[cfg(windows)]
-fn raw_spec(spec: &ServiceSpec) -> ntpc_platform::service_host::RawServiceSpec {
-    ntpc_platform::service_host::RawServiceSpec {
-        name: spec.name.clone(),
-        display_name: spec.display_name.clone(),
-        image_path: spec.image_path.clone(),
-        start_type: spec.start_type,
-        error_control: spec.error_control,
-    }
-}
-
-#[cfg(windows)]
-impl ScmApi for RealScm {
-    fn create(&mut self, spec: &ServiceSpec) -> Result<(), ScmError> {
-        // R106: LocalSystem only. The FFI always passes a null account
-        // (LocalSystem) and no dependencies. Refuse a spec that asks for
-        // anything else, or for a restricted SID, rather than ignore it.
-        if spec.account.is_some() || !spec.dependencies.is_empty() || spec.sid_type == 3 {
-            return Err(ScmError::Os {
-                op: "create (unsupported account or dependencies)",
-                code: -1,
-            });
-        }
-        ntpc_platform::service_host::create_service(&raw_spec(spec))
-            .map_err(|e| scm_err("create", &e))
-    }
-
-    fn update(&mut self, spec: &ServiceSpec) -> Result<(), ScmError> {
-        ntpc_platform::service_host::update_service(&raw_spec(spec))
-            .map_err(|e| scm_err("update", &e))
-    }
-
-    fn configure(&mut self, spec: &ServiceSpec) -> Result<(), (&'static str, ScmError)> {
-        use ntpc_platform::service_host::{RawExtras, RestartAfter, configure_service};
-        let x = RawExtras {
-            description: spec.description.clone(),
-            delayed: spec.delayed,
-            privileges: spec.privileges.clone(),
-            reset_period_s: spec.reset_period_s,
-            restarts: spec.restarts_ms.iter().map(|&d| RestartAfter(d)).collect(),
-            actions_on_non_crash: spec.actions_on_non_crash,
-            sid_type: spec.sid_type,
-        };
-        configure_service(&spec.name, &x).map_err(|(step, e)| (step, scm_err(step, &e)))
-    }
-
-    fn delete(&mut self, name: &str) -> Result<(), ScmError> {
-        ntpc_platform::service_host::delete_service(name).map_err(|e| scm_err("delete", &e))
-    }
-
-    fn run_state(&self, name: &str) -> Result<RunState, ScmError> {
-        use ntpc_platform::w32time::{RunState as W, ServiceControl, SvcError};
-        match ntpc_platform::ScmControl.query(name) {
-            Ok(s) if s.run == W::Stopped => Ok(RunState::Stopped),
-            Err(SvcError::NotFound) => Err(ScmError::NotFound),
-            Err(SvcError::AccessDenied) => Err(ScmError::AccessDenied),
-            // Our own service may also be in a start type the w32time
-            // mapper refuses. Fall back to "active", the safe reading.
-            Ok(_) | Err(SvcError::UnsupportedStartType(_)) => Ok(RunState::Active),
-            Err(e) => Err(ScmError::Os {
-                op: "query",
-                code: os_code(&e),
-            }),
-        }
-    }
-
-    fn stop(&mut self, name: &str) -> Result<(), ScmError> {
-        use ntpc_platform::w32time::{ServiceControl, SvcError};
-        ntpc_platform::ScmControl.stop(name).map_err(|e| match e {
-            SvcError::NotActive => ScmError::NotActive,
-            SvcError::NotFound => ScmError::NotFound,
-            SvcError::AccessDenied => ScmError::AccessDenied,
-            other => ScmError::Os {
-                op: "stop",
-                code: os_code(&other),
-            },
-        })
-    }
-
-    fn start(&mut self, name: &str) -> Result<(), ScmError> {
-        use ntpc_platform::w32time::{ServiceControl, SvcError};
-        ntpc_platform::ScmControl.start(name).map_err(|e| match e {
-            SvcError::AlreadyRunning => ScmError::AlreadyRunning,
-            SvcError::NotFound => ScmError::NotFound,
-            SvcError::AccessDenied => ScmError::AccessDenied,
-            other => ScmError::Os {
-                op: "start",
-                code: os_code(&other),
-            },
-        })
-    }
-}
-
-#[cfg(windows)]
-fn os_code(e: &ntpc_platform::w32time::SvcError) -> i32 {
-    match e {
-        ntpc_platform::w32time::SvcError::Os { code, .. } => *code,
-        _ => -1,
-    }
-}
-
-/// The real exe locator: `current_exe`, resolved by `canonicalize`, then
-/// `ntpc_platform::install_location::check_exe_location`.
-#[cfg(windows)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RealExeLocator;
-
-#[cfg(windows)]
-impl ExeLocator for RealExeLocator {
-    fn exe(&self) -> Result<PathBuf, String> {
-        let raw = std::env::current_exe()
-            .map_err(|e| format!("cannot find the running exe: {}", e.kind()))?;
-        // Resolves links and short names, so the registered path is the
-        // real file and the location check sees the real folders.
-        let real = std::fs::canonicalize(&raw)
-            .map_err(|e| format!("cannot resolve the running exe path: {}", e.kind()))?;
-        Ok(strip_verbatim(&real))
-    }
-
-    fn check(&self, exe: &Path) -> Vec<String> {
-        ntpc_platform::install_location::check_exe_location(exe)
-    }
-}
+pub use real::{RealExeLocator, RealScm};
 
 #[cfg(test)]
 mod tests;

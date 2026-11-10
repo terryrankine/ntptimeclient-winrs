@@ -23,6 +23,8 @@ enum Call {
 
 type Log = Rc<RefCell<Vec<Call>>>;
 
+// Each flag is one scripted fault or one observed effect.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct FakeScm {
     log: Log,
@@ -38,6 +40,13 @@ struct FakeScm {
     /// Polls that still read Active after a stop. `u32::MAX`: never stops.
     stop_lag: u32,
     pauses: u32,
+    /// The registered image path, when it exists. `None`: ours.
+    image: Option<String>,
+    /// After a start: stopped again with these exit codes.
+    dies_after_start: Option<(u32, u32)>,
+    /// After a start: stays start pending for ever.
+    start_hangs: bool,
+    starting: bool,
 }
 
 impl FakeScm {
@@ -55,6 +64,10 @@ impl FakeScm {
             state_error: None,
             stop_lag: 0,
             pauses: 0,
+            image: None,
+            dies_after_start: None,
+            start_hangs: false,
+            starting: false,
         }
     }
     fn push(&self, c: Call) {
@@ -93,7 +106,7 @@ impl ScmApi for FakeScm {
         self.exists = false;
         Ok(())
     }
-    fn run_state(&self, name: &str) -> Result<RunState, ScmError> {
+    fn status(&self, name: &str) -> Result<SvcStatus, ScmError> {
         self.push(Call::State(name.to_owned()));
         if let Some(e) = self.state_error.clone() {
             return Err(e);
@@ -101,11 +114,28 @@ impl ScmApi for FakeScm {
         if !self.exists {
             return Err(ScmError::NotFound);
         }
-        Ok(if self.running {
-            RunState::Active
-        } else {
-            RunState::Stopped
+        if self.starting {
+            return Ok(SvcStatus::of(RunState::Starting));
+        }
+        if self.running {
+            return Ok(SvcStatus::of(RunState::Running));
+        }
+        let (w, sp) = self.dies_after_start.unwrap_or((0, 0));
+        Ok(SvcStatus {
+            state: RunState::Stopped,
+            win32_exit: w,
+            specific_exit: sp,
         })
+    }
+    fn image_path(&self, _name: &str) -> Result<Option<String>, ScmError> {
+        if !self.exists {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.image
+                .clone()
+                .unwrap_or_else(|| format!("\"{EXE}\" service")),
+        ))
     }
     fn stop(&mut self, name: &str) -> Result<(), ScmError> {
         self.push(Call::Stop(name.to_owned()));
@@ -125,7 +155,11 @@ impl ScmApi for FakeScm {
         if self.running {
             return Err(ScmError::AlreadyRunning);
         }
-        self.running = true;
+        if self.start_hangs {
+            self.starting = true;
+        } else if self.dies_after_start.is_none() {
+            self.running = true;
+        }
         Ok(())
     }
     fn pause(&mut self, _d: Duration) {
@@ -189,6 +223,7 @@ impl EventSourceRegistry for FakeReg {
 struct FakeLocator {
     exe: Result<PathBuf, String>,
     reasons: Vec<String>,
+    owner: Result<bool, String>,
 }
 
 impl ExeLocator for FakeLocator {
@@ -198,6 +233,9 @@ impl ExeLocator for FakeLocator {
     fn check(&self, _exe: &Path) -> Vec<String> {
         self.reasons.clone()
     }
+    fn owner_trusted(&self) -> Result<bool, String> {
+        self.owner.clone()
+    }
 }
 
 const EXE: &str = r"C:\Program Files\ntptimeclient-winrs\ntptimeclient-winrs.exe";
@@ -206,6 +244,7 @@ fn locator() -> FakeLocator {
     FakeLocator {
         exe: Ok(PathBuf::from(EXE)),
         reasons: Vec::new(),
+        owner: Ok(true),
     }
 }
 
@@ -231,7 +270,7 @@ impl World {
     fn with<T>(&mut self, f: impl FnOnce(&mut ScmRegistration<'_>) -> T) -> T {
         let mut r =
             ScmRegistration::new(&mut self.scm, &mut self.reg, &self.loc, self.host.clone())
-                .with_stop_timeout(Duration::from_secs(2));
+                .with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
         f(&mut r)
     }
     fn calls(&self) -> Vec<Call> {
@@ -372,8 +411,10 @@ fn reinstall_updates_the_existing_service() {
     w.with(|r| r.register()).unwrap();
     let c = w.calls();
     assert!(matches!(c[0], Call::Create(_)));
-    assert!(matches!(c[1], Call::Update(_)));
-    assert!(matches!(c[2], Call::Configure(_)));
+    // A stopped service is only queried, then updated and configured.
+    assert_eq!(c[1], Call::State(SERVICE_NAME.to_owned()));
+    assert!(matches!(c[2], Call::Update(_)));
+    assert!(matches!(c[3], Call::Configure(_)));
 }
 
 #[test]
@@ -598,5 +639,107 @@ fn scm_error_codes_map() {
     assert_eq!(
         ScmError::from_code("x", 87),
         ScmError::Os { op: "x", code: 87 }
+    );
+}
+
+// ---- R109: start waits for RUNNING ----
+
+#[test]
+fn start_waits_for_running() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    assert_eq!(w.with(|r| r.start_service()), Ok(()));
+    assert!(w.scm.running);
+}
+
+#[test]
+fn a_service_that_stops_right_after_start_is_a_failure_with_its_code() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.scm.dies_after_start = Some((1066, 8));
+    let e = w.with(|r| r.start_service()).unwrap_err();
+    assert!(e.contains("service exit code 8"), "{e}");
+    assert!(e.contains("event log"), "{e}");
+}
+
+#[test]
+fn a_service_that_never_runs_times_out() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.scm.start_hangs = true;
+    let e = w.with(|r| r.start_service()).unwrap_err();
+    assert!(e.contains("did not report running"), "{e}");
+    assert!(w.scm.pauses >= 8, "the wait used the injected pause");
+}
+
+#[test]
+fn reinstall_stops_a_running_service_before_updating_it() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.scm.running = true;
+    w.with(|r| r.register()).unwrap();
+    let c = w.calls();
+    let stop = c.iter().position(|x| matches!(x, Call::Stop(_))).unwrap();
+    let update = c.iter().position(|x| matches!(x, Call::Update(_))).unwrap();
+    assert!(stop < update, "{c:?}");
+    assert!(!w.scm.running);
+}
+
+// ---- R110: never touch a service of our name that is not ours ----
+
+#[test]
+fn our_image_path_form() {
+    assert!(is_our_image_path(&format!("\"{EXE}\" service")));
+    assert!(is_our_image_path(
+        r#""D:\x\NTPTIMECLIENT-WINRS.EXE" service"#
+    ));
+    for bad in [
+        r"C:\x\ntptimeclient-winrs.exe service",
+        r#""C:\x\ntptimeclient-winrs.exe""#,
+        r#""C:\x\other.exe" service"#,
+        r#""C:\x\ntptimeclient-winrs.exe" service --evil"#,
+        r#""C:\x\a" "C:\x\ntptimeclient-winrs.exe" service"#,
+        r"C:\Windows\System32\svchost.exe -k LocalService",
+        r#""\ntptimeclient-winrs.exe" service"#,
+        "",
+    ] {
+        assert!(!is_our_image_path(bad), "{bad}");
+    }
+}
+
+#[test]
+fn a_foreign_service_of_our_name_refuses_install_and_uninstall() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.scm.image = Some(r"C:\Windows\System32\svchost.exe -k netsvcs".to_owned());
+    assert!(matches!(w.with(|r| r.ready()), Err(NotReady::Foreign(_))));
+    assert!(w.with(|r| r.check_ours()).is_err());
+    assert!(!w.calls().iter().any(|c| matches!(
+        c,
+        Call::Create(_) | Call::Update(_) | Call::Delete(_) | Call::Stop(_) | Call::Start(_)
+    )));
+}
+
+#[test]
+fn an_untrusted_token_owner_refuses_install() {
+    let mut w = World::new();
+    w.loc.owner = Ok(false);
+    assert!(matches!(
+        w.with(|r| r.ready()),
+        Err(NotReady::TokenOwner(_))
+    ));
+    let mut w = World::new();
+    w.loc.owner = Err("unreadable".to_owned());
+    assert!(matches!(
+        w.with(|r| r.ready()),
+        Err(NotReady::TokenOwner(_))
+    ));
+}
+
+#[test]
+fn a_percent_in_the_exe_path_is_refused() {
+    assert_eq!(
+        quote_image_path(Path::new(r"C:\%TEMP%\a.exe")),
+        Err(QuoteError::BadCharacter)
     );
 }

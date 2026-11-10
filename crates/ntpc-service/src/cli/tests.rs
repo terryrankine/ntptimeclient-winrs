@@ -141,6 +141,8 @@ impl RecordStore for MemStore {
 struct FakeReg {
     not_ready: bool,
     unsafe_location: bool,
+    foreign: bool,
+    bad_owner: bool,
     start_error: Option<String>,
     start_calls: u32,
     register_error: Option<String>,
@@ -155,11 +157,22 @@ impl Registration for FakeReg {
     fn ready(&self) -> Result<(), NotReady> {
         if self.not_ready {
             Err(NotReady::NotBuilt("registration not built".to_owned()))
+        } else if self.bad_owner {
+            Err(NotReady::TokenOwner("untrusted owner".to_owned()))
+        } else if self.foreign {
+            Err(NotReady::Foreign("not ours".to_owned()))
         } else if self.unsafe_location {
             Err(NotReady::UnsafeLocation(vec![
                 "the exe folder lets an account other than SYSTEM or Administrators change it"
                     .to_owned(),
             ]))
+        } else {
+            Ok(())
+        }
+    }
+    fn check_ours(&self) -> Result<(), String> {
+        if self.foreign {
+            Err("not ours".to_owned())
         } else {
             Ok(())
         }
@@ -416,6 +429,14 @@ fn every_exit_code_is_reachable() {
 
     let mut w = World::new(JoinState::Workgroup);
     w.reg.start_error = Some("x".to_owned());
+    seen.insert(w.install(SILENT));
+
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.foreign = true;
+    seen.insert(w.install(SILENT));
+
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.bad_owner = true;
     seen.insert(w.install(SILENT));
 
     seen.insert(run_install(

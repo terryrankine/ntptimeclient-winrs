@@ -21,6 +21,11 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
     if let Some(code) = require_elevated(d.host, "Uninstall") {
         return code;
     }
+    if let Err(e) = d.reg.check_ours() {
+        d.host
+            .say(&format!("Uninstall refused, nothing changed: {e}."));
+        return exit::FOREIGN_SERVICE;
+    }
     let mut codes = Vec::new();
     let mut stopped_ours = false;
 
