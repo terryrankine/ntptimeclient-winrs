@@ -117,10 +117,13 @@ fn converges_with_20ppm_drift() {
 
 #[test]
 fn converges_with_quantised_frequency_steps() {
-    // 6.4 ppm is 100 ns per 15.625 ms clock interrupt, the coarsest step
-    // `SetSystemTimeAdjustment` gives on a default Windows tick. Author's
-    // guess from training data, unverified. 20 ppm then sits between the
-    // levels 19.2 and 25.6, so the loop must dither.
+    // 6.4 ppm is 100 ns per 15.625 ms clock interrupt, the step of the
+    // legacy `SetSystemTimeAdjustment`. Measured in Task 11: the legacy
+    // increment is 156 250, so this holds for the legacy API. The adapter
+    // uses `SetSystemTimeAdjustmentPrecise`, measured at 0.1 ppm per count
+    // (increment 10 000 000). So 6.4 ppm is now a pessimistic case. Its
+    // value is unchanged here. 20 ppm sits between the levels 19.2 and 25.6, so the loop
+    // must dither.
     let g = 6.4;
     let mut w = SimWorld::new(7, g);
     w.set_true_drift(Ppm::new(DRIFT));

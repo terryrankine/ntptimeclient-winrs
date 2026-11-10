@@ -5,6 +5,10 @@
 #[allow(unsafe_code)]
 pub mod win32;
 
+pub mod clock;
+
+pub use clock::{MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise};
+
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";
 
