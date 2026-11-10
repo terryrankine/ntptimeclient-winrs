@@ -3,10 +3,12 @@
   DANGEROUS. Applies or undoes the tuned w32time profile from docs/measuring.md. Test machine only.
 
 .DESCRIPTION
-  Refuses unless the environment variable MEASURE_TEST_MACHINE is 1 and the session is elevated.
-  Supports -WhatIf. Apply first saves the current values to -BeforeFile (refuses to overwrite),
-  then sets the peers and the registry values and restarts w32time. -Undo restores the recorded
-  values and removes the ones that were absent. Exit codes: 0 done, 2 refused or bad input.
+  Refuses unless MEASURE_TEST_MACHINE is 1, the session is elevated, and a second test-machine signal
+  holds (a virtual machine by a model heuristic, or MEASURE_I_AM_ON_A_TEST_MACHINE=1). Supports -WhatIf.
+  Apply saves the current values to -BeforeFile through a temp file, reads the file back and checks it
+  before the first registry change. If any step fails it restores from the saved file and exits 1.
+  -Undo restores the recorded values and removes the ones that were absent.
+  Exit codes: 0 done, 1 failed (after an automatic restore), 2 refused or bad input.
 
 .EXAMPLE
   $env:MEASURE_TEST_MACHINE = '1'; .\apply-tuned-profile.ps1 -Peers IP1,IP2,IP3 -BeforeFile .\out\w32time-before.json
@@ -20,9 +22,14 @@ param(
 )
 
 Set-StrictMode -Version Latest
-# The guard comes first. Nothing above it may change state.
+# The guards come first. Nothing above them may change state.
 if ($env:MEASURE_TEST_MACHINE -ne '1') {
     [Console]::Error.WriteLine('apply-tuned-profile: refused. Set MEASURE_TEST_MACHINE=1 on a test machine to run this.')
+    exit 2
+}
+. (Join-Path $PSScriptRoot 'w32time-lib.ps1')
+if (-not (Test-SecondTestMachineSignal)) {
+    [Console]::Error.WriteLine('apply-tuned-profile: refused. No second test-machine signal: this does not look like a virtual machine. On a physical test box set MEASURE_I_AM_ON_A_TEST_MACHINE=1.')
     exit 2
 }
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -31,25 +38,14 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Securit
     exit 2
 }
 if ([string]::IsNullOrWhiteSpace($BeforeFile)) { [Console]::Error.WriteLine('apply-tuned-profile: -BeforeFile is required.'); exit 2 }
-
-$k = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config'
-$kp = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters'
-$names = 'MinPollInterval', 'MaxPollInterval', 'UpdateInterval', 'PhaseCorrectRate', 'FrequencyCorrectRate'
-$tuned = @{ MinPollInterval = 6; MaxPollInterval = 6; UpdateInterval = 100; PhaseCorrectRate = 1; FrequencyCorrectRate = 2 }
+$ErrorActionPreference = 'Stop'
 
 if ($Undo) {
     if (-not (Test-Path -LiteralPath $BeforeFile)) { [Console]::Error.WriteLine("apply-tuned-profile: no such file $BeforeFile"); exit 2 }
-    $b = Get-Content -LiteralPath $BeforeFile -Raw | ConvertFrom-Json
-    foreach ($n in $names) {
-        $v = $b.Config.$n
-        if ($null -ne $v) { if ($PSCmdlet.ShouldProcess($n, "restore $v")) { Set-ItemProperty -Path $k -Name $n -Value ([int]$v) -Type DWord } }
-        elseif ($PSCmdlet.ShouldProcess($n, 'remove (was absent)')) { Remove-ItemProperty -Path $k -Name $n -ErrorAction SilentlyContinue }
+    try {
+        if ($PSCmdlet.ShouldProcess('w32time registry values and service', "restore from $BeforeFile")) { Invoke-TunedUndo -StateFile $BeforeFile }
     }
-    if ($PSCmdlet.ShouldProcess('NtpServer and Type', 'restore')) {
-        Set-ItemProperty -Path $kp -Name NtpServer -Value $b.Parameters.NtpServer
-        Set-ItemProperty -Path $kp -Name Type -Value $b.Parameters.Type
-    }
-    if ($PSCmdlet.ShouldProcess('w32time', 'restart')) { Restart-Service w32time }
+    catch { [Console]::Error.WriteLine("apply-tuned-profile: $($_.Exception.Message)"); exit 1 }
     exit 0
 }
 
@@ -57,18 +53,11 @@ if (-not $Peers -or $Peers.Count -lt 1 -or @($Peers | Where-Object { $_ -notmatc
     [Console]::Error.WriteLine('apply-tuned-profile: -Peers must be one or more IP addresses.'); exit 2
 }
 if (Test-Path -LiteralPath $BeforeFile) { [Console]::Error.WriteLine("apply-tuned-profile: $BeforeFile exists. Refusing to overwrite."); exit 2 }
-
-$before = @{}
-$p = Get-ItemProperty -Path $k
-foreach ($n in $names) { $before[$n] = if ($p.PSObject.Properties.Name -contains $n) { $p.$n } else { $null } }
-$bp = Get-ItemProperty -Path $kp | Select-Object NtpServer, Type
-@{ Config = $before; Parameters = $bp } | ConvertTo-Json | Set-Content -LiteralPath $BeforeFile -Encoding ASCII
-Write-Host "saved the current values to $BeforeFile"
-
-$peerList = ($Peers | ForEach-Object { "$_,0x8" }) -join ' '
-if ($PSCmdlet.ShouldProcess('w32time', "manualpeerlist $peerList")) { w32tm /config "/manualpeerlist:$peerList" /syncfromflags:manual /update | Out-Null }
-foreach ($n in $names) {
-    if ($PSCmdlet.ShouldProcess($n, "set $($tuned[$n])")) { Set-ItemProperty -Path $k -Name $n -Value $tuned[$n] -Type DWord }
+try {
+    if ($PSCmdlet.ShouldProcess('w32time', "apply the tuned profile with peers $($Peers -join ',')")) {
+        Invoke-TunedProfile -Peers $Peers -StateFile $BeforeFile
+        Write-Host "applied. The values before the change are in $BeforeFile"
+    }
 }
-if ($PSCmdlet.ShouldProcess('w32time', 'restart')) { Restart-Service w32time }
+catch { [Console]::Error.WriteLine("apply-tuned-profile: $($_.Exception.Message)"); exit 1 }
 exit 0
