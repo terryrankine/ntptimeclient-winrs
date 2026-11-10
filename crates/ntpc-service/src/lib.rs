@@ -3,9 +3,13 @@
 pub mod cli;
 pub mod config;
 pub mod drift_store;
+pub mod host;
+pub mod logging;
 pub mod proto;
 pub mod resolver;
 mod safe_open;
+pub mod status;
+pub mod transport;
 
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-service";
