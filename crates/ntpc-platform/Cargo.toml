@@ -1,0 +1,20 @@
+[package]
+name = "ntpc-platform"
+description = "Windows adapters: clock, sockets, registry, DHCP. The only crate allowed unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ntpc-core.workspace = true
+
+# Cargo cannot combine `workspace = true` with overrides in one crate.
+# So this table repeats the workspace lints and changes only `unsafe_code`.
+# `deny` (not `forbid`) lets the `win32` module opt in. See src/lib.rs.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

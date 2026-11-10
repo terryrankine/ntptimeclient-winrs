@@ -1,0 +1,15 @@
+[package]
+name = "ntpc-service"
+description = "Windows service binary that wires the core to the platform adapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ntpc-core.workspace = true
+ntpc-platform.workspace = true
+
+[lints]
+workspace = true

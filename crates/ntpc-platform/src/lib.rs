@@ -1,0 +1,24 @@
+//! Platform adapters. All `unsafe` code lives in `win32` and nowhere else.
+
+/// Raw Win32 calls. This is the only module allowed to use `unsafe`.
+/// Every `unsafe` block needs a `// SAFETY:` comment.
+#[allow(unsafe_code)]
+pub mod win32;
+
+/// Crate name, used by the smoke test.
+pub const CRATE_NAME: &str = "ntpc-platform";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_name_matches_package() {
+        assert_eq!(CRATE_NAME, env!("CARGO_PKG_NAME"));
+    }
+
+    #[test]
+    fn depends_on_core() {
+        assert_eq!(ntpc_core::CRATE_NAME, "ntpc-core");
+    }
+}
