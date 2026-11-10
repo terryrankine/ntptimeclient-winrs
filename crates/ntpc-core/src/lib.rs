@@ -7,6 +7,8 @@ mod error;
 pub mod filter;
 mod ports;
 pub mod select;
+#[cfg(feature = "sim")]
+pub mod sim;
 pub mod tier;
 mod types;
 
