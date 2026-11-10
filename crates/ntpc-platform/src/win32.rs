@@ -6,6 +6,8 @@
 //!
 //! Nothing here decides policy. `clock` and `acl` do that.
 
+pub(crate) mod scm;
+
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
