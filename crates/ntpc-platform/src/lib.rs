@@ -14,7 +14,7 @@ pub mod clock;
 pub mod acl;
 
 #[cfg(windows)]
-pub use acl::{AclError, secure_state_dir};
+pub use acl::{AclError, KNOWN_CHILDREN, RestoreRecord, Secured, secure_state_dir};
 #[cfg(windows)]
 pub use clock::WindowsClock;
 pub use clock::{AdjustmentState, MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise};

@@ -84,6 +84,13 @@ pub enum AclError {
     /// a colon (named stream syntax).
     #[error("state directory path has a device name or a colon")]
     ReservedName,
+    /// The restore record could not be written into the fresh directory, or
+    /// it did not read back the same.
+    #[error("restore record could not be carried into the fresh state directory: {detail}")]
+    RestoreCarryFailed {
+        /// What failed. OS text, no path.
+        detail: String,
+    },
     /// Securing a fresh directory failed after the old one was moved to
     /// quarantine, and moving it back failed too. Both errors are kept.
     #[error(
@@ -143,12 +150,20 @@ fn os(op: &'static str, e: &io::Error) -> AclError {
 ///
 /// On Ok the path names a directory, not a link, owned by SYSTEM or
 /// Administrators, with exactly the protected secure DACL, whose children are
-/// only plain single-link `drift.txt` or `drift.txt.tmp` files owned by
-/// SYSTEM or Administrators. A directory with a wrong DACL or a wrong-owned
-/// known child is replaced by a fresh one (R78). The old one goes to a
-/// quarantine sibling `<name>.old-<hex>`, which is deleted best effort and
-/// may be left behind, empty or holding whatever an attacker put there
-/// later. Nothing reads it.
+/// only plain single-link files from [`KNOWN_CHILDREN`] owned by SYSTEM or
+/// Administrators. A directory with a wrong DACL or a wrong-owned known child
+/// is replaced by a fresh one (R78). The old one goes to a quarantine sibling
+/// `<name>.old-<hex>`, which is deleted best effort and may be left behind,
+/// empty or holding whatever an attacker put there later. Nothing reads it.
+///
+/// On that replacement only `restore.json` is carried into the fresh
+/// directory (R80), and only if the old file is a plain single-link file of
+/// at most 4 KiB owned by SYSTEM or Administrators. The bytes read through
+/// that checked handle are written with `create_new`, synced and read back.
+/// A restore record that fails the checks is not carried and not deleted:
+/// it stays in the quarantine, and the result says
+/// [`RestoreRecord::Dropped`]. Its content is checked by its reader, not
+/// here. Everything else is regenerated or relearnt.
 ///
 /// A directory this call creates and then cannot secure is removed again,
 /// best effort. It is empty and ours, and a half-secured directory must not
@@ -165,8 +180,35 @@ fn os(op: &'static str, e: &io::Error) -> AclError {
 ///
 /// # Errors
 /// [`AclError`] says which check failed.
-pub fn secure_state_dir(path: &Path) -> Result<(), AclError> {
+pub fn secure_state_dir(path: &Path) -> Result<Secured, AclError> {
     secure_state_dir_with(path, &OS_PROBE)
+}
+
+/// What `secure_state_dir` did with the w32time restore record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Secured {
+    /// The fate of `restore.json`.
+    pub restore_record: RestoreRecord,
+}
+
+/// The w32time restore record (`restore.json`, Task 12) after securing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreRecord {
+    /// It is in the secured directory: kept on the fast path, or carried
+    /// into a fresh directory.
+    Kept,
+    /// It existed but failed the provenance checks (owner, links, kind or
+    /// size), so it was not carried. It stays in the quarantine directory.
+    /// Install must treat the record as lost.
+    Dropped,
+    /// There was none.
+    Absent,
+}
+
+impl Secured {
+    const ABSENT: Self = Self {
+        restore_record: RestoreRecord::Absent,
+    };
 }
 
 /// OS reads that tests replace, so the parent rules can be checked inside a
@@ -198,7 +240,7 @@ fn drive_ok(drive_type: u32) -> Result<(), AclError> {
     }
 }
 
-fn secure_state_dir_with(path: &Path, probe: &Probe) -> Result<(), AclError> {
+fn secure_state_dir_with(path: &Path, probe: &Probe) -> Result<Secured, AclError> {
     let ancestors = ancestors(path)?;
     drive_ok((probe.drive_type)(&drive_root(path)?))?;
     for (i, a) in ancestors.iter().enumerate() {
@@ -224,10 +266,10 @@ fn drive_root(path: &Path) -> Result<PathBuf, AclError> {
 
 /// Everything after the parent checks. Split out so tests inside a
 /// user-owned temp tree can reach the later checks.
-fn secure_final(path: &Path) -> Result<(), AclError> {
+fn secure_final(path: &Path) -> Result<Secured, AclError> {
     let (handle, created) = open_or_create(path)?;
     let result = if created {
-        secure_fresh(&handle, path)
+        secure_fresh(&handle, path).map(|()| Secured::ABSENT)
     } else {
         secure_existing(&handle, path)
     };
@@ -485,18 +527,26 @@ fn finish_keep(ops: &impl DirOps, h: &OwnedHandle, path: &Path) -> Result<(), Ac
 }
 
 /// A directory that was there before this run.
-fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<Secured, AclError> {
     check_handle(h)?;
     let sec = win32::read_security(h).map_err(|e| os("read security", &e))?;
     if !owner_trusted(&sec) {
         return Err(AclError::UntrustedOwner);
     }
     let children = inspect_children(h, path)?;
-    match decide(dacl_is_secure(&sec), &children) {
-        Decision::Keep => finish_keep(&OsOps, h, path),
-        Decision::Refuse => Err(AclError::UnexpectedChild),
-        Decision::Quarantine => quarantine_and_recreate(h, path),
-    }
+    let restore_record = match decide(dacl_is_secure(&sec), &children) {
+        Decision::Keep => {
+            finish_keep(&OsOps, h, path)?;
+            if children.iter().any(|c| c.restore) {
+                RestoreRecord::Kept
+            } else {
+                RestoreRecord::Absent
+            }
+        }
+        Decision::Refuse => return Err(AclError::UnexpectedChild),
+        Decision::Quarantine => quarantine_and_recreate(h, path)?,
+    };
+    Ok(Secured { restore_record })
 }
 
 /// What a child is, as far as the rules care.
@@ -511,8 +561,10 @@ enum ChildKind {
 /// One observed child of the state directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChildObs {
-    /// `drift.txt` or `drift.txt.tmp`.
+    /// A name from [`KNOWN_CHILDREN`].
     known: bool,
+    /// The name is `restore.json`.
+    restore: bool,
     kind: ChildKind,
     /// Hard link count. Zero when not read (unknown name or not a file).
     links: u32,
@@ -568,6 +620,7 @@ fn inspect_children(dir: &OwnedHandle, path: &Path) -> Result<Vec<ChildObs>, Acl
         if !known || listed != ChildKind::File {
             out.push(ChildObs {
                 known,
+                restore: entry.name == RESTORE_NAME,
                 kind: listed,
                 links: 0,
                 owner_trusted: false,
@@ -581,6 +634,7 @@ fn inspect_children(dir: &OwnedHandle, path: &Path) -> Result<Vec<ChildObs>, Acl
         let sec = win32::read_security(&child).map_err(|e| os("check child", &e))?;
         out.push(ChildObs {
             known,
+            restore: entry.name == RESTORE_NAME,
             kind: kind_of(info.attributes),
             links: info.links,
             owner_trusted: owner_trusted(&sec),
@@ -593,17 +647,40 @@ fn inspect_children(dir: &OwnedHandle, path: &Path) -> Result<Vec<ChildObs>, Acl
 /// sibling through its own handle, create a fresh secure directory, and
 /// delete the quarantine best effort. If the fresh directory fails, move
 /// the old one back and report both errors if that fails too.
-fn quarantine_and_recreate(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+fn quarantine_and_recreate(h: &OwnedHandle, path: &Path) -> Result<RestoreRecord, AclError> {
+    // Read the restore record before anything moves. Its bytes are carried,
+    // never the file itself.
+    let source = read_restore(path, &os_child_owner_trusted)?;
     clean_known_children(h, path)?;
-    rename_to_quarantine(h, path)?;
-    match create_fresh(path) {
-        Ok(()) => {
-            // Best effort, as R78 says: the old directory is empty unless
-            // someone added to it through a held handle. Delete through the
-            // handle, so no link is followed. A failure leaves an inert
-            // quarantine directory that nothing reads.
+    let quarantine = rename_to_quarantine(h, path)?;
+    let result = create_fresh(path).and_then(|()| {
+        let carried = match &source {
+            RestoreSource::Carry { bytes, .. } => {
+                write_restore(path, bytes, &os_read_back).map(|()| RestoreRecord::Kept)
+            }
+            RestoreSource::Dropped => Ok(RestoreRecord::Dropped),
+            RestoreSource::Absent => Ok(RestoreRecord::Absent),
+        };
+        if carried.is_err() {
+            // The fresh directory is ours and `write_restore` removed its
+            // own file, so it is empty. Remove it before moving the old one
+            // back.
+            let _ = std::fs::remove_dir(path);
+        }
+        carried
+    });
+    match result {
+        Ok(record) => {
+            if let RestoreSource::Carry { id, .. } = &source {
+                remove_carried_original(&quarantine, id);
+            }
+            // Best effort, as R78 says: the old directory is empty unless a
+            // restore record was dropped or someone added to it through a
+            // held handle. Delete through the handle, so no link is
+            // followed. A failure leaves an inert quarantine directory that
+            // nothing reads.
             let _ = win32::delete_by_handle(h);
-            Ok(())
+            Ok(record)
         }
         Err(cause) => match win32::rename_by_handle(h, path) {
             Ok(()) => Err(cause),
@@ -612,6 +689,137 @@ fn quarantine_and_recreate(h: &OwnedHandle, path: &Path) -> Result<(), AclError>
                 rollback: e.to_string(),
             }),
         },
+    }
+}
+
+/// The largest restore record that is carried.
+const RESTORE_MAX_BYTES: u64 = 4096;
+
+/// `FILE_READ_DATA`.
+const FILE_READ_DATA: u32 = 0x0001;
+
+/// The old restore record, read before the quarantine rename.
+#[derive(Debug)]
+enum RestoreSource {
+    /// None there.
+    Absent,
+    /// There, but it failed a provenance check. Left where it is.
+    Dropped,
+    /// There and trusted. The bytes read through the checked handle, and its
+    /// identity so the original can be removed from the quarantine later.
+    Carry { bytes: Vec<u8>, id: win32::LinkInfo },
+}
+
+fn os_child_owner_trusted(h: &OwnedHandle) -> Result<bool, AclError> {
+    win32::read_security(h)
+        .map(|s| owner_trusted(&s))
+        .map_err(|e| os("check restore record", &e))
+}
+
+/// Opens `dir\restore.json` without following a reparse point and checks
+/// its provenance on that handle: plain file, one link, at most
+/// [`RESTORE_MAX_BYTES`], and `owner_ok`. Reads the bytes through the same
+/// handle. Content is not checked here: that is the reader's job (Task 12).
+fn read_restore(
+    dir: &Path,
+    owner_ok: &dyn Fn(&OwnedHandle) -> Result<bool, AclError>,
+) -> Result<RestoreSource, AclError> {
+    use std::io::Read;
+    let h = match win32::open_no_follow(
+        &dir.join(RESTORE_NAME),
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
+    ) {
+        Ok(h) => h,
+        Err(e) if matches!(e.raw_os_error(), Some(FILE_NOT_FOUND | PATH_NOT_FOUND)) => {
+            return Ok(RestoreSource::Absent);
+        }
+        Err(e) => return Err(os("open restore record", &e)),
+    };
+    let id = win32::link_info(&h).map_err(|e| os("check restore record", &e))?;
+    if kind_of(id.attributes) != ChildKind::File
+        || id.links != 1
+        || id.size > RESTORE_MAX_BYTES
+        || !owner_ok(&h)?
+    {
+        return Ok(RestoreSource::Dropped);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::from(h)
+        .take(RESTORE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| os("read restore record", &e))?;
+    // The size can change between the check and the read.
+    if bytes.len() as u64 > RESTORE_MAX_BYTES {
+        return Ok(RestoreSource::Dropped);
+    }
+    Ok(RestoreSource::Carry { bytes, id })
+}
+
+/// Reads a file back without following a reparse point, at most one byte
+/// more than [`RESTORE_MAX_BYTES`].
+fn os_read_back(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let h = win32::open_no_follow(path, FILE_READ_DATA | FILE_READ_ATTRIBUTES)?;
+    let mut bytes = Vec::new();
+    std::fs::File::from(h)
+        .take(RESTORE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Writes `bytes` as `dir\restore.json` with `create_new` and the same
+/// no-follow flags as the drift store, syncs it, and checks `read_back`
+/// returns the same bytes. Removes the file it created if anything fails.
+fn write_restore(
+    dir: &Path,
+    bytes: &[u8],
+    read_back: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+) -> Result<(), AclError> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` and `SECURITY_IDENTIFICATION`, as in
+    /// the service's `safe_open`.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+    let p = dir.join(RESTORE_NAME);
+    let fail = |detail: String| AclError::RestoreCarryFailed { detail };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .open(&p)
+        // Not created, so nothing of ours to remove.
+        .map_err(|e| fail(e.to_string()))?;
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    drop(f);
+    let checked = written
+        .and_then(|()| read_back(&p))
+        .map_err(|e| e.to_string());
+    match checked {
+        Ok(back) if back == bytes => Ok(()),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&p);
+            Err(fail("read-back differs".into()))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&p);
+            Err(fail(e))
+        }
+    }
+}
+
+/// Deletes the carried original from the quarantine, best effort, only if
+/// the name there still holds the very file that was read.
+fn remove_carried_original(quarantine: &Path, id: &win32::LinkInfo) {
+    let Ok(h) = win32::open_no_follow(
+        &quarantine.join(RESTORE_NAME),
+        DELETE | FILE_READ_ATTRIBUTES,
+    ) else {
+        return;
+    };
+    if win32::link_info(&h).is_ok_and(|now| now.same_file(id)) {
+        let _ = win32::delete_by_handle(&h);
     }
 }
 
@@ -686,11 +894,28 @@ fn same_object(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
     }
 }
 
-/// The only names the drift store writes.
-const KNOWN_CHILDREN: [&str; 2] = ["drift.txt", "drift.txt.tmp"];
+/// Every name the service writes in the state directory, by owner:
+/// - `drift.txt`, `drift.txt.tmp`: drift store (Task 10). Not carried on
+///   quarantine. The drift is only a starting hint and is relearnt.
+/// - `restore.json`, `restore.json.tmp`: w32time takeover record (Task 12).
+///   Only `restore.json` is carried (R80). A `.tmp` is never carried.
+/// - `status.json`, `status.json.tmp`: status output (later task). Not
+///   carried. It is regenerated.
+pub const KNOWN_CHILDREN: [&str; 6] = [
+    "drift.txt",
+    "drift.txt.tmp",
+    "restore.json",
+    "restore.json.tmp",
+    "status.json",
+    "status.json.tmp",
+];
 
-/// Deletes `drift.txt` and `drift.txt.tmp` from a directory before it goes
-/// to quarantine.
+/// The one file carried into a fresh directory.
+const RESTORE_NAME: &str = "restore.json";
+
+/// Deletes the known files except `restore.json` from a directory before it
+/// goes to quarantine. `restore.json` stays: its bytes were read already and
+/// are carried, or it was dropped and stays in the quarantine.
 ///
 /// - Any other entry, or a known name that is a directory, a link of any
 ///   kind or has more than one hard link: `UnexpectedChild`, nothing deleted.
@@ -711,6 +936,9 @@ fn clean_known_children(dir: &OwnedHandle, path: &Path) -> Result<(), AclError> 
         if !known || entry.attributes & (ATTR_DIRECTORY | ATTR_REPARSE_POINT) != 0 {
             return Err(AclError::UnexpectedChild);
         }
+        if entry.name == RESTORE_NAME {
+            continue;
+        }
         let child = win32::open_no_follow(&path.join(&entry.name), DELETE | FILE_READ_ATTRIBUTES)
             .map_err(|e| os("open child", &e))?;
         let info = win32::link_info(&child).map_err(|e| os("check child", &e))?;
@@ -724,8 +952,13 @@ fn clean_known_children(dir: &OwnedHandle, path: &Path) -> Result<(), AclError> 
     }
     // The files go when their handles close.
     drop(doomed);
-    // Something created during the clean-up also refuses.
-    if !win32::list_dir(dir).map_err(|e| os("list", &e))?.is_empty() {
+    // Something created during the clean-up also refuses. Only the restore
+    // record may remain.
+    if win32::list_dir(dir)
+        .map_err(|e| os("list", &e))?
+        .iter()
+        .any(|e| e.name != RESTORE_NAME)
+    {
         return Err(AclError::UnexpectedChild);
     }
     Ok(())
@@ -873,6 +1106,9 @@ mod tests {
             AclError::NotFixedDrive,
             AclError::PathChanged,
             AclError::ReservedName,
+            AclError::RestoreCarryFailed {
+                detail: "read-back differs".into(),
+            },
             AclError::RollbackFailed {
                 cause: "a".into(),
                 rollback: "b".into(),
@@ -1451,8 +1687,17 @@ mod tests {
         let s = Scratch::new("elevatedfix");
         let dir = state_dir(&s);
         std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
+        std::fs::write(dir.join("restore.json"), b"{\"r\":1}").unwrap();
         let before = win32::link_info(&listing_handle(&dir)).unwrap();
-        secure_final(&dir).unwrap();
+        assert_eq!(
+            secure_final(&dir).unwrap().restore_record,
+            RestoreRecord::Kept
+        );
+        assert_eq!(
+            std::fs::read(dir.join("restore.json")).unwrap(),
+            b"{\"r\":1}"
+        );
+        std::fs::remove_file(dir.join("restore.json")).unwrap();
         let h = win32::open_no_follow(&dir, READ_CONTROL | FILE_READ_ATTRIBUTES).unwrap();
         let after = win32::link_info(&h).unwrap();
         assert!(!before.same_file(&after), "the old object was kept");
@@ -1486,10 +1731,210 @@ mod tests {
     fn obs(known: bool, kind: ChildKind, links: u32, owner_trusted: bool) -> ChildObs {
         ChildObs {
             known,
+            restore: false,
             kind,
             links,
             owner_trusted,
         }
+    }
+
+    fn restore_obs(kind: ChildKind, links: u32, owner_trusted: bool) -> ChildObs {
+        ChildObs {
+            restore: true,
+            ..obs(true, kind, links, owner_trusted)
+        }
+    }
+
+    #[test]
+    fn decision_table_for_the_restore_record() {
+        use ChildKind::{File, Link};
+        let drift = obs(true, File, 1, true);
+        let rows: Vec<(bool, Vec<ChildObs>, Decision)> = vec![
+            // Trusted restore record: kept like any known file.
+            (true, vec![restore_obs(File, 1, true)], Decision::Keep),
+            (
+                true,
+                vec![drift, restore_obs(File, 1, true)],
+                Decision::Keep,
+            ),
+            // User-owned: forces the quarantine path, where it is dropped.
+            (
+                true,
+                vec![restore_obs(File, 1, false)],
+                Decision::Quarantine,
+            ),
+            (
+                false,
+                vec![restore_obs(File, 1, false)],
+                Decision::Quarantine,
+            ),
+            // Wrong DACL with a trusted record: quarantine, record carried.
+            (
+                false,
+                vec![restore_obs(File, 1, true)],
+                Decision::Quarantine,
+            ),
+            // Hard-linked or a link: refuse, as for every known name.
+            (true, vec![restore_obs(File, 2, true)], Decision::Refuse),
+            (true, vec![restore_obs(Link, 0, true)], Decision::Refuse),
+            // Absent: only the other children count.
+            (true, vec![drift], Decision::Keep),
+        ];
+        // Size is not an input here. A trusted record of any size in a
+        // secure directory is kept: only trusted principals can write there,
+        // and content checks belong to the reader. Size limits the carry
+        // only (`read_restore_drops_an_oversized_record`).
+        for (dacl, children, want) in rows {
+            assert_eq!(decide(dacl, &children), want, "{dacl} {children:?}");
+        }
+    }
+
+    // The signature must match the owner predicate, so the `Result` stays.
+    #[allow(clippy::unnecessary_wraps)]
+    fn yes(_: &OwnedHandle) -> Result<bool, AclError> {
+        Ok(true)
+    }
+
+    // The signature must match the owner predicate, so the `Result` stays.
+    #[allow(clippy::unnecessary_wraps)]
+    fn no(_: &OwnedHandle) -> Result<bool, AclError> {
+        Ok(false)
+    }
+
+    #[test]
+    fn read_restore_absent() {
+        let s = Scratch::new("rrabsent");
+        let dir = state_dir(&s);
+        assert!(matches!(
+            read_restore(&dir, &yes).unwrap(),
+            RestoreSource::Absent
+        ));
+    }
+
+    #[test]
+    fn read_restore_carries_a_trusted_record() {
+        let s = Scratch::new("rrtrusted");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("restore.json"), b"{\"start\":\"auto\"}").unwrap();
+        match read_restore(&dir, &yes).unwrap() {
+            RestoreSource::Carry { bytes, id } => {
+                assert_eq!(bytes, b"{\"start\":\"auto\"}");
+                assert_eq!(id.links, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_restore_drops_an_untrusted_record_and_leaves_it() {
+        let s = Scratch::new("rruntrusted");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("restore.json"), b"x").unwrap();
+        assert!(matches!(
+            read_restore(&dir, &no).unwrap(),
+            RestoreSource::Dropped
+        ));
+        assert!(dir.join("restore.json").exists());
+        // With the real owner check a user-owned record drops too.
+        if !elevated() {
+            assert!(matches!(
+                read_restore(&dir, &os_child_owner_trusted).unwrap(),
+                RestoreSource::Dropped
+            ));
+        }
+    }
+
+    #[test]
+    fn read_restore_drops_an_oversized_record() {
+        let s = Scratch::new("rrbig");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("restore.json"), vec![b'a'; 4097]).unwrap();
+        assert!(matches!(
+            read_restore(&dir, &yes).unwrap(),
+            RestoreSource::Dropped
+        ));
+        std::fs::write(dir.join("restore.json"), vec![b'a'; 4096]).unwrap();
+        assert!(matches!(
+            read_restore(&dir, &yes).unwrap(),
+            RestoreSource::Carry { .. }
+        ));
+    }
+
+    #[test]
+    fn read_restore_drops_a_hard_linked_record() {
+        let s = Scratch::new("rrhard");
+        let dir = state_dir(&s);
+        let outside = s.0.join("outside.json");
+        std::fs::write(&outside, b"x").unwrap();
+        std::fs::hard_link(&outside, dir.join("restore.json")).unwrap();
+        assert!(matches!(
+            read_restore(&dir, &yes).unwrap(),
+            RestoreSource::Dropped
+        ));
+    }
+
+    #[test]
+    fn write_restore_writes_and_verifies() {
+        let s = Scratch::new("wrok");
+        let dir = state_dir(&s);
+        write_restore(&dir, b"{}", &os_read_back).unwrap();
+        assert_eq!(std::fs::read(dir.join("restore.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn write_restore_read_back_failure_removes_the_file() {
+        let s = Scratch::new("wrbad");
+        let dir = state_dir(&s);
+        let differs = |_: &Path| Ok(b"tampered".to_vec());
+        assert!(matches!(
+            write_restore(&dir, b"{}", &differs),
+            Err(AclError::RestoreCarryFailed { .. })
+        ));
+        assert!(!dir.join("restore.json").exists());
+        let fails = |_: &Path| -> io::Result<Vec<u8>> { Err(io::Error::from_raw_os_error(5)) };
+        assert!(write_restore(&dir, b"{}", &fails).is_err());
+        assert!(!dir.join("restore.json").exists());
+    }
+
+    #[test]
+    fn write_restore_never_overwrites() {
+        let s = Scratch::new("wrexists");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("restore.json"), b"old").unwrap();
+        assert!(matches!(
+            write_restore(&dir, b"new", &os_read_back),
+            Err(AclError::RestoreCarryFailed { .. })
+        ));
+        assert_eq!(std::fs::read(dir.join("restore.json")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn clean_keeps_the_restore_record_and_removes_the_rest() {
+        let s = Scratch::new("cleanrestore");
+        let dir = state_dir(&s);
+        for n in KNOWN_CHILDREN {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let h = listing_handle(&dir);
+        assert_eq!(clean_known_children(&h, &dir), Ok(()));
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["restore.json".to_string()]);
+    }
+
+    #[test]
+    fn all_six_known_names_are_recognised() {
+        let s = Scratch::new("knownsix");
+        let dir = state_dir(&s);
+        for n in KNOWN_CHILDREN {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let c = inspect(&dir);
+        assert_eq!(c.len(), 6);
+        assert!(c.iter().all(|o| o.known && o.kind == ChildKind::File));
+        assert_eq!(c.iter().filter(|o| o.restore).count(), 1);
     }
 
     #[test]
@@ -1713,6 +2158,7 @@ mod tests {
         let s = Scratch::new("qrollback");
         let dir = state_dir(&s);
         std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
+        std::fs::write(dir.join("restore.json"), b"{\"keep\":1}").unwrap();
         let before = win32::link_info(&listing_handle(&dir)).unwrap();
         let h = rename_handle(&dir);
         assert_eq!(
@@ -1723,6 +2169,12 @@ mod tests {
         let back = win32::link_info(&listing_handle(&dir)).unwrap();
         assert!(before.same_file(&back), "old directory not restored");
         assert!(!dir.join("drift.txt").exists(), "known file cleaned first");
+        // The restore record is never deleted by the clean-up and comes back
+        // with the old directory.
+        assert_eq!(
+            std::fs::read(dir.join("restore.json")).unwrap(),
+            b"{\"keep\":1}"
+        );
         assert_eq!(quarantine_leftovers(&s.0), Vec::<String>::new());
     }
 
