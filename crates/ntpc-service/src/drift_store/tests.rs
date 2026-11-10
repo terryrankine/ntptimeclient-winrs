@@ -157,7 +157,18 @@ fn huge_file_is_not_read_into_memory() {
 fn save_then_load_round_trips() {
     let d = TempDir::new("rt");
     let s = d.store();
-    for v in [0.0, 12.345_678_9, -499.999, 500.0, -500.0, 1e-9, 0.1 + 0.2] {
+    for v in [
+        0.0,
+        12.345_678_9,
+        -499.999,
+        500.0,
+        -500.0,
+        1e-9,
+        0.1 + 0.2,
+        5e-324,
+        -5e-324,
+        f64::MIN_POSITIVE,
+    ] {
         s.save(Ppm::new(v)).expect("save");
         let got = s.load().expect("load").value();
         assert!(got.to_bits() == v.to_bits(), "{v} came back as {got}");
@@ -319,4 +330,77 @@ fn works_through_the_trait_object() {
     let dynamic: &dyn DriftStore = &s;
     dynamic.save(Ppm::new(2.5)).expect("save");
     assert_eq!(dynamic.load().map(Ppm::value), Some(2.5));
+}
+
+#[test]
+fn tiny_values_stay_under_the_read_limit() {
+    let d = TempDir::new("tiny");
+    let s = d.store();
+    s.save(Ppm::new(5e-324)).expect("save");
+    let len = fs::metadata(s.path()).expect("meta").len();
+    assert!(len <= MAX_FILE_BYTES, "{len} bytes");
+    assert_eq!(s.load().map(Ppm::value), Some(5e-324));
+}
+
+#[test]
+fn temp_that_is_a_directory_gives_an_error_not_a_panic() {
+    let d = TempDir::new("tmpdir");
+    let s = d.store();
+    fs::create_dir(s.temp_path()).expect("dir");
+    fs::write(s.temp_path().join("x"), b"x").expect("file in it");
+    let StoreError::Io(m) = s.save(Ppm::new(1.0)).expect_err("must fail");
+    assert!(m.contains("temp"), "{m}");
+    assert_eq!(s.load(), None, "nothing was written over the target");
+}
+
+/// Windows only: a share mode of 0 makes a delete fail while the handle is open.
+#[cfg(windows)]
+#[test]
+fn temp_that_cannot_be_removed_gives_an_error_not_a_panic() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let d = TempDir::new("tmplock");
+    let s = d.store();
+    s.save(Ppm::new(3.0)).expect("first save");
+    let held = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0)
+        .open(s.temp_path())
+        .expect("lock the temp file");
+    let StoreError::Io(m) = s.save(Ppm::new(9.0)).expect_err("must fail");
+    assert!(m.contains("temp"), "{m}");
+    drop(held);
+    assert_eq!(s.load().map(Ppm::value), Some(3.0), "old value kept");
+    s.save(Ppm::new(9.0)).expect("works once the lock is gone");
+}
+
+#[test]
+fn a_read_only_leftover_temp_never_panics() {
+    let d = TempDir::new("tmpro");
+    let s = d.store();
+    fs::write(s.temp_path(), b"old").expect("temp");
+    let mut perm = fs::metadata(s.temp_path()).expect("meta").permissions();
+    perm.set_readonly(true);
+    fs::set_permissions(s.temp_path(), perm).expect("read-only");
+    // Rust clears the attribute on delete on Windows, so this usually works.
+    // Either result is fine. A panic is not.
+    if s.save(Ppm::new(1.0)).is_ok() {
+        assert_eq!(s.load().map(Ppm::value), Some(1.0));
+    }
+    if let Ok(meta) = fs::metadata(s.temp_path()) {
+        let mut perm = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        let _ = fs::set_permissions(s.temp_path(), perm);
+    }
+}
+
+#[test]
+fn save_error_keeps_the_os_error_text() {
+    let d = TempDir::new("oserr");
+    let s = d.store();
+    fs::create_dir(s.temp_path()).expect("dir");
+    let StoreError::Io(m) = s.save(Ppm::new(1.0)).expect_err("must fail");
+    assert!(m.contains("os error"), "{m}");
 }
