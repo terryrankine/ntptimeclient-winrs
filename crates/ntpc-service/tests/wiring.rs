@@ -755,9 +755,9 @@ fn panicking_dhcp_reads_are_reported_and_the_reader_stops() {
     rig.dhcp.panics.store(true, Ordering::SeqCst);
     rig.network_at = vec![700.0, 1400.0, 2100.0, 2800.0];
     rig.run(HOUR);
-    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (1 of 3)"));
-    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (3 of 3)"));
-    assert!(rig.log_has("the DHCP reader stopped"));
+    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (1 in 10 min"));
+    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (3 in 10 min"));
+    assert!(rig.log_has("the DHCP reader stopped. A fresh reader starts in 4 h"));
     assert_eq!(
         read_times(&rig).len(),
         3,
@@ -900,4 +900,52 @@ fn queries_that_cannot_start_answer_after_the_batch() {
     assert!(r.counters.unreachable >= 4, "{:?}", r.counters);
     assert_eq!(r.counters.samples, 0);
     assert!(clock_cmds(&rig).iter().all(|c| matches!(c.1, Cmd::Freq(_))));
+}
+
+#[test]
+fn a_stopped_dhcp_reader_is_restarted_after_the_re_read_interval() {
+    // R103: three panics stop the reader. After 4 h a fresh one starts.
+    let mut rig = dhcp_rig();
+    rig.dhcp.panics.store(true, Ordering::SeqCst);
+    rig.network_at = vec![700.0, 1400.0, 2100.0];
+    rig.run(5 * HOUR);
+    assert!(rig.log_has("starting a fresh DHCP reader"));
+    let t = read_times(&rig);
+    assert_eq!(t.len(), 4, "{t:?}");
+    assert!(t[3] >= 2100.0 + 4.0 * 3600.0, "{t:?}");
+}
+
+#[test]
+fn escape_covers_the_remaining_format_characters_and_hangul_fillers() {
+    // M7.
+    for c in [
+        '\u{0600}',
+        '\u{0605}',
+        '\u{06DD}',
+        '\u{070F}',
+        '\u{08E2}',
+        '\u{110BD}',
+        '\u{110CD}',
+        '\u{1D173}',
+        '\u{1D17A}',
+        '\u{115F}',
+        '\u{1160}',
+        '\u{3164}',
+        '\u{FFA0}',
+    ] {
+        let e = escape(&format!("a{c}b"));
+        assert_eq!(e, format!("a\\u{{{:04X}}}b", u32::from(c)), "{c:?}");
+    }
+    // Ordinary text of many scripts stays as it is.
+    for text in [
+        "Zürich Ångström façade",
+        "Ελληνικά",
+        "Кириллица",
+        "漢字かなカナ",
+        "한국어 서버",
+        "emoji 😀 🕒",
+        "עברית العربية",
+    ] {
+        assert_eq!(escape(text), text);
+    }
 }

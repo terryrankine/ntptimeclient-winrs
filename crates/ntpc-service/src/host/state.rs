@@ -9,13 +9,14 @@ use std::time::Duration;
 use ntpc_core::engine::{Action, Engine, Event};
 use ntpc_core::{Mono, Offset, Ppm, QueryFailure, SourceId, SourceSpec, Tier};
 
-use super::dhcp::DhcpSchedule;
+use super::dhcp::{DHCP_REREAD, DhcpSchedule};
 use super::inflight::InFlight;
 use super::startup::{load_drift, log_start, secure_state_dir, start_dhcp_reader};
 use super::{
-    AdapterKey, ClockControl, DriftFile, HostDeps, HostResolver, Inbox, Inner, LEVEL_PERIOD, Msg,
-    NetworkEvents, PowerEvents, QUERY_TIMEOUT, QUERY_WATCHDOG, REARM_FIRST, REARM_MAX,
-    RESOLVE_GIVE_UP, STATUS_PERIOD, ServiceMonitor, SharedLookup, SharedOwn, Spawn, Waiter,
+    AdapterKey, ClockControl, DhcpSource, DriftFile, HostDeps, HostResolver, Inbox, Inner,
+    LEVEL_PERIOD, Msg, NetworkEvents, PowerEvents, QUERY_TIMEOUT, QUERY_WATCHDOG, REARM_FIRST,
+    REARM_MAX, RESOLVE_GIVE_UP, STATUS_PERIOD, ServiceMonitor, SharedLookup, SharedOwn, Spawn,
+    Waiter,
 };
 use crate::config::Config;
 use crate::logging::{Level, Logger, engine_event};
@@ -56,8 +57,11 @@ fn later(at: Mono, by: Duration) -> Mono {
 }
 
 struct DhcpReader {
-    requests: Sender<BTreeSet<AdapterKey>>,
+    /// `None` after the reader thread stopped, until `respawn_at`.
+    requests: Option<Sender<BTreeSet<AdapterKey>>>,
     schedule: DhcpSchedule,
+    source: Arc<dyn DhcpSource>,
+    respawn_at: Option<Mono>,
 }
 
 #[expect(
@@ -158,9 +162,11 @@ impl Host {
         let engine = Engine::new(cfg.engine_config(), loaded);
 
         let dhcp_reader = if cfg.dhcp {
-            start_dhcp_reader(dhcp, tx.clone(), &*logger).map(|requests| DhcpReader {
-                requests,
+            start_dhcp_reader(Arc::clone(&dhcp), tx.clone(), &*logger).map(|requests| DhcpReader {
+                requests: Some(requests),
                 schedule: DhcpSchedule::new(now),
+                source: dhcp,
+                respawn_at: None,
             })
         } else {
             None
@@ -295,7 +301,13 @@ impl Host {
             self.resolving_since
                 .and_then(|t| t.checked_add(RESOLVE_GIVE_UP)),
         );
-        d.push(self.dhcp.as_ref().and_then(|r| r.schedule.due_at()));
+        d.push(self.dhcp.as_ref().and_then(|r| {
+            if r.requests.is_some() {
+                r.schedule.due_at()
+            } else {
+                r.respawn_at
+            }
+        }));
         let next = d
             .into_iter()
             .flatten()
@@ -615,17 +627,44 @@ impl Host {
         let Some(d) = self.dhcp.as_mut() else {
             return;
         };
+        if d.requests.is_none() {
+            if d.respawn_at.is_some_and(|t| now < t) {
+                return;
+            }
+            let Some(requests) =
+                start_dhcp_reader(Arc::clone(&d.source), self.tx.clone(), &*self.logger)
+            else {
+                d.respawn_at = Some(later(now, DHCP_REREAD));
+                return;
+            };
+            d.requests = Some(requests);
+            d.respawn_at = None;
+            self.logger
+                .log(Level::Info, "dhcp", "starting a fresh DHCP reader");
+        }
+        let Some(d) = self.dhcp.as_mut() else {
+            return;
+        };
         if d.schedule.due_at().is_none_or(|t| t > now) {
             return;
         }
         let skip = d.schedule.start(now);
-        if d.requests.send(skip).is_err() {
-            // The reader thread is gone. No more DHCP for this run.
-            self.dhcp = None;
+        let sent = d.requests.as_ref().is_some_and(|r| r.send(skip).is_ok());
+        if !sent {
+            // The reader thread stopped after repeated panics. The read
+            // never ran, so it ends here, and a fresh reader starts after
+            // the re-read interval.
+            d.requests = None;
+            d.respawn_at = Some(later(now, DHCP_REREAD));
+            d.schedule
+                .finish(&Err(super::DhcpReadError("reader stopped".into())));
             self.log(
                 Level::Error,
                 "dhcp",
-                "the DHCP reader stopped. DHCP servers are no longer read",
+                &format!(
+                    "the DHCP reader stopped. A fresh reader starts in {} h",
+                    DHCP_REREAD.as_secs() / 3600
+                ),
             );
         }
     }
