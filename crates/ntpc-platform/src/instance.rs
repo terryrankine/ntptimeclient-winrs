@@ -31,6 +31,18 @@ pub enum Found {
     Failed(i32),
 }
 
+/// How an existing mutex counts, by its owner. Only SYSTEM or
+/// Administrators make it another instance. `TrustedInstaller` and anyone
+/// else do not: our own instances never run as them.
+#[must_use]
+pub const fn found_for_owner(system_or_admins: bool) -> Found {
+    if system_or_admins {
+        Found::ExistedTrusted
+    } else {
+        Found::ExistedUntrusted
+    }
+}
+
 /// The decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -97,10 +109,13 @@ fn acquire_named(name: &str) -> Result<(InstanceGuard, Option<String>), OtherIns
     use crate::win32::mutex::{Opened, open};
     let (found, handle) = match open(name) {
         Ok(Opened::Created(m)) => (Found::Created, Some(m)),
-        Ok(Opened::Existed(m, Principal::System | Principal::Administrators)) => {
-            (Found::ExistedTrusted, Some(m))
-        }
-        Ok(Opened::Existed(m, _)) => (Found::ExistedUntrusted, Some(m)),
+        Ok(Opened::Existed(m, owner)) => (
+            found_for_owner(matches!(
+                owner,
+                Principal::System | Principal::Administrators
+            )),
+            Some(m),
+        ),
         Err(e) if e.raw_os_error() == Some(5) => (Found::Denied, None),
         Err(e) => (Found::Failed(e.raw_os_error().unwrap_or(-1)), None),
     };
@@ -126,6 +141,19 @@ mod tests {
         ));
         assert!(matches!(decide(Found::Denied), Decision::Unguarded(_)));
         assert!(matches!(decide(Found::Failed(6)), Decision::Unguarded(_)));
+    }
+
+    #[test]
+    fn a_user_owned_existing_mutex_is_not_another_instance() {
+        assert_eq!(
+            decide(found_for_owner(false)),
+            decide(Found::ExistedUntrusted)
+        );
+        assert!(matches!(
+            decide(found_for_owner(false)),
+            Decision::Unguarded(_)
+        ));
+        assert_eq!(decide(found_for_owner(true)), Decision::OtherInstance);
     }
 
     #[test]

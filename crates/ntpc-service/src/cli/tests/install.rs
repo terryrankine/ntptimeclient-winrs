@@ -510,6 +510,35 @@ fn a_failed_start_puts_w32time_back_and_keeps_the_registration() {
     let t = w.host.text();
     assert!(t.contains("service exit code 8"), "{t}");
     assert!(t.contains("w32time was put back"), "{t}");
+    // R112: parked, so no restart loop and no adjustment.
+    assert!(w.reg.parked);
+    assert!(t.contains("manual start"), "{t}");
+}
+
+#[test]
+fn a_failed_start_with_a_disabled_original_says_it_stays_disabled() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    w.reg.start_error = Some("stopped".to_owned());
+    assert_eq!(w.install(ACCEPT_DISABLED), exit::START_FAILED);
+    let t = w.host.text();
+    assert!(t.contains("stays disabled"), "{t}");
+    assert!(!t.contains("keeps time sync"), "{t}");
+}
+
+#[test]
+fn a_successful_install_is_not_parked() {
+    let mut w = World::new(JoinState::Workgroup);
+    assert_eq!(w.install(SILENT), exit::OK);
+    assert!(!w.reg.parked);
+}
+
+#[test]
+fn a_non_elevated_prompt_gets_exit_3_before_any_readiness_check() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.host.elevated = Ok(false);
+    w.reg.bad_owner = true;
+    assert_eq!(w.install(SILENT), exit::NOT_ELEVATED);
 }
 
 #[test]

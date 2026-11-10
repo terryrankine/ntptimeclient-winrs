@@ -332,7 +332,7 @@ Each line names its source. "Learn" means the linked Microsoft Learn page. "Meas
 - `dwCheckPoint` counts up during a pending state and "should be zero" otherwise. Before `dwWaitHint` passes the service must bump the checkpoint or change state (Learn). Ours bumps about once a second while stopping, for at most the stop budget, so a hung host cannot fake progress for ever.
 - A service-specific code needs `dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR` (1066) and the code in `dwServiceSpecificExitCode` (Learn). A non-zero stop is logged by the SCM as event 7023 (Learn, `SetServiceStatus`).
 - `SERVICE_STOPPED` is sent "one time only". "Subsequent calls can cause the process to crash", and no work may follow it (Learn). The reporter refuses a second `STOPPED` and any backwards step. The Event Log is drained (2 s at most) before it.
-- Timing: start hint 30 s, stop hint 20 s, stop budget 15 s, poll 1 s. Learn gives "about 20 seconds" at system shutdown and 125 s from the Services snap-in. The budget plus one poll stays under the stop hint (tested). When the budget runs out the wrapper reports `STOPPED` with code 4 and the process ends. The next start resets the clock rate (R71).
+- Timing: start hint 30 s, stop hint 20 s, stop budget 15 s, poll 1 s. A requested stop that runs out of the budget ends with code 0 and an Event Log line saying the clock rate may stay adjusted until the next start or reboot (M2, D5). Learn gives "about 20 seconds" at system shutdown and 125 s from the Services snap-in. The budget plus one poll stays under the stop hint (tested). When the budget runs out the wrapper reports `STOPPED` with code 4 and the process ends. The next start resets the clock rate (R71).
 
 ### Control handler
 
@@ -352,7 +352,7 @@ Each line names its source. "Learn" means the linked Microsoft Learn page. "Meas
 - A failure after the create (a `ChangeServiceConfig2W` step or the Event Log source) deletes the service this run created and reports both errors. A service that existed before the run is left registered. Install then puts `w32time` back (exit 19, existing Task 12 path).
 - `DeleteService` "marks a service for deletion". The entry goes once every handle is closed and the service is not running (Learn). `ERROR_SERVICE_MARKED_FOR_DELETE` on uninstall counts as removed. On install it refuses with advice to close the Services window or reboot.
 - Stop of our own service: `ControlService(STOP)` through the Task 12 wrapper, then polls every 250 ms for at most 30 s.
-- Install starts our service after registering (exit 21 when that fails, the install is kept and the text names `sc.exe start ntptimeclient-winrs`). Uninstall starts it again when it stopped it and `w32time` could not be put back (R94 concern).
+- Install starts our service after registering and waits for `RUNNING`, then a 3 s soak (R109, R113). If it stops or never runs: exit 21, `w32time` put back (the text says the recorded start type, and that a disabled original stays disabled), our service set to manual start with no failure actions (R112), registration kept. A new install sets automatic delayed start and the failure actions again. Uninstall starts it again when it stopped it and `w32time` could not be put back (R94 concern).
 
 ### Account and privileges (R104)
 
@@ -488,3 +488,12 @@ Service-specific exit codes (`dwServiceSpecificExitCode`, with `dwWin32ExitCode`
 - M9: an exe with more than one hard link is refused (the location rule above).
 - M10: install refuses (exit 33) when the token's default owner is not SYSTEM or Administrators (`default_owner_is_trusted`), because the state directory and the record it creates would not be trusted later.
 - M11: the VM tests read back `QueryServiceConfigW` and `QueryServiceConfig2W` (account, quoted path, start type, privileges, SID type, failure actions). Written, not run.
+
+### Fix round 2
+
+- R112: after exit 21 the service is parked: `SERVICE_DEMAND_START` and no failure actions. Learn (`SERVICE_FAILURE_ACTIONSW`): "If this value is 0, but lpsaActions is not NULL, the reset period and array of failure actions are deleted." A new install rewrites both.
+- R113: install waits a 3 s soak after the first `RUNNING`. A stop within it is exit 21. Uninstall with a foreign service of our name restores `w32time` from the record, leaves the foreign service alone, and reports 31 after the restore (10 and 18 rank above it).
+- m1: any sub folder in the exe folder is refused. The release zip has none, and the exe has no manifest, so a `<exe>.local` folder could redirect DLL loads.
+- m2: a file next to the exe is named by its bare name. Reasons are deduplicated and end with generic advice (extract from an elevated prompt, or `takeown /a` and `icacls`).
+- m6: install checks elevation before readiness. m7: exit 33 names UAC and the policy "System objects: Default owner for objects created by members of the Administrators group". m8: `run --config` is resolved before the check.
+- The preflight is a pure function, `service::preflight_then_config`, so a test proves a bad location never reads the config.

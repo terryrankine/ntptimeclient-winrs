@@ -21,15 +21,27 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
     if let Some(code) = require_elevated(d.host, "Uninstall") {
         return code;
     }
-    if let Err(e) = d.reg.check_ours() {
-        d.host
-            .say(&format!("Uninstall refused, nothing changed: {e}."));
-        return exit::FOREIGN_SERVICE;
-    }
     let mut codes = Vec::new();
     let mut stopped_ours = false;
+    // R113: a foreign service of our name is left alone, but w32time is
+    // still restored from the record. Exit 31 is reported after that.
+    let foreign = match d.reg.check_ours() {
+        Ok(()) => false,
+        Err(e) => {
+            d.host.say(&format!(
+                "{e}. It is not stopped or removed. w32time is still restored."
+            ));
+            codes.push(exit::FOREIGN_SERVICE);
+            true
+        }
+    };
 
-    match d.reg.stop_service() {
+    let stopped = if foreign {
+        Ok(OwnService::Absent)
+    } else {
+        d.reg.stop_service()
+    };
+    match stopped {
         Ok(OwnService::Present) => {
             stopped_ours = true;
             d.host.say("Service stopped.");
@@ -48,7 +60,9 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
 
     let w32time_not_back =
         codes.contains(&exit::RESTORE) || codes.contains(&exit::NO_RECORD_DISABLED);
-    if w32time_not_back {
+    if foreign {
+        // Nothing of ours to start again or remove.
+    } else if w32time_not_back {
         d.host.say(
             "w32time was not put back, so the service registration is kept. Put w32time back \
              by hand, then run uninstall again.",
@@ -76,6 +90,7 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
         exit::RECORD_NOT_TRUSTED,
         exit::RECORD_INVALID,
         exit::STATE_DIR,
+        exit::FOREIGN_SERVICE,
         exit::UNREGISTER,
     ]
     .into_iter()
@@ -174,7 +189,7 @@ fn restore_step(d: &mut Deps<'_>, codes: &mut Vec<u8>) {
             Err(e) => {
                 d.host.say(&format!(
                     "Restoring w32time failed: {e}. The restore record is kept. Run uninstall \
-                     again."
+                     again. {MANUAL_RESTORE}"
                 ));
                 codes.push(exit::RESTORE);
             }

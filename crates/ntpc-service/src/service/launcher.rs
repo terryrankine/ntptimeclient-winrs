@@ -4,12 +4,12 @@
 //! `windows_deps(&cfg, sinks)`, which returns the host deps, the inbox, the
 //! host control and the resume notifier. This launcher takes one function
 //! that does the whole run on the calling thread (build, hand over, run),
-//! so this crate does not name 14c-A's types. Until it is wired in,
-//! [`DepsLauncher::pending`] says the host is not built: `run` and
-//! `service` stop with a clear code, and `install` refuses (exit 9), so no
-//! machine loses `w32time` to a service that cannot run.
+//! so this module does not name 14c-A's types. `app/real.rs` wires it in.
+//! [`DepsLauncher::pending`] stays for tests and for a build without the
+//! adapters: `run` and `service` then stop with a clear code and `install`
+//! refuses (exit 9).
 //!
-//! The function the merge wires in, in outline:
+//! The function `app/real.rs` passes, in outline:
 //!
 //! ```text
 //! |cfg, sinks, started| {

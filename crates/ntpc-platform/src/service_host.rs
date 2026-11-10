@@ -6,8 +6,8 @@
 pub use crate::win32::service::{
     ControlFn, EventSource, RawExtras, RawServiceSpec, RawStatus, RestartAfter, StatusHandle,
     configure_service, create_service, delete_hklm_key, delete_service, hklm_key_exists,
-    register_handler, run_dispatcher, set_console_handler, set_status, update_service,
-    write_event_source,
+    park_service, register_handler, run_dispatcher, set_console_handler, set_status,
+    update_service, write_event_source,
 };
 
 pub use crate::win32::service_query::{

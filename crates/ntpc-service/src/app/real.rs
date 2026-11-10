@@ -15,18 +15,14 @@ use crate::event_log::{DiscardSink, EventLogSink, RealEventApi, RealRegistry};
 use crate::logging::{ConsoleSink, LineLogger, LogSink, Logger};
 use crate::registration::{ExeLocator, RealExeLocator, RealScm, SERVICE_NAME, ScmRegistration};
 use crate::service::{
-    DepsLauncher, JobError, Launcher, Preflight, ServiceRun, Started, real::service_main,
+    DepsLauncher, JobError, Launcher, ServiceRun, Started, preflight_then_config,
+    real::service_main,
 };
 use crate::transport::StdTimeSource;
 use crate::winimpl::{ResumeNotifier, WinDepsError, windows_deps};
 
-/// The host launcher.
-///
-/// MERGE (Task 14c-A): replace the body with `DepsLauncher::new(...)` over
-/// `windows_deps(cfg, sinks)` and `host::run`. The outline is in
-/// `service/launcher.rs`. `windows_deps` is called once per process.
-/// Until then `install` refuses (exit 9) and `run` and `service` stop
-/// with "host not built".
+/// The host launcher: 14c-A's `windows_deps(cfg, sinks)` and `host::run`
+/// on one thread. `windows_deps` is called once per process.
 fn launcher() -> DepsLauncher {
     DepsLauncher::new(Arc::new(|cfg, sinks, started| {
         // 14c-A takes boxed sinks. Each shared sink goes in through the
@@ -201,6 +197,12 @@ fn run_config(config: Option<PathBuf>, err: &mut dyn Write) -> Result<Config, u8
             return Err(exit::CONFIG);
         }
     };
+    // m8: resolve first, so a relative --config is checked where it really
+    // is, links and short names included.
+    let path = match std::fs::canonicalize(&path) {
+        Ok(p) => crate::registration::strip_verbatim(&p),
+        Err(_) => std::path::absolute(&path).unwrap_or(path),
+    };
     let reasons = ntpc_platform::install_location::check_config_location(&path);
     if !reasons.is_empty() {
         let _ = writeln!(
@@ -289,7 +291,7 @@ fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
             exit::CONFIG
         }
         Err(e) => {
-            let _ = writeln!(err, "The host ended with an error: {e:?}");
+            let _ = writeln!(err, "The host ended with an error: {e}");
             exit::RUN_FAILED
         }
     }
@@ -309,20 +311,14 @@ fn service(err: &mut dyn Write) -> u8 {
             Ok((g, why)) => (Some(g), why),
             Err(_) => (None, None),
         };
-        let preflight = if !reasons.is_empty() {
-            Err(Preflight::UnsafeLocation(reasons))
-        } else if instance.is_none() {
-            Err(Preflight::OtherInstance)
-        } else {
-            Ok(())
-        };
-        let config = match (&preflight, exe) {
-            (Ok(()), Ok(p)) => match p.parent() {
-                Some(d) => load_config(&default_config_path(d)),
-                None => Err("the running exe has no folder".to_owned()),
-            },
-            _ => Err("not read: the start checks failed".to_owned()),
-        };
+        let (preflight, config) =
+            preflight_then_config(reasons, instance.is_none(), || match exe {
+                Ok(p) => match p.parent() {
+                    Some(d) => load_config(&default_config_path(d)),
+                    None => Err("the running exe has no folder".to_owned()),
+                },
+                Err(e) => Err(e),
+            });
         let event_sink = RealEventApi::open()
             .and_then(|api| EventLogSink::start(Box::new(api)))
             .ok()

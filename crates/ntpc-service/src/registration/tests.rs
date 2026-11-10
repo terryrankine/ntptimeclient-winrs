@@ -47,6 +47,12 @@ struct FakeScm {
     /// After a start: stays start pending for ever.
     start_hangs: bool,
     starting: bool,
+    /// After a start: Running for this many status reads, then Stopped.
+    dies_after_reads: Option<u32>,
+    reads: std::cell::Cell<u32>,
+    parked: bool,
+    /// A stop was sent and is still lagging.
+    stopping: bool,
 }
 
 impl FakeScm {
@@ -68,6 +74,10 @@ impl FakeScm {
             dies_after_start: None,
             start_hangs: false,
             starting: false,
+            dies_after_reads: None,
+            reads: std::cell::Cell::new(0),
+            parked: false,
+            stopping: false,
         }
     }
     fn push(&self, c: Call) {
@@ -117,6 +127,18 @@ impl ScmApi for FakeScm {
         if self.starting {
             return Ok(SvcStatus::of(RunState::Starting));
         }
+        if let Some(n) = self.dies_after_reads
+            && self.running
+        {
+            self.reads.set(self.reads.get() + 1);
+            if self.reads.get() > n {
+                return Ok(SvcStatus {
+                    state: RunState::Stopped,
+                    win32_exit: 1066,
+                    specific_exit: 10,
+                });
+            }
+        }
         if self.running {
             return Ok(SvcStatus::of(RunState::Running));
         }
@@ -126,6 +148,10 @@ impl ScmApi for FakeScm {
             win32_exit: w,
             specific_exit: sp,
         })
+    }
+    fn park(&mut self, _name: &str) -> Result<(), (&'static str, ScmError)> {
+        self.parked = true;
+        Ok(())
     }
     fn image_path(&self, _name: &str) -> Result<Option<String>, ScmError> {
         if !self.exists {
@@ -144,6 +170,8 @@ impl ScmApi for FakeScm {
         }
         if self.stop_lag == 0 {
             self.running = false;
+        } else {
+            self.stopping = true;
         }
         Ok(())
     }
@@ -164,7 +192,7 @@ impl ScmApi for FakeScm {
     }
     fn pause(&mut self, _d: Duration) {
         self.pauses += 1;
-        if self.stop_lag != u32::MAX {
+        if self.stopping && self.stop_lag != u32::MAX {
             self.stop_lag = self.stop_lag.saturating_sub(1);
             if self.stop_lag == 0 {
                 self.running = false;
@@ -270,7 +298,8 @@ impl World {
     fn with<T>(&mut self, f: impl FnOnce(&mut ScmRegistration<'_>) -> T) -> T {
         let mut r =
             ScmRegistration::new(&mut self.scm, &mut self.reg, &self.loc, self.host.clone())
-                .with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
+                .with_timeouts(Duration::from_secs(2), Duration::from_secs(2))
+                .with_soak(Duration::from_secs(2));
         f(&mut r)
     }
     fn calls(&self) -> Vec<Call> {
@@ -742,4 +771,54 @@ fn a_percent_in_the_exe_path_is_refused() {
         quote_image_path(Path::new(r"C:\%TEMP%\a.exe")),
         Err(QuoteError::BadCharacter)
     );
+}
+
+// ---- R113 soak, R112 park ----
+
+#[test]
+fn start_soaks_after_the_first_running() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    assert_eq!(w.with(|r| r.start_service()), Ok(()));
+    // The 2 s test soak at 250 ms polls is at least 8 pauses.
+    assert!(w.scm.pauses >= 8, "{}", w.scm.pauses);
+}
+
+#[test]
+fn a_stop_within_the_soak_is_a_failure() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.scm.dies_after_reads = Some(2);
+    let e = w.with(|r| r.start_service()).unwrap_err();
+    assert!(e.contains("service exit code 10"), "{e}");
+}
+
+#[test]
+fn park_goes_through_the_scm() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    assert_eq!(w.with(|r| r.park()), Ok(()));
+    assert!(w.scm.parked);
+}
+
+#[test]
+fn reinstall_after_a_park_sets_auto_start_and_failure_actions_again() {
+    let mut w = World::new();
+    w.scm.exists = true;
+    w.scm.parked = true;
+    w.with(|r| r.register()).unwrap();
+    let specs: Vec<ServiceSpec> = w
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Update(s) | Call::Configure(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(specs.len(), 2);
+    for s in specs {
+        assert_eq!(s.start_type, START_AUTO);
+        assert!(s.delayed);
+        assert_eq!(s.restarts_ms, RESTART_DELAYS_MS.to_vec());
+    }
 }

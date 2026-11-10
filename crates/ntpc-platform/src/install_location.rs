@@ -36,6 +36,37 @@ pub const WRITE_MASK: u32 =
 /// generic all, generic write.
 pub const ANCESTOR_MASK: u32 = 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
 
+/// The last reason of a refused location: what to do. Generic, no path.
+pub const ADVICE: &str = "To fix it, extract the files from an elevated prompt into a new folder \
+     under Program Files, or take ownership with takeown /a and reset the permissions with \
+     icacls, then run again.";
+
+/// Drops repeated reasons, keeps the order, and ends with [`ADVICE`].
+#[must_use]
+pub fn finish(reasons: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in reasons {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    if !out.is_empty() {
+        out.push(ADVICE.to_owned());
+    }
+    out
+}
+
+/// The reasons for a file in the exe folder, with its bare name in place
+/// of the role, so the admin knows which one. Never a path.
+#[must_use]
+pub fn name_folder_file(name: &str, reasons: Vec<String>) -> Vec<String> {
+    let label = Role::FolderFile.label();
+    reasons
+        .into_iter()
+        .map(|r| r.replacen(label, &format!("the file {name} in the exe folder"), 1))
+        .collect()
+}
+
 /// `INHERIT_ONLY_ACE`.
 const INHERIT_ONLY: u8 = 0x08;
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE`.
@@ -267,11 +298,19 @@ pub fn check_exe_location(exe: &Path) -> Vec<String> {
                 if path.file_name() == exe.file_name() {
                     continue;
                 }
-                // A plain sub folder is not loaded from. A link of any kind
-                // is judged, and refused as a reparse point.
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // m1: no sub folder at all. The release zip has none, and a
+                // folder named `<exe>.local` could redirect DLL loads.
                 match entry.file_type() {
-                    Ok(t) if t.is_dir() && !t.is_symlink() => {}
-                    _ => judge_path(Role::FolderFile, &path, &mut out),
+                    Ok(t) if t.is_dir() && !t.is_symlink() => out.push(format!(
+                        "the exe folder holds a sub folder, {name}. Remove it: a folder there \
+                         can change which DLLs load"
+                    )),
+                    _ => {
+                        let mut one = Vec::new();
+                        judge_path(Role::FolderFile, &path, &mut one);
+                        out.extend(name_folder_file(&name, one));
+                    }
                 }
             }
         }
@@ -280,7 +319,7 @@ pub fn check_exe_location(exe: &Path) -> Vec<String> {
             e.raw_os_error().unwrap_or(-1)
         )),
     }
-    out
+    finish(out)
 }
 
 /// Checks a config file, its folder and every parent (I1). A missing file
@@ -290,7 +329,7 @@ pub fn check_exe_location(exe: &Path) -> Vec<String> {
 pub fn check_config_location(config: &Path) -> Vec<String> {
     match std::fs::symlink_metadata(config) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        _ => check_chain(config, Role::Config, Role::ConfigFolder),
+        _ => finish(check_chain(config, Role::Config, Role::ConfigFolder)),
     }
 }
 
@@ -457,6 +496,28 @@ mod tests {
     }
 
     #[test]
+    fn a_user_owned_folder_file_with_a_trusted_acl_fails() {
+        // b2: the owner can change the ACL whatever it says now.
+        let mut f = facts(vec![ace(ALLOWED, 0, 0x001F_01FF, Who::Trusted)]);
+        f.owner = Some(Who::Other);
+        let r = name_folder_file("helper.dll", judge(Role::FolderFile, &f));
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(
+            r[0].starts_with("the file helper.dll in the exe folder"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn reasons_are_deduplicated_and_end_with_the_advice() {
+        let r = finish(vec!["a".to_owned(), "b".to_owned(), "a".to_owned()]);
+        assert_eq!(r, vec!["a".to_owned(), "b".to_owned(), ADVICE.to_owned()]);
+        assert_eq!(finish(Vec::new()), Vec::<String>::new());
+        assert!(ADVICE.contains("takeown /a") && ADVICE.contains("icacls"));
+        assert!(!ADVICE.contains(':'), "no path in the advice");
+    }
+
+    #[test]
     fn an_admin_only_config_passes() {
         assert_eq!(
             judge(Role::Config, &facts(program_files_like())),
@@ -511,7 +572,7 @@ mod tests {
         );
         let reasons: Vec<String> = check_config_location(&root.join("System32").join("cmd.exe"))
             .into_iter()
-            .filter(|r| !r.contains("hard link"))
+            .filter(|r| !r.contains("hard link") && r != ADVICE)
             .collect();
         assert_eq!(reasons, Vec::<String>::new());
     }
@@ -550,11 +611,32 @@ mod tests {
         let exe = dir.join("ntptimeclient-winrs.exe");
         std::fs::write(&exe, b"x").unwrap();
         std::fs::write(dir.join("helper.dll"), b"x").unwrap();
+        // a1: a user-owned config.toml is named by its bare file name.
+        std::fs::write(dir.join("config.toml"), b"dhcp = true").unwrap();
+        std::fs::create_dir_all(dir.join("ntptimeclient-winrs.exe.local")).unwrap();
         let reasons = check_exe_location(&exe);
         assert!(
             reasons
                 .iter()
-                .any(|r| r.starts_with("a file in the exe folder")),
+                .any(|r| r.starts_with("the file helper.dll in the exe folder")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("the file config.toml in the exe folder")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("sub folder, ntptimeclient-winrs.exe.local")),
+            "{reasons:?}"
+        );
+        assert_eq!(reasons.last().map(String::as_str), Some(ADVICE));
+        let dir_text = dir.to_string_lossy().into_owned();
+        assert!(
+            reasons.iter().all(|r| !r.contains(&dir_text)),
             "{reasons:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

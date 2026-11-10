@@ -424,16 +424,20 @@ impl Controller {
 }
 
 /// Why the host run ended with an error.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum JobError {
     /// Building the host adapters failed for another reason.
+    #[error("{0}")]
     Deps(String),
     /// The system clock could not be opened (14c-A `WinDepsError::Clock`).
+    #[error("{0}")]
     Clock(String),
     /// The service account is refused (R106, `UntrustedAccount` or
     /// `AccountUnreadable`).
+    #[error("{0}")]
     Account(String),
     /// The host returned an error.
+    #[error("{0}")]
     Host(HostError),
 }
 
@@ -491,6 +495,30 @@ pub enum Preflight {
     UnsafeLocation(Vec<String>),
     /// Another instance holds the instance lock.
     OtherInstance,
+}
+
+/// The start checks, then the config, in that order (I1): the config is
+/// read only when the location is safe and no other instance runs. Pure
+/// over its inputs, so a test proves a bad location stops the service
+/// before the config is read (m12 a2).
+pub fn preflight_then_config(
+    reasons: Vec<String>,
+    other_instance: bool,
+    load: impl FnOnce() -> Result<Config, String>,
+) -> (Result<(), Preflight>, Result<Config, String>) {
+    let preflight = if !reasons.is_empty() {
+        Err(Preflight::UnsafeLocation(reasons))
+    } else if other_instance {
+        Err(Preflight::OtherInstance)
+    } else {
+        Ok(())
+    };
+    let config = if preflight.is_ok() {
+        load()
+    } else {
+        Err("not read: the start checks failed".to_owned())
+    };
+    (preflight, config)
 }
 
 /// The parts made before the handler is registered.
@@ -645,8 +673,8 @@ fn start_and_wait(
                 log(
                     logger,
                     Level::Error,
-                    "the host did not stop in time. Stopping anyway. The next start resets \
-                     the clock rate",
+                    "the host did not stop in time. Stopping anyway. The clock rate may stay \
+                     adjusted until the next start or reboot",
                 );
                 // M2: the stop was asked for, so no failure restart.
                 return service_exit::OK;
@@ -704,3 +732,42 @@ pub mod real;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    #[test]
+    fn an_unsafe_location_means_the_config_is_never_read() {
+        let mut read = false;
+        let (p, c) = preflight_then_config(
+            vec!["the file config.toml in the exe folder is not owned by SYSTEM".to_owned()],
+            false,
+            || {
+                read = true;
+                Ok(Config::default())
+            },
+        );
+        assert!(matches!(p, Err(Preflight::UnsafeLocation(_))));
+        assert!(c.is_err());
+        assert!(!read, "the config must not be read");
+    }
+
+    #[test]
+    fn another_instance_means_the_config_is_never_read() {
+        let mut read = false;
+        let (p, _) = preflight_then_config(Vec::new(), true, || {
+            read = true;
+            Ok(Config::default())
+        });
+        assert_eq!(p, Err(Preflight::OtherInstance));
+        assert!(!read);
+    }
+
+    #[test]
+    fn a_safe_start_reads_the_config() {
+        let (p, c) = preflight_then_config(Vec::new(), false, || Ok(Config::default()));
+        assert_eq!(p, Ok(()));
+        assert_eq!(c, Ok(Config::default()));
+    }
+}
