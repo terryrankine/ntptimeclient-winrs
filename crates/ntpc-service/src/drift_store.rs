@@ -17,12 +17,14 @@
 //! Saves are serial only. Two concurrent saves share one temp name and can
 //! fail or clobber each other. The host has a single writer.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use ntpc_core::{DriftStore, Ppm, StoreError};
+
+use crate::safe_open;
 use thiserror::Error;
 
 /// Largest accepted drift, either sign. Same as the discipline's slew cap.
@@ -108,7 +110,7 @@ impl FileDriftStore {
     /// # Errors
     /// A [`LoadNote`] naming the first thing wrong with the file.
     pub fn load_checked(&self) -> Result<Ppm, LoadNote> {
-        let file = File::open(self.path()).map_err(|e| match e.kind() {
+        let file = safe_open::open_read(&self.path()).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => LoadNote::Missing,
             kind => LoadNote::Unreadable(kind),
         })?;
@@ -162,28 +164,6 @@ fn io_error(step: &str, e: &io::Error) -> StoreError {
     StoreError::Io(format!("{step}: {e}"))
 }
 
-/// Windows `FILE_FLAG_OPEN_REPARSE_POINT`. Written out here because the
-/// constant lives in a crate we do not depend on.
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-/// Creates the temp file, failing if anything is already at that path.
-///
-/// `create_new` never follows a link at the path, on any host. On Windows the
-/// reparse-point flag also makes the open act on a link itself, as a second
-/// guard. On other hosts only `create_new` applies (`O_EXCL`). The project
-/// targets Windows. This gate only keeps the crate compiling elsewhere.
-fn create_temp(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(path)
-}
-
 /// Adds a failed cleanup to the error, so neither is lost.
 fn with_cleanup(step: &str, e: &io::Error, temp: &Path) -> StoreError {
     match fs::remove_file(temp) {
@@ -234,17 +214,12 @@ impl DriftStore for FileDriftStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_error("remove old drift temp file", &e)),
         }
-        let mut f = create_temp(&temp).map_err(|e| io_error("create drift temp file", &e))?;
+        let mut f =
+            safe_open::create_new(&temp).map_err(|e| io_error("create drift temp file", &e))?;
         // `{:?}` is the shortest text that reads back exactly. `{}` writes
         // 5e-324 as 0.000...5 with over 300 digits.
         if let Err(e) = f
-            .write_all(
-                format!(
-                    "{VERSION} {value:?}
-"
-                )
-                .as_bytes(),
-            )
+            .write_all(format!("{VERSION} {value:?}\n").as_bytes())
             .and_then(|()| f.sync_all())
         {
             drop(f);

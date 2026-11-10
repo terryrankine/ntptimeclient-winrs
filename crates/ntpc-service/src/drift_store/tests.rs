@@ -404,3 +404,85 @@ fn save_error_keeps_the_os_error_text() {
     let StoreError::Io(m) = s.save(Ppm::new(1.0)).expect_err("must fail");
     assert!(m.contains("os error"), "{m}");
 }
+
+/// Windows only. Makes a file symlink, or returns false when the account may
+/// not create one (needs Developer Mode or elevation). The caller skips then.
+#[cfg(windows)]
+fn try_symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("skipped: cannot create a symlink here: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_symlink_at_the_temp_path_is_replaced_and_the_victim_is_untouched() {
+    let d = TempDir::new("symtmp");
+    let victim = d.0.join("victim.txt");
+    fs::write(&victim, b"precious").expect("victim");
+    let s = d.store();
+    if !try_symlink_file(&victim, &s.temp_path()) {
+        return;
+    }
+    s.save(Ppm::new(2.0)).expect("save recovers");
+    assert_eq!(fs::read(&victim).expect("victim"), b"precious");
+    assert_eq!(s.load().map(Ppm::value), Some(2.0));
+    assert!(!s.temp_path().exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_hard_link_at_the_temp_path_does_not_write_through() {
+    let d = TempDir::new("hardtmp");
+    let victim = d.0.join("victim.txt");
+    fs::write(&victim, b"precious").expect("victim");
+    let s = d.store();
+    fs::hard_link(&victim, s.temp_path()).expect("hard link needs no privilege");
+    s.save(Ppm::new(2.0)).expect("save recovers");
+    assert_eq!(fs::read(&victim).expect("victim"), b"precious");
+    assert_eq!(s.load().map(Ppm::value), Some(2.0));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_at_the_temp_path_gives_an_error_and_no_write_through() {
+    let d = TempDir::new("junc");
+    let target = d.0.join("target");
+    fs::create_dir(&target).expect("target");
+    let s = d.store();
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(s.temp_path())
+        .arg(&target)
+        .output();
+    if !made.is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: mklink /J failed");
+        return;
+    }
+    let StoreError::Io(m) = s.save(Ppm::new(2.0)).expect_err("must fail");
+    assert!(m.contains("temp"), "{m}");
+    assert_eq!(
+        fs::read_dir(&target).expect("dir").count(),
+        0,
+        "nothing written through"
+    );
+    assert_eq!(s.load(), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_symlinked_drift_file_loads_none_and_the_victim_is_not_read() {
+    let d = TempDir::new("symload");
+    let victim = d.0.join("victim.txt");
+    fs::write(&victim, b"v1 12.5\n").expect("victim");
+    let s = d.store();
+    if !try_symlink_file(&victim, &s.path()) {
+        return;
+    }
+    assert_eq!(s.load(), None, "the link target must not be read");
+    assert!(matches!(s.last_load_note(), Some(LoadNote::Unreadable(_))));
+}
