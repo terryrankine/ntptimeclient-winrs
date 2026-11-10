@@ -1,0 +1,10 @@
+[package]
+name = "probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+ntp-proto = { version = "=1.9.0", default-features = false, features = ["rustcrypto", "__internal-api"] }
