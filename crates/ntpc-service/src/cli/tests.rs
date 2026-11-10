@@ -140,6 +140,9 @@ impl RecordStore for MemStore {
 #[derive(Debug, Default)]
 struct FakeReg {
     not_ready: bool,
+    unsafe_location: bool,
+    start_error: Option<String>,
+    start_calls: u32,
     register_error: Option<String>,
     unregister_error: Option<String>,
     present: bool,
@@ -149,11 +152,23 @@ struct FakeReg {
 }
 
 impl Registration for FakeReg {
-    fn ready(&self) -> Result<(), String> {
+    fn ready(&self) -> Result<(), NotReady> {
         if self.not_ready {
-            Err("registration not built".to_owned())
+            Err(NotReady::NotBuilt("registration not built".to_owned()))
+        } else if self.unsafe_location {
+            Err(NotReady::UnsafeLocation(vec![
+                "the exe folder lets an account other than SYSTEM or Administrators change it"
+                    .to_owned(),
+            ]))
         } else {
             Ok(())
+        }
+    }
+    fn start_service(&mut self) -> Result<(), String> {
+        self.start_calls += 1;
+        match &self.start_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
         }
     }
     fn register(&mut self) -> Result<(), String> {
@@ -317,11 +332,19 @@ fn uninstall_args_parse() {
 #[test]
 fn bad_arguments_exit_with_usage_and_change_nothing() {
     assert_eq!(
-        run_install(&args(&["--nope"]), &Config::default()),
+        run_install(
+            &args(&["--nope"]),
+            &Config::default(),
+            &mut PendingRegistration
+        ),
         exit::USAGE
     );
     assert_eq!(
-        run_uninstall(&args(&["--nope"]), &Config::default()),
+        run_uninstall(
+            &args(&["--nope"]),
+            &Config::default(),
+            &mut PendingRegistration
+        ),
         exit::USAGE
     );
 }
@@ -387,7 +410,19 @@ fn every_exit_code_is_reachable() {
     w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
     seen.insert(w.install(SILENT));
 
-    seen.insert(run_install(&args(&["--bad"]), &Config::default()));
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.unsafe_location = true;
+    seen.insert(w.install(SILENT));
+
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.start_error = Some("x".to_owned());
+    seen.insert(w.install(SILENT));
+
+    seen.insert(run_install(
+        &args(&["--bad"]),
+        &Config::default(),
+        &mut PendingRegistration,
+    ));
 
     let all: BTreeSet<u8> = exit::ALL.iter().copied().collect();
     assert_eq!(seen, all);
@@ -410,56 +445,4 @@ fn messages_name_no_path() {
         assert!(!t.contains('\\'), "{t}");
         assert!(!t.to_lowercase().contains("programdata"), "{t}");
     }
-}
-
-// ---- Dispatch (R85, M6) ----
-
-fn run(a: &[&str]) -> (u8, String, String) {
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let code = dispatch(&args(a), &Config::default(), &mut out, &mut err);
-    (
-        code,
-        String::from_utf8(out).unwrap(),
-        String::from_utf8(err).unwrap(),
-    )
-}
-
-#[test]
-fn no_arguments_keeps_the_stub_and_exits_zero() {
-    let (code, out, err) = run(&[]);
-    assert_eq!(code, exit::OK);
-    assert!(out.contains("pre-alpha"));
-    assert_eq!(err, "");
-}
-
-#[test]
-fn help_does_not_list_install_or_uninstall_yet() {
-    for h in ["--help", "-h"] {
-        let (code, out, _) = run(&[h]);
-        assert_eq!(code, exit::OK);
-        assert!(!out.contains("install"), "{out}");
-    }
-}
-
-#[test]
-fn unknown_subcommand_or_argument_exits_non_zero_with_one_line() {
-    for a in [
-        &["status"][..],
-        &["--version"],
-        &["--help", "x"],
-        &["frobnicate", "--silent"],
-    ] {
-        let (code, out, err) = run(a);
-        assert_eq!(code, exit::USAGE, "{a:?}");
-        assert_eq!(out, "");
-        assert_eq!(err.lines().count(), 1, "{err}");
-    }
-}
-
-#[test]
-fn dispatch_bad_install_and_uninstall_arguments_exit_with_usage() {
-    // Only invalid arguments: they stop at parsing, before any real call.
-    assert_eq!(run(&["install", "--nope"]).0, exit::USAGE);
-    assert_eq!(run(&["uninstall", "--nope"]).0, exit::USAGE);
 }

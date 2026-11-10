@@ -5,7 +5,8 @@
 //! tested with fakes and no real service is touched by a test.
 //!
 //! Install, in order:
-//! 1. Refuse unless the service registration hook is ready (Task 14).
+//! 1. Refuse unless the service registration is ready: built, and the exe
+//!    sits where only administrators can change it (exit 20).
 //! 2. Refuse unless elevated.
 //! 3. Domain join rule. `Unknown` counts as domain joined. A silent install
 //!    (`--silent`, or stdin or stderr not a console, R83) aborts unless
@@ -26,11 +27,16 @@
 //! 6. Take over `w32time`. The record is written before anything changes.
 //!    If the takeover fails before any change, the record this run wrote is
 //!    removed again (M8).
-//! 7. Register our service (Task 14 hook). On failure `w32time` is put back.
+//! 7. Register our service. On failure `w32time` is put back and the
+//!    registration rolls itself back (exit 19).
+//! 8. Start our service. A failed start keeps the install: the service
+//!    starts at the next boot (exit 21).
 //!
 //! Uninstall (`cli/uninstall.rs`): stop our service (hook), secure the state
 //! directory and read the record with the provenance checks (R86), restore
-//! `w32time` from it, and only then remove the registration (hook, R94). A
+//! `w32time` from it, and only then remove the registration (hook, R94).
+//! When `w32time` was not put back and our service was running, it is
+//! started again so the machine keeps a time service (R94 concern). A
 //! directory or record that cannot be trusted leaves `w32time` alone (exit
 //! 17) with a manual restore hint that guesses no start type. No usable
 //! record while `w32time` is disabled is exit 18 (R92).
@@ -43,7 +49,7 @@
 //!
 //! Messages carry no paths, machine names, user names or domain names.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use crate::config::Config;
@@ -124,9 +130,15 @@ pub mod exit {
     /// Install: registering our service failed after the takeover. The
     /// message says whether `w32time` was put back (R95).
     pub const REGISTER_FAILED: u8 = 19;
+    /// Install: the exe is somewhere a non-administrator can change it
+    /// (its file, its folder or a parent folder). Nothing changed.
+    pub const EXE_LOCATION: u8 = 20;
+    /// Install: registered, but our service did not start. It starts at the
+    /// next boot. `w32time` stays taken over.
+    pub const START_FAILED: u8 = 21;
 
     /// Every code, for tests.
-    pub const ALL: [u8; 19] = [
+    pub const ALL: [u8; 21] = [
         OK,
         USAGE,
         NOT_ELEVATED,
@@ -146,6 +158,8 @@ pub mod exit {
         RECORD_NOT_TRUSTED,
         NO_RECORD_DISABLED,
         REGISTER_FAILED,
+        EXE_LOCATION,
+        START_FAILED,
     ];
 }
 
@@ -385,20 +399,33 @@ pub trait RecordStore {
 /// Whether our own service registration existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnService {
-    /// It was there.
+    /// It was there. For `stop_service`: it was running and is now stopped.
     Present,
+    /// `stop_service` only: it was there and already stopped, so nothing
+    /// was stopped and nothing is started again later.
+    WasStopped,
     /// It was not there.
     Absent,
 }
 
-/// Our own service registration. Task 14 implements it with
-/// `CreateServiceW` and friends. Task 12 only defines the hook.
+/// Why registration is not available. Checked before any change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReady {
+    /// A part is not built (exit 9).
+    NotBuilt(String),
+    /// The exe location fails the administrators-only check (exit 20). Each
+    /// entry is one reason, without a path.
+    UnsafeLocation(Vec<String>),
+}
+
+/// Our own service registration. The real one is
+/// `crate::registration::ScmRegistration`.
 pub trait Registration {
     /// Whether registration is available at all. Checked before any change.
     ///
     /// # Errors
-    /// Why not.
-    fn ready(&self) -> Result<(), String>;
+    /// [`NotReady`].
+    fn ready(&self) -> Result<(), NotReady>;
     /// Registers our service.
     ///
     /// # Errors
@@ -414,6 +441,12 @@ pub trait Registration {
     /// # Errors
     /// Why it failed.
     fn unregister(&mut self) -> Result<OwnService, String>;
+    /// Starts our service. Does not wait for it to run. Already running
+    /// counts as success.
+    ///
+    /// # Errors
+    /// Why it failed.
+    fn start_service(&mut self) -> Result<(), String>;
 }
 
 /// Everything install and uninstall act on.
@@ -436,10 +469,27 @@ const UNKNOWN_WARNING: &str = "The domain join state could not be read. It is tr
 
 /// Runs the install steps. Returns an [`exit`] code.
 pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
-    if let Err(e) = d.reg.ready() {
-        d.host
-            .say(&format!("Install refused, nothing changed: {e}"));
-        return exit::REGISTER;
+    match d.reg.ready() {
+        Ok(()) => {}
+        Err(NotReady::NotBuilt(e)) => {
+            d.host
+                .say(&format!("Install refused, nothing changed: {e}"));
+            return exit::REGISTER;
+        }
+        Err(NotReady::UnsafeLocation(reasons)) => {
+            d.host.say(
+                "Install refused, nothing changed: the exe must sit in a folder that only \
+                 administrators can change, because the service runs it as LocalSystem.",
+            );
+            for r in reasons {
+                d.host.say(&format!("  {r}"));
+            }
+            d.host.say(
+                "Put the files in a folder created from an elevated prompt (for example under \
+                 Program Files) and run install from there.",
+            );
+            return exit::EXE_LOCATION;
+        }
     }
     if let Some(code) = require_elevated(d.host, "Install") {
         return code;
@@ -592,7 +642,16 @@ fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
         }
         return exit::REGISTER_FAILED;
     }
-    d.host.say("Installed.");
+    d.host.say("Service registered.");
+    if let Err(e) = d.reg.start_service() {
+        d.host.say(&format!(
+            "Installed, but starting the service failed: {e}. It starts at the next boot. \
+             Until then this machine has no time sync. Start it by hand with: sc.exe start {}",
+            crate::registration::SERVICE_NAME
+        ));
+        return exit::START_FAILED;
+    }
+    d.host.say("Installed and started.");
     exit::OK
 }
 
@@ -649,21 +708,21 @@ fn report_failed_takeover(e: &TakeoverError, record_is_new: bool, d: &mut Deps<'
     }
 }
 
-/// The registration hook until Task 14 builds it.
-///
-/// TODO(Task 14): replace with a real implementation over `CreateServiceW`,
-/// `ControlService` and `DeleteService`. Until then install refuses before
-/// any change, and uninstall treats our service as absent so it can still
-/// restore `w32time`.
+/// A registration that is never ready. Used off Windows, and in tests that
+/// must stop at argument parsing. Install refuses before any change, and
+/// uninstall treats our service as absent so it can still restore
+/// `w32time`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PendingRegistration;
 
+const NOT_AVAILABLE: &str = "service registration is not available on this build";
+
 impl Registration for PendingRegistration {
-    fn ready(&self) -> Result<(), String> {
-        Err("service registration is not built yet (it arrives with the service host)".to_owned())
+    fn ready(&self) -> Result<(), NotReady> {
+        Err(NotReady::NotBuilt(NOT_AVAILABLE.to_owned()))
     }
     fn register(&mut self) -> Result<(), String> {
-        self.ready()
+        Err(NOT_AVAILABLE.to_owned())
     }
     fn stop_service(&mut self) -> Result<OwnService, String> {
         Ok(OwnService::Absent)
@@ -671,42 +730,14 @@ impl Registration for PendingRegistration {
     fn unregister(&mut self) -> Result<OwnService, String> {
         Ok(OwnService::Absent)
     }
-}
-
-/// The line `--help` prints. It does not list `install` or `uninstall` yet:
-/// the release gate must stay red until Task 14 makes them real (R85).
-pub const HELP: &str = "usage: ntptimeclient-winrs (pre-alpha: no subcommands are available yet)";
-
-/// Dispatches the command line. `config` gives the state directory
-/// (`Config.state_dir`, R86). No arguments keeps the pre-alpha stub
-/// (exit 0). `--help` prints [`HELP`] (exit 0). An unknown subcommand or
-/// argument prints one usage line to `err` and exits [`exit::USAGE`] (M6).
-pub fn dispatch(args: &[String], config: &Config, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    match args.first().map(String::as_str) {
-        None => {
-            let _ = writeln!(
-                out,
-                "{} (pre-alpha, no service logic yet)",
-                crate::CRATE_NAME
-            );
-            exit::OK
-        }
-        Some("--help" | "-h") if args.len() == 1 => {
-            let _ = writeln!(out, "{HELP}");
-            exit::OK
-        }
-        Some("install") => run_install(&args[1..], config),
-        Some("uninstall") => run_uninstall(&args[1..], config),
-        Some(_) => {
-            let _ = writeln!(err, "unknown subcommand or argument. Run with --help.");
-            exit::USAGE
-        }
+    fn start_service(&mut self) -> Result<(), String> {
+        Err(NOT_AVAILABLE.to_owned())
     }
 }
 
 /// `install` from the command line. Returns an [`exit`] code.
 #[must_use]
-pub fn run_install(args: &[String], config: &Config) -> u8 {
+pub fn run_install(args: &[String], config: &Config, reg: &mut dyn Registration) -> u8 {
     let opts = match parse_install_args(args) {
         Ok(o) => o,
         Err(e) => {
@@ -714,50 +745,50 @@ pub fn run_install(args: &[String], config: &Config) -> u8 {
             return exit::USAGE;
         }
     };
-    run_install_real(opts, &config.state_dir)
+    run_install_real(opts, &config.state_dir, reg)
 }
 
 /// `uninstall` from the command line. Returns an [`exit`] code.
 #[must_use]
-pub fn run_uninstall(args: &[String], config: &Config) -> u8 {
+pub fn run_uninstall(args: &[String], config: &Config, reg: &mut dyn Registration) -> u8 {
     if let Err(e) = parse_uninstall_args(args) {
         eprintln!("{e}");
         return exit::USAGE;
     }
-    run_uninstall_real(&config.state_dir)
+    run_uninstall_real(&config.state_dir, reg)
 }
 
 #[cfg(windows)]
-fn run_install_real(opts: InstallOptions, state_dir: &Path) -> u8 {
+fn run_install_real(opts: InstallOptions, state_dir: &Path, reg: &mut dyn Registration) -> u8 {
     install(
         &opts,
         &mut Deps {
             host: &mut ConsoleHost::new(),
             store: &mut FileRecordStore::new(state_dir),
             scm: &mut ntpc_platform::ScmControl,
-            reg: &mut PendingRegistration,
+            reg,
         },
     )
 }
 
 #[cfg(windows)]
-fn run_uninstall_real(state_dir: &Path) -> u8 {
+fn run_uninstall_real(state_dir: &Path, reg: &mut dyn Registration) -> u8 {
     uninstall(&mut Deps {
         host: &mut ConsoleHost::new(),
         store: &mut FileRecordStore::new(state_dir),
         scm: &mut ntpc_platform::ScmControl,
-        reg: &mut PendingRegistration,
+        reg,
     })
 }
 
 #[cfg(not(windows))]
-fn run_install_real(_opts: InstallOptions, _state_dir: &Path) -> u8 {
+fn run_install_real(_opts: InstallOptions, _state_dir: &Path, _reg: &mut dyn Registration) -> u8 {
     eprintln!("install runs on Windows only");
     exit::USAGE
 }
 
 #[cfg(not(windows))]
-fn run_uninstall_real(_state_dir: &Path) -> u8 {
+fn run_uninstall_real(_state_dir: &Path, _reg: &mut dyn Registration) -> u8 {
     eprintln!("uninstall runs on Windows only");
     exit::USAGE
 }

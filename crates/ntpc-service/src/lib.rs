@@ -1,13 +1,17 @@
-//! Service wiring. Config and runtime arrive in later tasks.
+//! Service wiring: the host, the CLI, the Windows service wrapper.
 
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod drift_store;
+pub mod event_log;
 pub mod host;
 pub mod logging;
 pub mod proto;
+pub mod registration;
 pub mod resolver;
 mod safe_open;
+pub mod service;
 pub mod status;
 pub mod transport;
 
