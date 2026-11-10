@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use super::{Fault, Rng, ServerSpec, SimEvent, SimReport};
 use crate::engine::{Action, Engine, Event};
-use crate::{Delay, KodCode, Mono, Offset, Ppm, QueryFailure, Sample, SourceId, SourceSpec};
+use crate::{
+    ClockError, Delay, KodCode, Mono, Offset, Ppm, QueryFailure, Sample, SourceId, SourceSpec,
+};
 
 /// The host's query timeout. The engine closes a round after 30 s and asks
 /// for well under that.
@@ -118,6 +120,10 @@ pub struct SimWorld {
     network_up: bool,
     /// The adjustment level the host last sent.
     level: bool,
+    /// Clock commands fail while set.
+    broken: bool,
+    /// A clock command failed and the host has not re-armed the engine.
+    latched: bool,
     next_check: Mono,
     events: Vec<(Mono, u64, SimEvent)>,
     pending: Vec<Pending>,
@@ -147,6 +153,8 @@ impl SimWorld {
             seen: Mono::from_nanos(0),
             network_up: true,
             level: false,
+            broken: false,
+            latched: false,
             next_check: Mono::from_nanos(0),
             events: Vec::new(),
             pending: Vec::new(),
@@ -311,11 +319,28 @@ impl SimWorld {
         }
         let actions = engine.handle(ev);
         let mut results = Vec::new();
+        // Host contract: after the first failure the rest of the batch's
+        // clock actions are not performed.
+        let mut failed = false;
         for a in actions {
+            let clock = matches!(a, Action::SetFrequency(_) | Action::Step(_));
+            if clock && failed {
+                self.report.skipped_after_failure += 1;
+                continue;
+            }
+            if clock {
+                self.clock_command();
+                if self.broken {
+                    failed = true;
+                    self.latched = true;
+                    self.report.clock_failures += 1;
+                    results.push(Err(ClockError::Rejected("simulated failure".into())));
+                    continue;
+                }
+            }
             match a {
                 Action::Query { source, .. } => self.send(source),
                 Action::SetFrequency(f) => {
-                    self.clock_command();
                     self.clock.settle(self.now);
                     self.clock.applied = quantise(f.value(), self.granularity);
                     let size = self.clock.applied.abs();
@@ -325,7 +350,6 @@ impl SimWorld {
                     results.push(Ok(()));
                 }
                 Action::Step(o) => {
-                    self.clock_command();
                     self.clock.settle(self.now);
                     self.clock.err += o.as_secs();
                     self.report.steps.push((self.now, o));
@@ -336,8 +360,7 @@ impl SimWorld {
                 Action::Log(l) => self.report.logs.push((self.now, l)),
             }
         }
-        // Results in action order, after the batch. The simulated clock
-        // never fails, so no batch is cut short.
+        // Results in action order, after the batch.
         for r in results {
             self.feed(engine, Event::ClockResult(r));
         }
@@ -345,7 +368,9 @@ impl SimWorld {
 
     fn clock_command(&mut self) {
         self.report.clock_commands += 1;
-        if !self.level {
+        // After a failure the engine must stay silent until re-armed, even
+        // while the host keeps sending `true`.
+        if !self.level || self.latched {
             self.report.commands_while_disabled += 1;
         }
     }
@@ -515,6 +540,12 @@ impl SimWorld {
                 self.feed(engine, Event::AdjustmentAllowed(true));
             }
             SimEvent::SetDrift(p) => self.clock.need = p.value(),
+            SimEvent::ClockFails(yes) => self.broken = yes,
+            SimEvent::HostRearm => {
+                self.latched = false;
+                self.feed(engine, Event::AdjustmentAllowed(false));
+                self.feed(engine, Event::AdjustmentAllowed(self.level));
+            }
         }
     }
 }
