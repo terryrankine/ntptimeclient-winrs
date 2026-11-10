@@ -31,14 +31,16 @@ use ntpc_core::select::SelectionConfig;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::safe_open;
+
 /// Largest config file read. A real file is a few hundred bytes. The cap
 /// stops a wrong path (a log, a disk image) being read into memory.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
 /// Most entries in `servers`. A sanity bound only. The resolver keeps 8
-/// addresses per tier, and every name gives at least one, so at most 8
-/// entries can contribute. Later entries, IP literals included, are dropped
-/// with a `TierCapped` note.
+/// addresses per tier. A name that fails, has no usable address or repeats an
+/// earlier address gives none, so a 9th or later entry can still contribute.
+/// What the tier cap cuts is dropped with a `TierCapped` note.
 pub const MAX_SERVERS: usize = 16;
 
 /// Longest host name, from RFC 1035.
@@ -170,7 +172,7 @@ impl Config {
             path: path.to_owned(),
             kind: e.kind(),
         };
-        let file = std::fs::File::open(path).map_err(|e| read_err(&e))?;
+        let file = safe_open::open_read(path).map_err(|e| read_err(&e))?;
         let mut bytes = Vec::new();
         file.take(MAX_CONFIG_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
@@ -234,12 +236,16 @@ impl Config {
         }
         // The cross-check compares the pool with the active tier. The pool
         // reading can be one poll older, and the clock slews at up to 500 ppm
-        // in between. That drift is 0.5 ms per second of min_poll and must stay
-        // at or below half the step threshold, or every step is vetoed as a
-        // disagreement. So step_threshold_ms >= min_poll_s.
+        // in between. That drift is 0.5 ms per second of min_poll. The veto
+        // line is the full step threshold, and half of it is the budget for
+        // honest server disagreement. The drift must stay within that half,
+        // or the budget shrinks and honest disagreement vetoes steps. So
+        // step_threshold_ms >= min_poll_s.
         if self.step_threshold_ms < self.min_poll_s {
             return Err(format!(
-                "step_threshold_ms ({} ms) must be at least min_poll_s ({} s). The pool                  cross-check margin is 500 ppm of min_poll and must stay within half the                  step threshold, or every step is vetoed",
+                "step_threshold_ms ({} ms) must be at least min_poll_s ({} s). The pool \
+                 cross-check margin is 500 ppm of min_poll. It must stay within half the \
+                 step threshold, or the veto margin for honest server disagreement is gone",
                 self.step_threshold_ms, self.min_poll_s
             ));
         }
@@ -289,7 +295,9 @@ impl Config {
             let bare = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
             if !bare.contains('.') || bare.rsplit('.').next() == Some("local") {
                 out.push(format!(
-                    "{key} is a single-label or .local name. LLMNR, NetBIOS or mDNS may                      answer it, and anyone on the LAN can answer those. Use a full DNS name                      or an IP address"
+                    "{key} is a single-label or .local name. LLMNR, `NetBIOS` or mDNS may \
+                     answer it, and anyone on the LAN can answer those. Use a full DNS name \
+                     or an IP address"
                 ));
             }
         }

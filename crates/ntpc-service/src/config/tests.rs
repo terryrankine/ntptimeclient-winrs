@@ -52,10 +52,7 @@ fn engine_defaults_equal_config_defaults_except_max_age() {
 #[test]
 fn max_age_is_two_polls_and_30_seconds() {
     for (max_poll, want) in [(64, 158), (100, 230), (1024, 2078)] {
-        let c = ok(&format!(
-            "max_poll_s = {max_poll}
-"
-        ));
+        let c = ok(&format!("max_poll_s = {max_poll}\n"));
         assert_eq!(
             c.engine_config().selection.max_age,
             Duration::from_secs(want)
@@ -95,28 +92,17 @@ fn step_threshold_must_be_at_least_min_poll() {
     ];
     for (min_poll, step, good) in cases {
         let r = Config::parse(&format!(
-            "min_poll_s = {min_poll}
-step_threshold_ms = {step}
-"
+            "min_poll_s = {min_poll}\nstep_threshold_ms = {step}\n"
         ));
         assert_eq!(r.is_ok(), good, "min_poll {min_poll} step {step}: {r:?}");
     }
-    let m = invalid_text(
-        "step_threshold_ms = 63
-",
-    );
+    let m = invalid_text("step_threshold_ms = 63\n");
     assert!(
         m.contains("step_threshold_ms") && m.contains("min_poll_s") && m.contains("cross-check"),
         "{m}"
     );
     // The default 128 ms still fits the largest allowed min_poll of 128 s.
-    assert!(
-        Config::parse(
-            "min_poll_s = 128
-"
-        )
-        .is_ok()
-    );
+    assert!(Config::parse("min_poll_s = 128\n").is_ok());
     Config::default().validate().expect("defaults are valid");
 }
 
@@ -135,8 +121,7 @@ fn bare_and_local_names_warn() {
 
 #[test]
 fn a_bare_pool_name_warns() {
-    let c = ok("pool = \"ntp\"
-");
+    let c = ok("pool = \"ntp\"\n");
     let w = c.warnings();
     assert_eq!(w.len(), 1);
     assert!(w[0].starts_with("pool "));
@@ -461,4 +446,21 @@ fn load_rejects_non_utf8() {
 fn load_directory_is_a_read_error() {
     let d = TempDir::new("dir");
     assert!(matches!(Config::load(&d.0), Err(ConfigError::Read { .. })));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_symlinked_config_is_not_followed() {
+    let d = TempDir::new("symcfg");
+    let victim = d.0.join("victim.toml");
+    std::fs::write(&victim, "dhcp = false\n").expect("victim");
+    let link = d.0.join("c.toml");
+    if let Err(e) = std::os::windows::fs::symlink_file(&victim, &link) {
+        eprintln!("skipped: cannot create a symlink here: {e}");
+        return;
+    }
+    assert!(
+        matches!(Config::load(&link), Err(ConfigError::Read { .. })),
+        "a link is refused: not read and not treated as an empty file"
+    );
 }
