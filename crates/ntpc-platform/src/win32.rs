@@ -7,6 +7,7 @@
 //! Nothing here decides policy. `clock` and `acl` do that.
 
 pub(crate) mod dhcp;
+pub(crate) mod scm;
 
 use std::ffi::c_void;
 use std::io;
@@ -302,7 +303,6 @@ pub fn token_has_systemtime_privilege() -> io::Result<bool> {
         .any(|e| e.Luid.LowPart == luid.LowPart && e.Luid.HighPart == luid.HighPart))
 }
 
-#[cfg(test)]
 /// Whether the process token is elevated. Read only.
 ///
 /// # Errors
