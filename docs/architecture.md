@@ -5,7 +5,7 @@
 - `ntpc-core`: the engine. Source selection, filtering, clock discipline, poll timing. No OS or network code.
 - `ntpc-platform`: Windows adapters. Clock, sockets, registry, DHCP.
 - `ntpc-service`: the service binary. It wires the core to the adapters.
-- `fuzz/`: `cargo-fuzz` targets. Outside the workspace. A future `fuzz/Cargo.toml` must have its own `[workspace]` table.
+- `fuzz/`: `cargo-fuzz` targets. Outside the workspace. `fuzz/Cargo.toml` exists and has its own `[workspace]` table.
 
 ## Dependency rule
 
@@ -13,7 +13,7 @@
 - `ntpc-platform` depends on `ntpc-core`, and on Windows on `windows-sys` (which brings only `windows-link`).
 - `ntpc-service` depends on `ntpc-core` and `ntpc-platform`.
 
-`scripts/check-deps.ps1` fails if `ntpc-core` gains any other dependency. CI also builds and tests `ntpc-core` alone on Linux. That proves it has no OS dependency.
+`scripts/check-deps.ps1` fails if `ntpc-core` gains any other dependency. CI also builds and tests `ntpc-core` alone on Linux. That checks it has no OS dependency.
 
 ## Sans-IO pattern
 
@@ -46,7 +46,7 @@ Because the core is sans-IO, tests drive it with a simulated world. The world ha
 
 ## Platform: Windows clock and state directory
 
-Task 11 facts. Each line names its source. "Measured" means read on the builder's Windows 11 machine (build 26300) with read-only calls. "Guess" means not found in the docs.
+Task 11 facts. Each line names its source. "Measured" means read on a Windows 11 build with read-only calls. "Guess" means not found in the docs.
 
 ### Sources
 
@@ -203,7 +203,7 @@ Each line names its source. "Measured" means read on the builder's Windows 11 ma
 
 ### `restore.json`
 
-- Location: `restore.json` in `Config.state_dir` (R86). Install and uninstall take the directory from the config value the caller passes, never from `current_exe` or the environment. Until Task 14 loads the config file, `main` passes `Config::default()`. Risk: a `state_dir` changed between install and uninstall points uninstall at a directory with no record. It then leaves `w32time` alone and says so (safe direction).
+- Location: `restore.json` in `Config.state_dir` (R86). Install and uninstall take the directory from the config value the caller passes, never from `current_exe` or the environment. Risk: a `state_dir` changed between install and uninstall points uninstall at a directory with no record. It then leaves `w32time` alone and says so (safe direction).
 - The state directory is secured by `secure_state_dir` before the record is written. If it cannot be secured or the record cannot be written, install refuses and changes nothing. A stopped `w32time` with no record is worse than no install.
 - Content: one of eight canonical byte strings, `{"version":1,"service":"w32time","start_type":"<t>","was_running":<b>}` and a newline. `<t>` is one of `automatic`, `automatic_delayed`, `manual`, `disabled`. The reader accepts only an exact match. A wrong version, another service name, an unknown start type, a duplicate key, extra whitespace or a truncated file are all refused. Reads stop at 512 bytes.
 - Write: temp file, `sync_all`, then `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (M1). Learn ([MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)): with write-through "The function does not return until the file is actually moved on the disk". The page then says the flag "guarantees that a move performed as a copy and delete operation is flushed". Whether a same-volume rename is also flushed is not stated in more words. Guess: yes, per the first sentence. Non-Windows builds (fuzz job only) use `std::fs::rename` and never write a record.
@@ -215,7 +215,7 @@ Each line names its source. "Measured" means read on the builder's Windows 11 ma
 
 ## Platform: DHCP option 42 (Task 13)
 
-Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe on the builder's Windows 11 machine (build 26300). Probes read registry value names, value kinds and option numbers only. No address, name or lease value was copied anywhere.
+Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe on a Windows 11 build. Probes read registry value names, value kinds and option numbers only. No address, name or lease value was copied anywhere.
 
 ### Sources
 
@@ -233,9 +233,9 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 | Candidate | Documented | Gives option 42 | Admin | Network traffic | Observed |
 | --- | --- | --- | --- | --- | --- |
 | IP Helper `GetAdaptersAddresses` | yes | no. Members cover DNS, WINS, gateways and `Dhcpv4Server`. Nothing for NTP or other options | no | none | used for the adapter list |
-| Registry `Tcpip\Parameters\Interfaces\{GUID}` named values | only in old KB pages | no. There is no `DhcpNTPServer` value | no | none | 14 interface keys. Named DHCP values found: `DhcpIPAddress`, `DhcpServer`, `DhcpSubnetMask`, `DhcpDefaultGateway`, `DhcpNameServer`, `DhcpDomain`, lease times and a few more. No value names NTP. |
-| Registry `DhcpInterfaceOptions` (REG_BINARY) | no | only if the client asked for it | no | none | Present on 2 keys. A guessed record layout (20-byte header, data padded to 4) walks both blobs exactly. Option 42 is absent on both. |
-| Registry `Dhcp\Parameters\Options\<n>` | no | no | read no, write yes | none | Keys exist for options 1, 3, 6, 15, 44, 46, 47 and 220. No key for 42. |
+| Registry `Tcpip\Parameters\Interfaces\{GUID}` named values | only in old KB pages | no. There is no `DhcpNTPServer` value | no | none | Several interface keys. Named DHCP values found: `DhcpIPAddress`, `DhcpServer`, `DhcpSubnetMask`, `DhcpDefaultGateway`, `DhcpNameServer`, `DhcpDomain`, lease times and a few more. No value names NTP. |
+| Registry `DhcpInterfaceOptions` (REG_BINARY) | no | only if the client asked for it | no | none | Present on some interfaces. A guessed record layout (20-byte header, data padded to 4) walks the blobs exactly. Option 42 is absent in the ones seen. |
+| Registry `Dhcp\Parameters\Options\<n>` | no | no | read no, write yes | none | Keys exist for some options. No key for 42. |
 | DHCP client API `DhcpRequestParams` | yes, since Windows 2000 | yes, as the raw option data | not stated. Guess: no | from the cache if every option asked for is there, else a DHCPINFORM to the server (Learn remarks). May block up to 2 minutes (Learn) | NOT RUN. Option 42 is not in the cache on this machine, so a call would send an INFORM. Forbidden here. |
 | WMI `Win32_NetworkAdapterConfiguration` | yes | no. DHCP properties are `DHCPEnabled`, `DHCPLeaseExpires`, `DHCPLeaseObtained`, `DHCPServer` only | no | none | not needed |
 | `w32time` learning from DHCP | n/a | out of scope | n/a | n/a | not checked |
@@ -332,7 +332,7 @@ Each line names its source. "Learn" means the linked Microsoft Learn page. "Meas
 - `dwCheckPoint` counts up during a pending state and "should be zero" otherwise. Before `dwWaitHint` passes the service must bump the checkpoint or change state (Learn). Ours bumps about once a second while stopping, for at most the stop budget, so a hung host cannot fake progress for ever.
 - A service-specific code needs `dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR` (1066) and the code in `dwServiceSpecificExitCode` (Learn). A non-zero stop is logged by the SCM as event 7023 (Learn, `SetServiceStatus`).
 - `SERVICE_STOPPED` is sent "one time only". "Subsequent calls can cause the process to crash", and no work may follow it (Learn). The reporter refuses a second `STOPPED` and any backwards step. The Event Log is drained (2 s at most) before it.
-- Timing: start hint 30 s, stop hint 20 s, stop budget 15 s, poll 1 s. A requested stop that runs out of the budget ends with code 0 and an Event Log line saying the clock rate may stay adjusted until the next start or reboot (M2, D5). Learn gives "about 20 seconds" at system shutdown and 125 s from the Services snap-in. The budget plus one poll stays under the stop hint (tested). When the budget runs out the wrapper reports `STOPPED` with code 4 and the process ends. The next start resets the clock rate (R71).
+- Timing: start hint 30 s, stop hint 20 s, stop budget 15 s, poll 1 s. A requested stop that runs out of the budget ends with code 0 and an Event Log line saying the clock rate may stay adjusted until the next start or reboot (M2, D5). Learn gives "about 20 seconds" at system shutdown and 125 s from the Services snap-in. The budget plus one poll stays under the stop hint (tested). The next start resets the clock rate (R71).
 
 ### Control handler
 
@@ -477,7 +477,7 @@ Service-specific exit codes (`dwServiceSpecificExitCode`, with `dwWin32ExitCode`
 ### Fix round 1 (Task 14c-B review)
 
 - I1, location at every start: the service checks, before it reads the config, the exe, its folder, every parent and every file directly in the exe folder (owner SYSTEM, Administrators or TrustedInstaller, no write right for anyone else, no reparse point, at most one hard link for a file). Failure is service code 10 with an Event Log line, and the config is not read. Install runs the same check (exit 20). `run` checks the config file it uses, its folder and parents (exit 32). A missing config file passes: it means the defaults.
-- Why every file in the exe folder: the exe imports system DLLs only, but the loader searches the exe folder first for a DLL it does not find as a known DLL, and the Task 15 scripts there run elevated. One rule for every file is simpler than guessing which names matter. Sub folders are skipped (nothing is loaded from them). Measured: System32 files are hard links into WinSxS, so the link rule would refuse a System32 copy in place. An extracted zip gives single-link files.
+- Why every file in the exe folder: the exe imports system DLLs only, but the loader searches the exe folder first for a DLL it does not find as a known DLL, and the Task 15 scripts there run elevated. One rule for every file is simpler than guessing which names matter. Measured: System32 files are hard links into WinSxS, so the link rule would refuse a System32 copy in place. An extracted zip gives single-link files.
 - I2 (R109): `start_service` waits up to 30 s for `RUNNING`, polling every 250 ms through the injectable pause. `STOPPED` or no `RUNNING` in time: install exits 21, prints the Win32 and service exit codes and points at the Application log, puts `w32time` back through the restore path and keeps our registration. A re-install stops a running service before `ChangeServiceConfigW` (the change applies at the next start) and starts it again afterwards.
 - R110: `QueryServiceConfigW` reads the image path of an existing service of our name. Only `"<folder>\ntptimeclient-winrs.exe" service` (one pair of quotes, case-insensitive) is ours. Anything else: install and uninstall refuse with exit 31 and change nothing.
 - R111: `Global\ntptimeclient-winrs-clock`, a named mutex held by `run` and the service for their whole life. Learn (`CreateMutexW`): an existing name returns `ERROR_ALREADY_EXISTS`, the object goes when the last handle closes, and "a malicious user can create this mutex before you do". Learn (Kernel object namespaces): only file mappings and symbolic links need `SeCreateGlobalPrivilege` in the global namespace, so any user can create a mutex there. Our mutex grants only SYSTEM and Administrators. An existing one counts as another instance only when its owner is SYSTEM or Administrators. One owned by anyone else, or one that refuses us, is a squat: the run goes on without the lock and warns, so a squatter cannot stop time sync. `run` keeps the SCM query as a courtesy check. Service code 11, `run` exit 30.

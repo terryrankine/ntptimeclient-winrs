@@ -13,6 +13,9 @@ This is a developer preview. It is not a release.
    Never on the host, never on a production machine, a domain controller,
    or any machine you cannot rebuild.
 
+Nothing in this document has been demonstrated on a real machine. The
+first VM run tests mechanics, not accuracy.
+
 No accuracy figure is promised. The aim is to keep the clock close to
 correct. Whether it does better than the Windows default is something to
 measure on your own machine, not something this preview claims.
@@ -27,7 +30,12 @@ queries pool.ntp.org as a cross-check. The pool never picks the source. It
 can only veto a step.
 It corrects small errors by slewing (changing the clock rate gently). It
 steps the clock only above a threshold (128 ms by default). It refuses a
-step above 1000 seconds unless the config allows it. It writes a log file
+step above 1000 seconds unless the config allows it.
+With the default allow_panic_step = false, a clock more than 1000 s wrong
+is never corrected, by a step or by a slew, after a start or a resume. To
+get past that, set allow_panic_step = true in config.toml for the first
+run, or fix the clock first. This default is under review by the owner.
+It writes a log file
 and a status.json. It sends no alerts.
 
 WHAT INSTALLING DOES
@@ -41,7 +49,10 @@ and its review notes, that does the following and nothing else:
  2. Registers a Windows service named ntptimeclient-winrs. It runs as
     LocalSystem with a reduced token: the only privilege it keeps for
     changing the clock is SeSystemtimePrivilege. (That the token really is
-    reduced as designed is unverified until the VM test.)
+    reduced as designed is unverified until the VM test.) The service still
+    runs as LocalSystem. The reduction removes unneeded privileges but does
+    not make the service low privilege. Windows service DACLs and registry
+    rights still apply to the SYSTEM identity.
  3. Sets the service to delayed automatic start, and to restart after a
     failure (after 60 s, 60 s, then 5 minutes).
  4. Creates an Event Log source for the service. The preview borrows
@@ -93,9 +104,11 @@ service also runs from this folder as LocalSystem.
 Checks, and who does them:
  - The exe (exit 20) checks the exe, EVERY file in its folder, every parent
    folder, and refuses subfolders, links, files with more than one hard
-   link, and drives that are not fixed local drives. A stray file in the
-   folder gives exit 20, so do not add files. config.toml is the one
-   expected addition.
+   link, and drives that are not fixed local drives. The exe and install.ps1
+   refuse files that are not owned by SYSTEM, Administrators or
+   TrustedInstaller, that anyone else can write, that are links, and any
+   subfolder. A harmless extra file owned by Administrators is accepted.
+   config.toml is the one expected addition.
  - The scripts do a similar check first and refuse with code 44. They look
    at the folder, every file in it, each parent, subfolders, reparse points,
    link counts and the drive type. Their check is meant to be at least as
@@ -185,8 +198,8 @@ Delete it by hand if you want it gone.
 
 EXIT CODES
 ----------
-Codes 40 to 48 come from the scripts. Codes 0 to 33 come from the exe. They
-never overlap, so a code says who spoke.
+Codes 40 to 48 come from the scripts. Codes 0 to 33 and 101 come from the
+exe. They never overlap, so a code says who spoke.
 
  Scripts:
   40 -AcceptPreviewRisk not given
@@ -215,12 +228,19 @@ never overlap, so a code says who spoke.
   22 to 30 status, config and run codes (26: service run from a console)
   31 a service with our name that is not ours
   32 run: config location not safe          33 token default owner not trusted
+ 101 the process panicked (a bug, please report it)
 
-Codes 2 to 7, 12, 13, 16, 20, 31 and 33 mean nothing was changed. The
-script says so and prints no rollback text. 8, 10, 11, 14, 15, 17 and 18 mean
-something may have changed. 9, 19 and 21 depend on the exe text: read it and
+For INSTALL: codes 2 to 7, 12, 13, 16, 20, 31 and 33 mean nothing was
+changed. The script says so and prints no rollback text. 8, 10, 11, 14, 15,
+17 and 18 mean something may have changed.
+For UNINSTALL this list does not apply. Exit 6 can follow a restore, so
+check the state the script prints.
+9, 19 and 21 depend on the exe text: read it and
 the state the script prints. The table is the exe's. If it differs, trust
 the exe's own message.
+
+If uninstall says exit 25: a bad config.toml blocks uninstall. Delete or fix
+config.toml, then run uninstall again.
 
 HOW TO RESTORE w32time BY HAND
 ------------------------------
@@ -258,8 +278,13 @@ KNOWN LIMITATIONS
    release.
  - IPv4 only for DHCP-supplied servers. No NTS, no server mode, no PTP.
  - A single-server config or DHCP tier has no majority to check it. The pool
-   cross-check limits the damage but does not remove the risk.
- - A bad config file makes the service fail and restart every 5 minutes.
+   cross-check vetoes STEPS only. A bad server in the config or DHCP tier
+   that is less than 1000 s off can still pull the clock to its time at up
+   to 500 ppm (about 43 s a day) and keep it there. This is a known open
+   decision.
+ - A bad config file makes the service fail. The failure actions are 60 s,
+   60 s, then 5 minutes. Whether they apply to a non-crash stop is
+   unverified.
  - The Event Log source uses EventCreate.exe as its message file. Fine for a
    preview. A public release needs its own message table.
 

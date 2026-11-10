@@ -1,3 +1,5 @@
+> SUPERSEDED IN PART: the build replaced ntp-proto with an in-house codec (R54), has no async runtime (R90), runs as LocalSystem with a reduced token (R104), and the engine, tier, discipline and cross-check contracts changed through the ruling ledger. The record is .superpowers/sdd/2026-11-10-ntptimeclient-winrs/progress.md in the build repository.
+
 # ntp-proto spike
 
 Date: 2026-11-10. Machine: Windows 11 Pro, rustc/cargo 1.92.0 stable, target `x86_64-pc-windows-msvc`. Probe: `spikes/probe/` (throwaway, never sets the clock).
@@ -126,7 +128,7 @@ Direct dependencies of `ntp-proto`: `tokio` (`io-util`), `rustls`, `tokio-rustls
 
 ## Baseline: w32tm against pool.ntp.org
 
-Command: `w32tm /stripchart /computer:pool.ntp.org /samples:120 /dataonly`, run unelevated, 2 second interval, `pool.ntp.org` resolved to different servers: idle run `144.6.227.199`, load run `203.14.0.251` (line 1 of each file). No w32time or system setting changed. Offset is as w32tm reports it, in seconds, against the local clock.
+Command: `w32tm /stripchart /computer:pool.ntp.org /samples:120 /dataonly`, run unelevated, 2 second interval, `pool.ntp.org` resolved to different servers: idle run `192.0.2.1`, load run `192.0.2.2` (line 1 of each file). No w32time or system setting changed. Offset is as w32tm reports it, in seconds, against the local clock.
 
 | Run | Samples ok | Min | Max | Median | Mean abs |
 |---|---|---|---|---|---|

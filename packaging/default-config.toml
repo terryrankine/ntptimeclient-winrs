@@ -5,9 +5,10 @@
 # directory (C:\ProgramData\ntptimeclient-winrs). Copy this file to
 # config.toml from an elevated shell. The folder and the file must be
 # admin-only, because the service loads the file as LocalSystem at every
-# start. Anyone who can write it controls the clock. The exe refuses to run
-# from a folder that is not admin-only, and it refuses a folder with stray
-# files in it, so keep config.toml as the one addition.
+# start. Anyone who can write it controls the clock. The exe and install.ps1
+# refuse files that are not owned by SYSTEM, Administrators or
+# TrustedInstaller, that anyone else can write, that are links, and any
+# subfolder. A harmless extra file owned by Administrators is accepted.
 #
 # Every key is optional. An empty file gives the same values as this file.
 # An unknown key is an error, so a typo cannot silently leave a safety

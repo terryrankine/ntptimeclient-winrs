@@ -7,6 +7,26 @@
 
 Status: NOT RUN. This is the procedure for the owner. The packaging author did not run any of it.
 
+## PRECONDITIONS
+
+Do all of these before step 1.
+
+1. Take a snapshot named `before-preview`.
+2. Turn hypervisor time sync off (VMware Tools time sync or Hyper-V Time Synchronization integration service). Confirm it is off in the VM settings.
+3. After EVERY snapshot revert, run `w32tm /resync /force` and check the offset against a reference is under 1000 s before you install. A reverted snapshot has an old clock. Or set `allow_panic_step = true` in `config.toml` for the run. With the default `allow_panic_step = false` a clock more than 1000 s wrong is never corrected.
+4. Do not revert a snapshot while the service is installed. Uninstall first.
+5. Reboot after any failed or killed run.
+6. Recovery commands, from an elevated prompt, if a run leaves the VM in a bad state. Use the keyword recorded in step 1 in place of `auto`:
+   ```powershell
+   sc.exe stop ntptimeclient-winrs
+   sc.exe delete ntptimeclient-winrs
+   sc.exe config w32time start= auto
+   sc.exe start w32time
+   w32tm.exe /resync /force
+   sc.exe qc w32time
+   ```
+   Then reboot. Nothing in this procedure has been demonstrated on a real machine. The first run tests mechanics, not accuracy.
+
 This tests the UNSIGNED PREVIEW zip. Items marked (unverified) are guesses. The exe and the design notes own the real behaviour. Write down what you actually see.
 
 Names used below: binary `ntptimeclient-winrs.exe`, service `ntptimeclient-winrs`, record `restore.json` and `status.json` in `C:\ProgramData\ntptimeclient-winrs`, config `config.toml` next to the exe.
@@ -113,7 +133,7 @@ Each must exit with the code shown. After each, repeat `sc.exe qc w32time` and c
 4. Declined: add `-Confirm` and answer No. Expect "Declined", exit 45, not "WhatIf". No change.
 5. Damage check. Copy the extracted folder to a second new admin-only folder the same way. Append one byte to the copy's `ntptimeclient-winrs.exe`. Run `install.ps1 -AcceptPreviewRisk` from the copy. Expect exit 43 and no change. This proves the accidental-damage check only. Do the same to `preview-common.ps1` and expect exit 43.
 6. Writable folder. Extract a copy into `C:\Users\Public\x` or Downloads. Run from there. Expect REFUSED and exit 44 from the script with the offending principal or owner listed. This is the script's own check. Then try to defeat the script check to see the exe's: on a copy in an admin-only folder, run the exe directly: `Invoke-OnVm { .\ntptimeclient-winrs.exe install }` from the Downloads copy. Expect exit 20 and no change.
-7. Loose file. In a good admin-only copy, add a stray file (`Set-Content .\stray.txt x`) and a subfolder (`New-Item -ItemType Directory sub`). Run the install each time. Expect refusal from the script (44) and, if you run the exe directly, exit 20. Remove them afterwards.
+7. Loose file and subfolder. A file made by an elevated shell is owned by Administrators and is accepted, so it does not test the check. Use a file owned by a non-admin user. In a NON-elevated shell as an ordinary user, create it in a folder that user can write on the same drive: `Set-Content $env:USERPROFILE\stray.txt x`. Then in the elevated shell move it in: `Move-Item $env:USERPROFILE\stray.txt .\stray.txt`. A same-drive move keeps the user as owner (check with `(Get-Acl .\stray.txt).Owner`, unverified). A copy across drives may give the file a new owner. Run the install. Expect exit 20 from the exe run directly and exit 44 from the wrapper, for THAT case only. Then add a subfolder (`New-Item -ItemType Directory sub`) and expect refusal as well. Remove both afterwards. Also confirm that a plain file made in the elevated shell (`Set-Content .\harmless.txt x`) is accepted.
 8. Hard link and junction in the folder: `Invoke-OnVm { cmd.exe /c mklink /H hard.txt LICENSE-MIT }`, expect exit 44 and exit 20 from the exe. Remove `hard.txt`. Then repeat with a junction (`mklink /J link C:\Windows`), remove it.
 9. Domain joined: see step 8.
 
@@ -123,7 +143,7 @@ Each must exit with the code shown. After each, repeat `sc.exe qc w32time` and c
 Invoke-OnVm { powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -AcceptPreviewRisk; "exit $LASTEXITCODE" }
 ```
 
-Expect exit 0. If it prints exit 46 the machine does not look installed. That is the wrapper catching a stub or a failure. Stop and tell the author. For exit 12 read the message. Only pass `-AcceptDisabledOriginal` if w32time really was disabled before you started. Exit 21 (started failed) is a result to record: w32time must be back and our service set to manual.
+Expect exit 0. If it prints exit 46 the machine does not look installed. That is the wrapper catching a stub or a failure. Stop and tell the author. For exit 12 read the message. Only pass `-AcceptDisabledOriginal` if w32time really was disabled before you started. Exit 21 (registered but did not start) cannot be forced safely. It needs a failure after the SCM start. Mark exit 21 as tested only by fakes.
 
 Read the "State before the install" block and the rollback line. Check it matches step 1. Then check, read only:
 
@@ -252,12 +272,12 @@ The goal is to prove the printed manual rollback works. Run each on a reverted s
    }
    ```
    Check `sc.exe qc w32time` and the registry values match step 1 and no service is left. If a command fails, record it. The printed text needs fixing. Restart the VM, as the text says the clock rate may stay non-nominal until then.
-3. Start failure (exit 21). Make the service unable to start in a way you can undo, for example run the install with a bad `config.toml` already in the folder (a syntax error). Expect the install to report exit 21, w32time back, and our service on manual start (`sc.exe qc` shows DEMAND_START). Fix the config. Re-run the install and check it sets auto start (delayed) again.
+3. Start-time location check. A bad `config.toml` gives exit 25 at install, not exit 21, so do not use one here. Instead, after a successful install, stop the service (`Invoke-OnVm { sc.exe stop ntptimeclient-winrs }`). Make `config.toml` writable by Users (`Invoke-OnVm { icacls.exe .\config.toml /grant "Users:(W)" }`). Start the service. Expect the start to fail with service exit code 10 in the Event Log and no config read. This tests the start-time location check only. Exit 21 from install needs a failure after the SCM start that cannot be forced safely, so it is tested only by fakes. Remove the grant (`icacls.exe .\config.toml /remove:g Users`), start the service again and confirm it runs.
 4. Kill test. After an install:
    ```powershell
    Invoke-OnVm { Stop-Process -Name ntptimeclient-winrs -Force }
    ```
-   Wait. Record whether the service restarts and whether the clock rate was reset. Then uninstall.
+   Wait. Record whether the service restarts. Read the clock rate from the `clock rate at start` line in `service.log` after the restart, not from the process. Then uninstall.
 5. Any non-zero exit from the exe: stop, run the step 1 checks, and write down what state the machine was left in before you do anything else.
 
 ## 10. Record the result
