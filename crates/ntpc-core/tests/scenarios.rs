@@ -547,38 +547,47 @@ fn same_seed_gives_the_same_run() {
     assert_ne!(run(5), run(6));
 }
 
-/// Added beyond the brief, so `ExternalStep` is exercised. DOCUMENTS A
-/// KNOWN ISSUE. Another program moves the clock 1 s. The engine slews it
-/// back without a step, as the spec asks after the first sync. But tier
-/// usability judges each source by its lowest-delay sample of the last
-/// eight. While the loop slews at hundreds of ppm those samples come from
-/// different polls, measure a clock that has moved between them, and stop
-/// overlapping. The Dhcp tier then fails and the engine falls to no tier
-/// and to Pool, which the spec forbids ("must not flap between tiers").
-/// Change the tier assertion when that is fixed.
+/// Added beyond the brief, so `ExternalStep` is exercised. Another program
+/// moves the clock. After the first sync the engine slews it back without
+/// a step, as the spec asks.
+///
+/// It also guards ruling R50. Tier usability judges each source by its
+/// lowest-delay sample of the last eight. While the loop slews at hundreds
+/// of ppm those samples come from different polls. Uncorrected, they stop
+/// overlapping and the tier flapped between Dhcp, no tier and Pool. The
+/// engine now corrects each stored offset for the slew it applied since.
 #[test]
 fn external_step_is_slewed_back_without_a_step() {
-    let mut w = world(53, 0.0);
-    for label in ["dhcp-a", "dhcp-b", "dhcp-c"] {
-        w.add_server(label, healthy(Tier::Dhcp));
+    for (seed, jump) in [(53, 1.0), (59, 5.0)] {
+        let mut w = world(seed, 0.0);
+        for label in ["dhcp-a", "dhcp-b", "dhcp-c"] {
+            w.add_server(label, healthy(Tier::Dhcp));
+        }
+        add_pool(&mut w, 4);
+        let mut e = engine(Some(DRIFT));
+        let _ = w.run(&mut e, 6 * HOUR);
+        w.schedule(6 * HOUR, SimEvent::ExternalStep(Offset::from_secs(jump)));
+        let r = w.run(&mut e, 12 * HOUR);
+        no_steps(&r);
+        within("r.max_abs_frequency", r.max_abs_frequency, 500.0);
+        // The jump with damping 1 shrinks without overshoot. 12 hours is
+        // over 20 phase constants, so only the settled noise is left.
+        within("r.max_abs_error", r.max_abs_error, jump + SETTLED);
+        within("r.final_error.abs()", r.final_error.abs(), SETTLED);
+        assert_eq!(e.status().active_tier, Some(Tier::Dhcp));
+        // Zero tier changes. Every server is healthy and answers every
+        // query, so a tier can only fail when its sources disagree.
+        // Corrected readings differ by reading noise (2 ms at most) plus
+        // what the correction misses. It uses the commanded slew, which
+        // the clock applies exactly here (no quantisation). It misses only
+        // the error of the learned drift, under 2 ppm, over a sample age of
+        // at most 448 s: 0.9 ms. Each interval is at least 15 ms wide on
+        // either side, so the sources always overlap.
+        let changes: Vec<_> = r
+            .logs
+            .iter()
+            .filter(|(_, l)| matches!(l, LogEvent::TierChanged { .. }))
+            .collect();
+        assert_eq!(changes.len(), 0, "jump {jump}: tier flapped {changes:?}");
     }
-    add_pool(&mut w, 4);
-    let mut e = engine(Some(DRIFT));
-    let _ = w.run(&mut e, 6 * HOUR);
-    w.schedule(6 * HOUR, SimEvent::ExternalStep(Offset::from_secs(1.0)));
-    let r = w.run(&mut e, 12 * HOUR);
-    no_steps(&r);
-    within("r.max_abs_frequency", r.max_abs_frequency, 500.0);
-    // 1 s with damping 1 shrinks without overshoot. 12 hours is over 20
-    // phase constants, so only the settled noise is left.
-    within("r.max_abs_error", r.max_abs_error, 1.0 + SETTLED);
-    within("r.final_error.abs()", r.final_error.abs(), SETTLED);
-    assert_eq!(e.status().active_tier, Some(Tier::Dhcp));
-    // KNOWN ISSUE, current behaviour: the tier flaps during the slew.
-    let changes = r
-        .logs
-        .iter()
-        .filter(|(_, l)| matches!(l, LogEvent::TierChanged { .. }))
-        .count();
-    assert!(changes > 0, "tier flap fixed? then assert zero changes");
 }
