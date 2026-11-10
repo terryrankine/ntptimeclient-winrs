@@ -162,6 +162,8 @@ pub struct World {
     /// Commands (Freq or Step) counted from 1 that fail.
     pub fail_numbers: BTreeSet<u64>,
     pub commands: u64,
+    /// The first `n` rate takes fail.
+    pub fail_take: u32,
     pub log: Vec<(Mono, Cmd, bool)>,
 }
 
@@ -186,6 +188,7 @@ pub fn world(err: f64, need: f64) -> SharedWorld {
         need,
         fail_numbers: BTreeSet::new(),
         commands: 0,
+        fail_take: 0,
         log: Vec::new(),
     }))
 }
@@ -243,8 +246,14 @@ impl ClockControl for FakeClock {
     fn take_rate_control(&mut self) -> Result<(), ClockError> {
         let mut w = lock(&self.world);
         let now = self.time.now();
-        w.log.push((now, Cmd::Take, true));
-        Ok(())
+        let ok = w.fail_take == 0;
+        w.fail_take = w.fail_take.saturating_sub(1);
+        w.log.push((now, Cmd::Take, ok));
+        if ok {
+            Ok(())
+        } else {
+            Err(ClockError::PermissionDenied)
+        }
     }
 }
 

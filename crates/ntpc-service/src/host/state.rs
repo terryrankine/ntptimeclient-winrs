@@ -88,6 +88,8 @@ pub(super) struct Host {
     next_status: Mono,
     started_at: Mono,
     stopping: bool,
+    /// `take_rate_control` succeeded. Then stop resets the rate.
+    rate_taken: bool,
     last_saved_drift: Option<Ppm>,
     last_step: Option<(i128, f64)>,
     counters: Counters,
@@ -177,24 +179,15 @@ impl Host {
             next_status: now,
             started_at: now,
             stopping: false,
+            rate_taken: false,
             last_saved_drift: loaded,
             last_step: None,
             counters: Counters::default(),
         };
 
-        match host.clock.take_rate_control() {
-            Ok(()) => host.log(
-                Level::Info,
-                "rate_control",
-                "took the clock rate at nominal, with the OS kept out",
-            ),
-            Err(e) => host.log(
-                Level::Error,
-                "rate_control",
-                &format!("could not take the clock rate: {e}"),
-            ),
-        }
         // R34: adjustment starts off. The first check below may enable it.
+        // The clock rate is taken only then, so a running w32time is never
+        // touched.
         host.send_level(false);
         host
     }
@@ -402,7 +395,38 @@ impl Host {
             self.log(Level::Info, "w32time", "w32time stopped");
         }
         self.w32time_running = false;
-        if self.latched && self.rearm_at.is_some_and(|t| now >= t) {
+        let rearm_due = self.rearm_at.is_some_and(|t| now >= t);
+        if !self.rate_taken {
+            // A failed take waits out the same back-off as a failed command.
+            if self.latched && !rearm_due {
+                self.send_level(false);
+                return;
+            }
+            // R71: nominal with the OS kept out, once, before the first
+            // enable. Not at start: w32time may still own the clock then.
+            match self.clock.take_rate_control() {
+                Ok(()) => {
+                    self.rate_taken = true;
+                    self.latched = false;
+                    self.log(
+                        Level::Info,
+                        "rate_control",
+                        "took the clock rate at nominal, with the OS kept out",
+                    );
+                }
+                Err(e) => {
+                    self.clock_outcome(true);
+                    self.log(
+                        Level::Error,
+                        "rate_control",
+                        &format!("could not take the clock rate: {e}. Adjustment stays off"),
+                    );
+                    self.send_level(false);
+                    return;
+                }
+            }
+        }
+        if self.latched && rearm_due {
             self.log(
                 Level::Info,
                 "rearm",
@@ -772,15 +796,19 @@ impl Host {
         let now = self.time.mono();
         self.stopping = true;
         self.log(Level::Info, "stop", "stopping");
-        match self.clock.reset_frequency() {
-            Ok(()) => self.log(Level::Info, "stop", "clock rate handed back to the system"),
-            Err(e) => {
-                self.counters.clock_failures += 1;
-                self.log(
-                    Level::Error,
-                    "stop",
-                    &format!("could not hand the clock rate back: {e}"),
-                );
+        // R71: hand the rate back so w32time can take over. Skipped if it
+        // was never taken: then this run never touched the clock.
+        if self.rate_taken {
+            match self.clock.reset_frequency() {
+                Ok(()) => self.log(Level::Info, "stop", "clock rate handed back to the system"),
+                Err(e) => {
+                    self.counters.clock_failures += 1;
+                    self.log(
+                        Level::Error,
+                        "stop",
+                        &format!("could not hand the clock rate back: {e}"),
+                    );
+                }
             }
         }
         let drift = self.engine.status().drift;
