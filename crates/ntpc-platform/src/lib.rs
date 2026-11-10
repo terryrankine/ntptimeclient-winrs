@@ -8,6 +8,7 @@
 pub(crate) mod win32;
 
 pub mod clock;
+pub mod domain;
 
 /// State directory security. Windows only.
 #[cfg(windows)]
@@ -18,6 +19,9 @@ pub use acl::{AclError, secure_state_dir};
 #[cfg(windows)]
 pub use clock::WindowsClock;
 pub use clock::{AdjustmentState, MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise};
+#[cfg(windows)]
+pub use domain::join_state;
+pub use domain::{JoinState, map_join_status};
 
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";
