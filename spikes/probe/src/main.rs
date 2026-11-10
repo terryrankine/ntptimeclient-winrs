@@ -89,27 +89,31 @@ impl NtpClock for MockClock {
 }
 
 fn kalman() {
+    // THREE sources, all agreeing, to see whether used_sources appears.
     let mut c = KalmanClockController::<MockClock, u32>::new(
         MockClock, SynchronizationConfig::default(), AlgorithmConfig::default()).unwrap();
-    let mut src = c.add_source(1, SourceConfig::default());
-    c.source_update(1, true);
+    let mut srcs: Vec<_> = (1..=3u32).map(|id| c.add_source(id, SourceConfig::default())).collect();
+    for id in 1..=3u32 { c.source_update(id, true); }
     let start = now_ts();
-    for i in 0..8u32 {
-        let m = Measurement {
-            delay: NtpDuration::from_seconds(0.02),
-            offset: NtpDuration::from_seconds(0.0123),
-            localtime: start + NtpDuration::from_seconds(i as f64 * 16.0),
-            monotime: NtpInstant::now(),
-            stratum: 2,
-            root_delay: NtpDuration::from_seconds(0.001),
-            root_dispersion: NtpDuration::from_seconds(0.001),
-            leap: NtpLeapIndicator::NoWarning,
-            precision: -20,
-        };
-        if let Some(msg) = src.handle_measurement(m) {
-            let upd = c.source_message(1, msg);
-            println!("i={} snapshot={:?} used={:?}", i, upd.time_snapshot.is_some(), upd.used_sources);
-        } else { println!("i={} no message", i); }
+    for i in 0..12u32 {
+        for (k, src) in srcs.iter_mut().enumerate() {
+            let id = k as u32 + 1;
+            let m = Measurement {
+                delay: NtpDuration::from_seconds(0.02 + 0.001 * k as f64),
+                offset: NtpDuration::from_seconds(0.0123 + 0.0001 * k as f64),
+                localtime: start + NtpDuration::from_seconds(i as f64 * 16.0 + k as f64),
+                monotime: NtpInstant::now(),
+                stratum: 2,
+                root_delay: NtpDuration::from_seconds(0.001),
+                root_dispersion: NtpDuration::from_seconds(0.001),
+                leap: NtpLeapIndicator::NoWarning,
+                precision: -20,
+            };
+            if let Some(msg) = src.handle_measurement(m) {
+                let upd = c.source_message(id, msg);
+                println!("i={} src={} snapshot={} used={:?} has_msg={}", i, id, upd.time_snapshot.is_some(), upd.used_sources, upd.source_message.is_some());
+            } else { println!("i={} src={} no message", i, id); }
+        }
     }
 }
 
