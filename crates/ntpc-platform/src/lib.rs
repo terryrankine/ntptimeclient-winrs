@@ -14,6 +14,14 @@ pub mod w32time;
 /// DHCP option 42 servers and the lease watcher.
 pub mod dhcp;
 
+/// Is the installed exe where only administrators can change it.
+pub mod install_location;
+
+/// Service process calls: dispatcher, status, registration, Event Log.
+/// Windows only.
+#[cfg(windows)]
+pub mod service_host;
+
 /// State directory security. Windows only.
 #[cfg(windows)]
 pub mod acl;

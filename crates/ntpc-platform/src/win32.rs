@@ -8,6 +8,7 @@
 
 pub(crate) mod dhcp;
 pub(crate) mod scm;
+pub(crate) mod service;
 
 use std::ffi::c_void;
 use std::io;
