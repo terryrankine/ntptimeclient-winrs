@@ -780,6 +780,15 @@ impl Engine {
                 for src in self.sources.values_mut() {
                     src.filter = SourceFilter::new();
                 }
+                // R99: replies still in flight measured the clock before the
+                // step, as after a resume. They end their wait but are
+                // dropped, and a fresh round of their tier follows.
+                for (i, round) in self.rounds.iter_mut().enumerate() {
+                    if let Some(r) = round {
+                        r.stale = true;
+                        self.recheck[i] = true;
+                    }
+                }
                 self.prev_offset = None;
             }
             Correction::RefuseStep { offset, frequency } => {
