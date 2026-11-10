@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod drift_store;
+pub mod host;
 pub mod logging;
 pub mod proto;
 pub mod resolver;
