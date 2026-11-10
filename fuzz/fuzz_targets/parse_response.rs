@@ -3,6 +3,7 @@
 //! Each input is parsed twice. Once as sent, which must never be accepted
 //! because it cannot hold our random origin. Once with our origin written
 //! into bytes 24 to 31, so the checks past the origin gate run too.
+//! It also checks that the header codec round trips every input it accepts.
 
 #![no_main]
 
@@ -10,7 +11,7 @@ use std::net::SocketAddr;
 
 use libfuzzer_sys::fuzz_target;
 use ntpc_core::{Mono, QueryFailure, SourceId};
-use ntpc_service::proto::{NtpTime, build_request, parse_response};
+use ntpc_service::proto::{NtpTime, build_request, codec, parse_response};
 
 /// 2026-11-10T00:00:00Z as an NTP timestamp.
 const T1: u64 = 0xEE9C_DD00_0000_0000;
@@ -30,6 +31,10 @@ fuzz_target!(|data: &[u8]| {
             Mono::from_nanos(0),
         )
     };
+
+    if let Some(h) = codec::decode(data) {
+        assert_eq!(Some(&codec::encode(&h)[..]), data.get(..codec::HEADER_LEN));
+    }
 
     let raw = parse(data);
     // A 2^-64 chance per input that random bytes hit the origin.
