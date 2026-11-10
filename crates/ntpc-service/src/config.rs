@@ -21,12 +21,13 @@
 //! message. That message can quote the one offending value, capped in length.
 
 use std::io::{self, Read};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ntpc_core::discipline::DisciplineConfig;
 use ntpc_core::engine::EngineConfig;
+use ntpc_core::select::SelectionConfig;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -34,8 +35,10 @@ use thiserror::Error;
 /// stops a wrong path (a log, a disk image) being read into memory.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
-/// Most entries in `servers`. The resolver keeps 8 addresses per tier, so
-/// more than 16 names (each may give up to 4) can never all be used.
+/// Most entries in `servers`. A sanity bound only. The resolver keeps 8
+/// addresses per tier, and every name gives at least one, so at most 8
+/// entries can contribute. Later entries, IP literals included, are dropped
+/// with a `TierCapped` note.
 pub const MAX_SERVERS: usize = 16;
 
 /// Longest host name, from RFC 1035.
@@ -229,6 +232,17 @@ impl Config {
                 self.panic_threshold_s, self.step_threshold_ms
             ));
         }
+        // The cross-check compares the pool with the active tier. The pool
+        // reading can be one poll older, and the clock slews at up to 500 ppm
+        // in between. That drift is 0.5 ms per second of min_poll and must stay
+        // at or below half the step threshold, or every step is vetoed as a
+        // disagreement. So step_threshold_ms >= min_poll_s.
+        if self.step_threshold_ms < self.min_poll_s {
+            return Err(format!(
+                "step_threshold_ms ({} ms) must be at least min_poll_s ({} s). The pool                  cross-check margin is 500 ppm of min_poll and must stay within half the                  step threshold, or every step is vetoed",
+                self.step_threshold_ms, self.min_poll_s
+            ));
+        }
         if self.servers.len() > MAX_SERVERS {
             return Err(format!(
                 "servers has {} entries, at most {MAX_SERVERS} are allowed",
@@ -252,8 +266,39 @@ impl Config {
         Ok(())
     }
 
+    /// Warnings for settings that are allowed but risky. The host logs them
+    /// at every start.
+    ///
+    /// A single-label name (`ntp`) or a `.local` name is not resolved by
+    /// normal DNS alone. Windows may fall back to LLMNR, `NetBIOS` or mDNS, and
+    /// any machine on the LAN can answer those. A time source chosen that way
+    /// can be hijacked, so the config still accepts the name and says so.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let named = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("servers[{i}]"), s.as_str()))
+            .chain(std::iter::once(("pool".to_owned(), self.pool.as_str())));
+        for (key, host) in named {
+            if host.parse::<IpAddr>().is_ok() {
+                continue;
+            }
+            let bare = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+            if !bare.contains('.') || bare.rsplit('.').next() == Some("local") {
+                out.push(format!(
+                    "{key} is a single-label or .local name. LLMNR, NetBIOS or mDNS may                      answer it, and anyone on the LAN can answer those. Use a full DNS name                      or an IP address"
+                ));
+            }
+        }
+        out
+    }
+
     /// Builds the engine settings. Fields the file cannot set keep the
-    /// engine defaults. Call it on a validated config.
+    /// engine defaults, except `selection.max_age`, which follows
+    /// `max_poll_s`. Call it on a validated config.
     #[must_use]
     pub fn engine_config(&self) -> EngineConfig {
         let base = EngineConfig::default();
@@ -263,6 +308,12 @@ impl Config {
                 panic_threshold: Duration::from_secs(u64::from(self.panic_threshold_s)),
                 allow_panic_step: self.allow_panic_step,
                 ..base.discipline
+            },
+            // Two polls and a margin, so one lost reply does not drop a
+            // source from the tier vote at the longest poll.
+            selection: SelectionConfig {
+                max_age: Duration::from_secs(2 * u64::from(self.max_poll_s) + 30),
+                ..base.selection
             },
             min_poll: Duration::from_secs(u64::from(self.min_poll_s)),
             max_poll: Duration::from_secs(u64::from(self.max_poll_s)),
