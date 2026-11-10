@@ -24,7 +24,9 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Same helper check as install.ps1. See the comment there.
+# Same helper check as install.ps1. See the comment there. The same plain
+# limit applies: a folder writable by a hostile user before the run cannot be
+# made safe by this script.
 try {
     $helperPath = Join-Path -Path $PSScriptRoot -ChildPath 'preview-common.ps1'
     $sumsText = [System.IO.File]::ReadAllText((Join-Path -Path $PSScriptRoot -ChildPath 'SHA256SUMS'))
@@ -74,13 +76,21 @@ if (-not $PSCmdlet.ShouldProcess("`"$exe`" $($exeArgs -join ' ')", 'Run the unin
 }
 
 $code = Invoke-ExeKeepingExitCode -Path $exe -Arguments $exeArgs
+if ($code -eq $script:ExitCannotStart) {
+    Write-Host 'Nothing was changed: the exe did not run. See README-PREVIEW.txt (blocked by Smart App Control or AppLocker).' -ForegroundColor Red
+    Write-Host 'To remove by hand, use the manual steps in README-PREVIEW.txt.'
+    exit $code
+}
 $after = Get-MachineState
 Write-Host ''
 Write-Host "The uninstaller exited with code $code. State now (read only):"
 Format-MachineState -State $after | ForEach-Object { Write-Host "  $_" }
 if ($code -ne 0) {
-    Write-Host 'It may have stopped halfway.' -ForegroundColor Red
-    Write-Host (Get-ManualRollbackText -StartKeyword $null)
+    $class = Get-ExeExitClass -Code $code -Command uninstall
+    Write-Host $class.Message -ForegroundColor Red
+    if ($class.Class -ne 'NothingChanged') {
+        Write-Host (Get-ManualRollbackText -StartKeyword $null)
+    }
     exit $code
 }
 $problems = @(Test-UninstallOutcome -State $after)

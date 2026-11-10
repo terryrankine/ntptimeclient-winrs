@@ -166,7 +166,7 @@ Describe 'Rollback text' {
 }
 
 Describe 'Test-InstallOutcome and Test-UninstallOutcome' {
-    $svc = { param($state, $start) [pscustomobject]@{ State = $state; StartMode = $start } }
+    $svc = { param($state, $start) [pscustomobject]@{ Unreadable = $false; Error = ""; State = $state; StartMode = $start } }
     It 'flags a stub: nothing changed' {
         $s = [pscustomobject]@{ W32Time = (& $svc 'Running' 'Manual'); W32TimeStart = 'demand'; Ours = $null }
         @(Test-InstallOutcome -State $s).Count | Should Be 3

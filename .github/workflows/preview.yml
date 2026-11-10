@@ -79,30 +79,78 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked -p ntpc-service
 
-      # Stub gate. Until Tasks 12 and 14 merge, the exe is a stub that ignores
-      # its arguments and exits 0, and install.ps1 would then run it. So the
-      # exe must print a help that lists both subcommands. This gate stays
-      # RED until Tasks 12 and 14 merge. That is intended: no tag can publish
-      # a stub. A manual dry run is red too.
-      # --help is the one argument passed. On a stub or an unknown CLI it does
-      # nothing, and the runner is a throw-away machine in any case.
-      - name: Refuse to package a stub exe
+      # Exe gate. A stub exe, or one whose CLI is not the one the scripts call,
+      # must never be packaged. The probes below are non-mutating and a stub
+      # cannot fake them: the exit codes come from the exe's own table.
+      #   --help               exit 0, and the five commands listed as help lines
+      #   (no arguments)       exit 2
+      #   frob                 exit 2 (an unknown subcommand)
+      #   service              exit 26 (not started by the service manager)
+      #   status --config <a file that does not exist>   exit 22 or 24
+      # NEVER run install, uninstall, run or a real service start here. The
+      # runner is a throw-away machine, but the gate must stay safe to run
+      # anywhere. The probes may not write to the machine.
+      # R87 (human rule: no v* tag before Tasks 12 and 14 merge) can retire
+      # once this gate has passed against the merged exe.
+      - name: Gate the built exe
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $candidates = 'target/release/ntptimeclient-winrs.exe', 'target/release/ntpc-service.exe'
-          $exe = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-          if (-not $exe) { Write-Error 'No release binary found.'; exit 1 }
-          $ErrorActionPreference = 'Continue'
-          $help = (& $exe --help 2>&1 | Out-String)
-          $code = $LASTEXITCODE
-          $ErrorActionPreference = 'Stop'
-          Write-Host "exit code $code"
-          Write-Host $help
-          if ([string]::IsNullOrWhiteSpace($help)) { Write-Error 'The exe printed nothing for --help. It is a stub.'; exit 1 }
-          foreach ($word in 'install', 'uninstall') {
-            if ($help -notmatch "(?m)\b$word\b") { Write-Error "The exe help does not list '$word'. It is a stub."; exit 1 }
+          $found = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $found) { Write-Error 'No release binary found.'; exit 1 }
+          $exe = (Resolve-Path -LiteralPath $found).Path
+          $tmp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
+          $missing = Join-Path $tmp 'ntpc-gate-does-not-exist.toml'
+          if (Test-Path -LiteralPath $missing) { Write-Error "Probe path exists: $missing"; exit 1 }
+
+          function Invoke-Probe {
+            param([string[]]$ProbeArgs)
+            $out = Join-Path $tmp ('probe-out-' + [guid]::NewGuid().ToString('N') + '.txt')
+            $err = Join-Path $tmp ('probe-err-' + [guid]::NewGuid().ToString('N') + '.txt')
+            $sp = @{ FilePath = $exe; PassThru = $true; NoNewWindow = $true; RedirectStandardOutput = $out; RedirectStandardError = $err }
+            if ($ProbeArgs.Count -gt 0) { $sp.ArgumentList = $ProbeArgs }
+            $p = Start-Process @sp
+            $null = $p.Handle   # keeps the exit code readable after exit
+            if (-not $p.WaitForExit(30000)) { $p.Kill(); Write-Error "Probe hung: $($ProbeArgs -join ' ')"; exit 1 }
+            [pscustomobject]@{ Code = $p.ExitCode; Text = ((Get-Content -Raw -LiteralPath $out -ErrorAction SilentlyContinue) + (Get-Content -Raw -LiteralPath $err -ErrorAction SilentlyContinue)) }
           }
+
+          $fail = @()
+          $help = Invoke-Probe @('--help')
+          Write-Host "--help exit $($help.Code)"; Write-Host $help.Text
+          if ($help.Code -ne 0) { $fail += "--help exited $($help.Code), want 0" }
+          if ([string]::IsNullOrWhiteSpace($help.Text)) { $fail += '--help printed nothing' }
+          # Command-list lines only: the word at the start of a line, then space or end.
+          foreach ($word in 'install', 'uninstall', 'run', 'service', 'status') {
+            if ($help.Text -notmatch "(?m)^\s*$word(\s|$)") { $fail += "--help has no command-list line for '$word'" }
+          }
+          $probes = @(
+            @{ Name = 'no arguments'; Args = @(); Want = @(2) },
+            @{ Name = 'unknown subcommand'; Args = @('frob'); Want = @(2) },
+            @{ Name = 'service from a console'; Args = @('service'); Want = @(26) },
+            @{ Name = 'status with a missing config'; Args = @('status', '--config', $missing); Want = @(22, 24) }
+          )
+          foreach ($pr in $probes) {
+            $r = Invoke-Probe $pr.Args
+            Write-Host "$($pr.Name): exit $($r.Code)"
+            if ($pr.Want -notcontains $r.Code) { $fail += "$($pr.Name) exited $($r.Code), want $($pr.Want -join ' or ')" }
+          }
+          if ($fail.Count -gt 0) { $fail | ForEach-Object { Write-Host "GATE FAIL: $_" }; exit 1 }
+
+      # Packaging tests. The scripts are written for the inbox Pester 3.4 in
+      # Windows PowerShell. The runner also has a newer Pester, and "Should Be"
+      # tests with shared variables do not run on it, so 3.4.0 is imported by
+      # version. UNVERIFIED on the runner: 3.4.0 was present on the author's
+      # machine only. If the import fails here, this step fails loudly and the
+      # fix is to install or vendor that version. It is never skipped quietly.
+      - name: Packaging tests (Pester 3.4, Windows PowerShell)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module Pester -RequiredVersion 3.4.0
+          $r = Invoke-Pester -Path packaging/tests -PassThru
+          if ($r.FailedCount -gt 0 -or $r.PassedCount -eq 0) { exit 1 }
 
       - name: Test
         run: cargo test --workspace --locked
