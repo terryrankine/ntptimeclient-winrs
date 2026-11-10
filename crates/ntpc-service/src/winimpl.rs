@@ -89,6 +89,34 @@ pub enum WinDepsError {
     /// text holds no path.
     #[error("the system clock could not be opened: {0}")]
     Clock(#[from] ClockError),
+    /// No log sink was given. Without one even a refusal line would be
+    /// lost, so the build stops first.
+    #[error("no log sink was given, so nothing could be logged")]
+    NoSinks,
+    /// The process token gives new files an owner other than SYSTEM or
+    /// Administrators (R106). Every second start would then replace the
+    /// state directory and lose the log and the drift. Run as SYSTEM.
+    #[error(
+        "the service account gives new files an owner other than SYSTEM or Administrators. Run the service as LocalSystem"
+    )]
+    UntrustedAccount,
+    /// The process token could not be read. The OS error kind only.
+    #[error("the service account could not be checked: {0}")]
+    AccountUnreadable(std::io::ErrorKind),
+}
+
+/// The R106 decision on the token's default owner, apart from the OS read.
+///
+/// # Errors
+/// [`WinDepsError::UntrustedAccount`] for any other owner,
+/// [`WinDepsError::AccountUnreadable`] if it could not be read. Unknown is
+/// refused: the cost of a wrong guess is lost data every second start.
+pub fn check_account(owner_trusted: std::io::Result<bool>) -> Result<(), WinDepsError> {
+    match owner_trusted {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WinDepsError::UntrustedAccount),
+        Err(e) => Err(WinDepsError::AccountUnreadable(e.kind())),
+    }
 }
 
 /// Writes every line to each sink in turn.
@@ -136,11 +164,18 @@ pub fn build_logger(
 /// ACL outside the state directory, and sends no packet.
 ///
 /// # Errors
-/// [`WinDepsError::Clock`] if the clock cannot be opened.
+/// [`WinDepsError::NoSinks`] for an empty `sinks`, then
+/// [`WinDepsError::UntrustedAccount`] or [`WinDepsError::AccountUnreadable`]
+/// (R106), all before anything is touched. Then [`WinDepsError::Clock`] if
+/// the clock cannot be opened.
 pub fn windows_deps(
     cfg: &Config,
     sinks: Vec<Box<dyn LogSink>>,
 ) -> Result<WindowsDeps, WinDepsError> {
+    if sinks.is_empty() {
+        return Err(WinDepsError::NoSinks);
+    }
+    check_account(ntpc_platform::default_owner_is_trusted())?;
     let time: Arc<dyn TimeSource> = Arc::new(WinTimeSource);
     let state = WinStateDir::secure_now(&cfg.state_dir);
     let outcome = state.secure();

@@ -33,14 +33,18 @@ fn time() -> Arc<dyn TimeSource> {
 fn a_secured_directory_gets_the_log_file_and_the_other_sinks() {
     let s = Scratch::new("logon");
     let mem = MemorySink::new();
-    for outcome in [SecureOutcome::Ok, SecureOutcome::RestoreDropped] {
+    for outcome in [
+        SecureOutcome::Ok,
+        SecureOutcome::Replaced,
+        SecureOutcome::RestoreDropped,
+    ] {
         let logger = build_logger(outcome, &s.0, vec![Box::new(mem.clone())], time());
         logger.log(Level::Info, "test", "hello");
     }
     let file = fs::read_to_string(s.0.join(LOG_FILE_NAME)).expect("log file");
-    assert_eq!(file.lines().count(), 2);
+    assert_eq!(file.lines().count(), 3);
     assert!(file.lines().all(|l| l.ends_with("hello")));
-    assert_eq!(mem.lines().len(), 2, "other sinks still get every line");
+    assert_eq!(mem.lines().len(), 3, "other sinks still get every line");
 }
 
 #[test]
@@ -91,6 +95,37 @@ fn tee_writes_each_line_to_every_sink_in_order() {
     tee.write_line("two");
     assert_eq!(a.lines(), vec!["one", "two"]);
     assert_eq!(b.lines(), a.lines());
+}
+
+#[test]
+fn an_empty_sink_list_is_refused_before_anything_runs() {
+    // Returns before the account check, the state directory or the clock,
+    // so this touches nothing.
+    let cfg = Config {
+        state_dir: PathBuf::from(r"Z:\never\used"),
+        ..Config::default()
+    };
+    assert!(matches!(
+        windows_deps(&cfg, Vec::new()),
+        Err(WinDepsError::NoSinks)
+    ));
+}
+
+#[test]
+fn the_account_decision_refuses_anything_but_a_trusted_owner() {
+    assert!(check_account(Ok(true)).is_ok());
+    assert!(matches!(
+        check_account(Ok(false)),
+        Err(WinDepsError::UntrustedAccount)
+    ));
+    assert!(matches!(
+        check_account(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        ))),
+        Err(WinDepsError::AccountUnreadable(
+            std::io::ErrorKind::PermissionDenied
+        ))
+    ));
 }
 
 #[test]
