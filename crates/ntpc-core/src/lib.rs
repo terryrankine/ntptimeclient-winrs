@@ -1,6 +1,16 @@
 //! Sans-IO core of the NTP client. It takes events in and returns actions out.
 //! It never touches the clock, the network or the file system.
 
+mod error;
+mod ports;
+mod types;
+
+pub use error::{ClockError, StoreError};
+pub use ports::{Clock, DriftStore};
+pub use types::{
+    Delay, KodCode, Mono, Offset, Ppm, QueryFailure, Sample, SourceId, SourceSpec, Tier,
+};
+
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-core";
 
