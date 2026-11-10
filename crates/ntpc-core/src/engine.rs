@@ -713,6 +713,14 @@ impl Engine {
         // change has added no phase error to it yet. A coarse Mono (15.6 ms
         // ticks) or a fast LAN pool often gives exactly that stamp. A strict
         // window would drop it and stall a start step.
+        //
+        // The pool reading may be up to one poll older than the reading it
+        // is compared with. While a step is refused the poll is `min_poll`
+        // and the clock slews at up to `max_slew` in between. At 500 ppm
+        // that is 0.5 ms per second, so with the default 128 ms step
+        // threshold the drift between the two readings stays under half the
+        // threshold only while `min_poll` is at most 128 s. Task 10 config
+        // must enforce that.
         let age = self.freq_changed_at.map_or(cap, |changed| {
             self.now.saturating_duration_since(changed).min(cap)
         });
@@ -740,49 +748,83 @@ impl Engine {
     /// change. An older one was already used or measured a clock that has
     /// moved since, so it can neither feed the loop again nor decide a step.
     /// A delay spike is left out (see [`POPCORN_RATIO`]). It still counts
-    /// for tier usability. Also returns each considered sample, to mark as
-    /// used.
-    fn select_new(&self, tier: Tier) -> Option<(Selection, Vec<(SourceId, Mono)>)> {
+    /// for tier usability. Returns the kept samples and whether any new
+    /// sample was dropped as a spike.
+    fn new_samples(&self, tier: Tier) -> (Vec<Sample>, bool) {
         let max_age = self.cfg.selection.max_age;
-        let samples: Vec<Sample> = self
-            .sources
-            .values()
-            .filter(|s| s.spec.tier == tier)
-            .filter_map(|s| {
-                let age = self.window(s.fed_until.max(self.freq_changed_at), max_age)?;
-                let new = s.filter.best_fresh(self.now, age)?;
-                // The best of the last eight includes `new`, so a source
-                // with one sample, or a path that stays slow for eight
-                // samples, is never a spike.
-                let best = s.filter.best().map_or(new.delay, |b| b.delay).as_secs();
-                let d = new.delay.as_secs();
-                let spike = d > POPCORN_RATIO * best && d > POPCORN_FLOOR.as_secs_f64();
-                (!spike).then_some(new)
-            })
-            .collect();
-        let sel = select(&samples, self.now, &self.cfg.selection)?;
-        Some((sel, samples.iter().map(|s| (s.source, s.at)).collect()))
+        let mut spiked = false;
+        let mut kept = Vec::new();
+        for s in self.sources.values().filter(|s| s.spec.tier == tier) {
+            let Some(age) = self.window(s.fed_until.max(self.freq_changed_at), max_age) else {
+                continue;
+            };
+            let Some(new) = s.filter.best_fresh(self.now, age) else {
+                continue;
+            };
+            // The best of the last eight includes `new`, so a source with
+            // one sample, or a path that stays slow for eight samples, is
+            // never a spike.
+            let best = s.filter.best().map_or(new.delay, |b| b.delay).as_secs();
+            let d = new.delay.as_secs();
+            if d > POPCORN_RATIO * best && d > POPCORN_FLOOR.as_secs_f64() {
+                spiked = true;
+            } else {
+                kept.push(new);
+            }
+        }
+        (kept, spiked)
     }
 
     /// Feeds the loop from new samples of the active tier, if any.
     ///
-    /// `picked` is the tier-wide selection over the last eight samples of
-    /// each source. The new samples may feed the loop only if every one of
-    /// their survivors is also a survivor there. Otherwise sources with
-    /// nothing new (lost reply, timeout, kiss-of-death) would leave a falseticker to
-    /// win alone. In that case nothing is fed this round and the samples
-    /// stay unused, so the next round with replies from the majority can
-    /// still use them.
-    fn feed_loop(&mut self, tier: Tier, picked: &Selection, out: &mut Vec<Action>) {
-        let Some((sel, used)) = self.select_new(tier) else {
-            return;
-        };
-        if !sel.survivors.iter().all(|id| picked.survivors.contains(id)) {
+    /// The new samples feed the loop only if every one of their survivors
+    /// also survives a vote of the whole tier. In that vote each source
+    /// casts its new sample if it has one, else its best fresh sample.
+    /// Without the vote, sources with nothing new (lost reply, timeout,
+    /// kiss-of-death) would leave a falseticker to win alone. A source's
+    /// own new sample is used rather than its best of eight, so a source
+    /// that has just turned false cannot vote with an old good sample, and
+    /// one that has just turned good is not held back by an old bad one.
+    /// When the vote refuses, nothing is fed and the samples stay unused.
+    fn feed_loop(&mut self, tier: Tier, out: &mut Vec<Action>) {
+        let (kept, spiked) = self.new_samples(tier);
+        if kept.is_empty() {
+            // Every new reading was a spike. Poll fast so a path that has
+            // really turned slow is learned in eight short polls, not eight
+            // long ones.
+            if spiked {
+                self.poll = self.cfg.min_poll;
+            }
             return;
         }
-        for (id, at) in used {
-            if let Some(src) = self.sources.get_mut(&id) {
-                src.fed_until = Some(at);
+        let Some(sel) = select(&kept, self.now, &self.cfg.selection) else {
+            return;
+        };
+        let max_age = self.cfg.selection.max_age;
+        let vote: Vec<Sample> = self
+            .sources
+            .values()
+            .filter(|s| s.spec.tier == tier)
+            .filter_map(|s| {
+                kept.iter()
+                    .find(|k| k.source == s.spec.id)
+                    .copied()
+                    .or_else(|| s.filter.best_fresh(self.now, max_age))
+            })
+            .collect();
+        let Some(tier_vote) = select(&vote, self.now, &self.cfg.selection) else {
+            return;
+        };
+        if !sel
+            .survivors
+            .iter()
+            .all(|id| tier_vote.survivors.contains(id))
+        {
+            return;
+        }
+        for k in &kept {
+            if let Some(src) = self.sources.get_mut(&k.source) {
+                src.fed_until = Some(k.at);
             }
         }
         self.update(tier, &sel, out);
@@ -831,15 +873,17 @@ impl Engine {
                 let dcfg = &self.cfg.discipline;
                 let panic = offset.as_secs().abs() > dcfg.panic_threshold.as_secs_f64()
                     && !dcfg.allow_panic_step;
-                if cross == CrossCheck::Pending && !panic {
+                // A missing, stale or disagreeing reading: ask again, so a
+                // pool that comes to agree is seen within a poll.
+                if cross != CrossCheck::NotRequired && !panic {
                     self.ask_pool_now();
                 }
             }
         }
     }
 
-    /// A step waits on a missing or stale pool reading. Ask the pool now
-    /// rather than at `reprobe_every`, at most once per poll interval.
+    /// A step waits on the pool. Ask it now rather than at
+    /// `reprobe_every`, at most once per poll interval.
     fn ask_pool_now(&mut self) {
         let i = slot(Tier::Pool);
         let recent =

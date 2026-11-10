@@ -763,11 +763,12 @@ fn refuses_step_when_pool_cross_check_disagrees() {
     let h = config_and_pool(steady(5.0), pool, 3600);
     let steps = h.steps();
     assert_eq!(steps.len(), 1, "steps {steps:?}");
-    // A refusal on a stale pool reading asks the pool again at once. A
-    // disagreeing reading is not stale yet, so while the pool disagrees it
-    // is asked every other poll. The step follows within three polls.
+    // Every refusal asks the pool again, at most once per poll, whether its
+    // reading is missing, stale or disagreeing. The first ask at or after
+    // 800 s gets an agreeing reply and the next config round steps. Worst
+    // case two polls.
     assert!(
-        (800..=800 + 3 * 64).contains(&steps[0]),
+        (800..=800 + 2 * 64).contains(&steps[0]),
         "step at {}",
         steps[0]
     );
@@ -1238,6 +1239,116 @@ fn first_slow_samples_of_a_source_are_fed() {
     h.run(200);
     let fed: Vec<u64> = h.times(is_freq).into_iter().filter(|&t| t > 0).collect();
     assert_eq!(fed[..2], [64, 128], "fed {fed:?}");
+}
+
+#[test]
+fn source_turned_false_cannot_vote_with_its_old_good_sample() {
+    // Reviewer probe. Two pool sources read 0 at 20 ms. From 704 s source 2
+    // reads +100 ms at 25 ms, so its old 20 ms sample stays its best of
+    // eight. Source 1 loses the 704 s reply. The loop must not move toward
+    // source 2.
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(1) && t == 704 {
+            Err(QueryFailure::Timeout)
+        } else if s == id(2) && t >= 704 {
+            Ok(0.100)
+        } else {
+            Ok(0.0)
+        }
+    });
+    let mut h = Harness::new(cfg, reply);
+    h.delay = Box::new(|s, t| if s == id(2) && t >= 704 { 0.025 } else { 0.020 });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![
+        spec(1, Tier::Pool),
+        spec(2, Tier::Pool),
+    ]));
+    h.run(4000);
+    let late: Vec<f64> = h
+        .log
+        .iter()
+        .filter(|(t, _)| *t >= 704)
+        .filter_map(|(_, a)| match a {
+            Action::SetFrequency(f) => Some(f.value()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        late.iter().all(|f| f.abs() < 1.0),
+        "slewed toward the falseticker: {late:?}"
+    );
+    assert!(
+        h.status()
+            .last_offset
+            .is_some_and(|o| o.as_secs().abs() < 0.01)
+    );
+}
+
+#[test]
+fn source_turned_good_is_not_held_back_by_an_old_sample() {
+    // Reviewer probe. Pool sources 1 and 3 read 0 at 20 ms. Source 2 reads
+    // +25 ms at 40 ms, but at 20 ms every eighth poll. At 40 ms it agrees,
+    // at 20 ms it does not. Its best of eight is the disagreeing 20 ms one,
+    // yet most rounds must still feed the loop.
+    let reply: Reply = Box::new(|s, _| Ok(if s == id(2) { 0.025 } else { 0.0 }));
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let mut h = Harness::new(cfg, reply);
+    h.delay = Box::new(|s, t| {
+        if s == id(2) && (t / 64) % 8 != 0 {
+            0.040
+        } else {
+            0.020
+        }
+    });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![
+        spec(1, Tier::Pool),
+        spec(2, Tier::Pool),
+        spec(3, Tier::Pool),
+    ]));
+    h.run(3600);
+    let rounds = h.queries(1).iter().filter(|&&t| t >= 64).count();
+    let fed = h.times(is_freq).iter().filter(|&&t| t >= 64).count();
+    assert!(fed * 10 >= rounds * 9, "fed {fed} of {rounds} rounds");
+}
+
+#[test]
+fn spike_starved_loop_polls_fast_until_the_slow_path_is_learned() {
+    // The poll has reached 1024 s. Then the path turns from 20 ms to 200 ms
+    // for good. Each round that feeds nothing because of a spike drops the
+    // poll to 64 s, so the eighth slow sample comes 7 x 64 s after the
+    // first, not 7 x 1024 s.
+    let reply: Reply = Box::new(|_, t| Ok(if t >= 6000 { 0.004 } else { 0.001 }));
+    let mut h = Harness::new(EngineConfig::default(), reply);
+    h.delay = Box::new(|_, t| if t >= 6000 { 0.200 } else { 0.020 });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![spec(1, Tier::Pool)]));
+    h.run(6000);
+    assert_eq!(gaps(&h.queries(1)).last(), Some(&1024));
+    h.run(12_000);
+    let first_slow = *h
+        .queries(1)
+        .iter()
+        .find(|&&t| t >= 6000)
+        .expect("slow round");
+    let fed = *h
+        .times(is_freq)
+        .iter()
+        .find(|&&t| t >= 6000)
+        .expect("fed again");
+    assert!(
+        fed - first_slow <= 8 * 64,
+        "fed {} s after the first slow sample",
+        fed - first_slow
+    );
+    assert!(h.status().last_offset.is_some_and(|o| near(o, 0.004)));
 }
 
 #[test]
