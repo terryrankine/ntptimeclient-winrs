@@ -470,3 +470,45 @@ fn domain_warnings_use_the_warning_stream() {
         );
     }
 }
+
+// ---- Task 14c-B: exe location and start after register ----
+
+#[test]
+fn install_refuses_an_unsafe_exe_location_before_any_change() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.unsafe_location = true;
+    assert_eq!(w.install(SILENT), exit::EXE_LOCATION);
+    assert!(w.untouched());
+    assert!(
+        w.host.text().contains("only administrators"),
+        "{}",
+        w.host.text()
+    );
+}
+
+#[test]
+fn install_starts_our_service_after_registering() {
+    let mut w = World::new(JoinState::Workgroup);
+    assert_eq!(w.install(SILENT), exit::OK);
+    assert!(w.reg.registered);
+    assert_eq!(w.reg.start_calls, 1);
+}
+
+#[test]
+fn a_failed_start_keeps_the_install_and_says_so() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.start_error = Some("access denied".to_owned());
+    assert_eq!(w.install(SILENT), exit::START_FAILED);
+    // Installed: registration kept, w32time stays taken over.
+    assert!(w.reg.registered);
+    assert_eq!(w.w32time(), taken_over());
+    assert!(w.host.text().contains("next boot"), "{}", w.host.text());
+}
+
+#[test]
+fn a_register_failure_never_starts_anything() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.register_error = Some("create failed".to_owned());
+    assert_eq!(w.install(SILENT), exit::REGISTER_FAILED);
+    assert_eq!(w.reg.start_calls, 0);
+}

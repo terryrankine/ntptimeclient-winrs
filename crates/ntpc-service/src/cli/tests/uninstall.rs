@@ -269,3 +269,58 @@ fn a_missing_state_dir_is_not_created_and_means_no_record() {
         assert_eq!(w.uninstall(), exit::NO_RECORD_DISABLED, "{state:?}");
     }
 }
+
+// ---- R94 concern (Task 14c-B): start our service again ----
+
+#[test]
+fn restore_failure_starts_our_stopped_service_again() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::missing());
+    w.store = MemStore::with(Restore::new(StartType::Manual, true));
+    w.reg.present = true;
+    assert_eq!(w.uninstall(), exit::RESTORE);
+    assert_eq!(w.reg.unregister_calls, 0);
+    assert_eq!(w.reg.start_calls, 1);
+    assert!(w.host.text().contains("started again"), "{}", w.host.text());
+}
+
+#[test]
+fn no_record_while_disabled_starts_our_stopped_service_again() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    w.reg.present = true;
+    assert_eq!(w.uninstall(), exit::NO_RECORD_DISABLED);
+    assert_eq!(w.reg.start_calls, 1);
+}
+
+#[test]
+fn a_failed_restart_is_reported_with_the_manual_step() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::missing());
+    w.store = MemStore::with(Restore::new(StartType::Manual, true));
+    w.reg.present = true;
+    w.reg.start_error = Some("access denied".to_owned());
+    assert_eq!(w.uninstall(), exit::RESTORE);
+    let t = w.host.text();
+    assert!(t.contains("could not be started again"), "{t}");
+    assert!(t.contains("no time sync"), "{t}");
+}
+
+#[test]
+fn an_absent_service_is_not_started_again() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::missing());
+    w.store = MemStore::with(Restore::new(StartType::Manual, true));
+    w.reg.present = false;
+    assert_eq!(w.uninstall(), exit::RESTORE);
+    assert_eq!(w.reg.start_calls, 0);
+}
+
+#[test]
+fn a_successful_uninstall_never_starts_our_service() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.store = MemStore::with(Restore::new(StartType::AutomaticDelayed, true));
+    w.reg.present = true;
+    assert_eq!(w.uninstall(), exit::OK);
+    assert_eq!(w.reg.start_calls, 0);
+}

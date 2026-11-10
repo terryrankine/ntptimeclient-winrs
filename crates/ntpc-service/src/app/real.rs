@@ -1,0 +1,236 @@
+//! Runs a parsed [`Command`] on the real system. Only glue: the decisions
+//! are in `app.rs`, `cli`, `service` and `registration`, each tested with
+//! fakes. Nothing here runs in a test.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+use super::{Command, HELP, USAGE, default_config_path, exit, load_config, status_command};
+use crate::cli::{self, Registration};
+use crate::config::Config;
+use crate::event_log::{DiscardSink, EventLogSink, RealEventApi, RealRegistry};
+use crate::logging::{ConsoleSink, LineLogger, LogSink, Logger};
+use crate::registration::{ExeLocator, RealExeLocator, RealScm, SERVICE_NAME, ScmRegistration};
+use crate::service::{
+    DepsLauncher, JobError, Launcher, ServiceRun, real::service_main, run_console,
+};
+use crate::transport::StdTimeSource;
+
+/// The host launcher.
+///
+/// MERGE (Task 14c-A): replace the body with
+/// `DepsLauncher::new(Arc::new(|cfg| <winimpl>::windows_deps(cfg)))`.
+/// Until then `install` refuses (exit 9) and `run` and `service` stop
+/// with "host not built".
+fn launcher() -> DepsLauncher {
+    DepsLauncher::pending()
+}
+
+/// The folder of the running exe, resolved.
+fn exe_dir() -> Result<PathBuf, String> {
+    let exe = RealExeLocator.exe()?;
+    exe.parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "the running exe has no folder".to_owned())
+}
+
+/// The config at `path`, or the default location. Prints its warnings.
+fn config_for(path: Option<PathBuf>, err: &mut dyn Write) -> Result<Config, u8> {
+    let path = match path {
+        Some(p) => p,
+        None => match exe_dir() {
+            Ok(d) => default_config_path(&d),
+            Err(e) => {
+                let _ = writeln!(err, "{e}");
+                return Err(exit::CONFIG);
+            }
+        },
+    };
+    match load_config(&path) {
+        Ok(c) => {
+            for w in c.warnings() {
+                let _ = writeln!(err, "config warning: {w}");
+            }
+            Ok(c)
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            Err(exit::CONFIG)
+        }
+    }
+}
+
+/// Runs `cmd`. Returns the process exit code.
+pub fn execute(cmd: Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    match cmd {
+        Command::Help => {
+            let _ = writeln!(out, "{HELP}");
+            cli::exit::OK
+        }
+        Command::Install(args) => match config_for(None, err) {
+            Ok(cfg) => with_registration(|reg| cli::run_install(&args, &cfg, reg)),
+            Err(code) => code,
+        },
+        Command::Uninstall(args) => match config_for(None, err) {
+            Ok(cfg) => with_registration(|reg| cli::run_uninstall(&args, &cfg, reg)),
+            Err(code) => code,
+        },
+        Command::Status { config } => match config_for(config, err) {
+            Ok(cfg) => status_command(&cfg, out, err),
+            Err(code) => code,
+        },
+        Command::Run { config } => run(config, err),
+        Command::Service => service(err),
+    }
+}
+
+fn with_registration(f: impl FnOnce(&mut dyn Registration) -> u8) -> u8 {
+    let mut scm = RealScm;
+    let mut events = RealRegistry;
+    let locator = RealExeLocator;
+    let mut reg = ScmRegistration::new(&mut scm, &mut events, &locator, launcher().ready());
+    f(&mut reg)
+}
+
+/// Whether our service is running. Read only. An error counts as running:
+/// two instances must never adjust one clock.
+fn own_service_running() -> Result<bool, String> {
+    use ntpc_platform::w32time::{RunState, ServiceControl, SvcError};
+    match ntpc_platform::ScmControl.query(SERVICE_NAME) {
+        Ok(s) => Ok(s.run != RunState::Stopped),
+        Err(SvcError::NotFound) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn run(config: Option<PathBuf>, err: &mut dyn Write) -> u8 {
+    match own_service_running() {
+        Ok(false) => {}
+        Ok(true) => {
+            let _ = writeln!(
+                err,
+                "The {SERVICE_NAME} service is running. Stop it first: two instances must not \
+                 adjust one clock."
+            );
+            return exit::RUN_CONFLICT;
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "Cannot tell whether the {SERVICE_NAME} service runs ({e}). Not starting."
+            );
+            return exit::RUN_CONFLICT;
+        }
+    }
+    let cfg = match config_for(config, err) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let launcher = launcher();
+    if let Err(e) = launcher.ready() {
+        let _ = writeln!(err, "Cannot run: {e}.");
+        return exit::HOST_NOT_BUILT;
+    }
+    let logger: Arc<dyn Logger> = Arc::new(LineLogger::new(
+        Box::new(ConsoleSink::new()),
+        Arc::new(StdTimeSource::new()),
+    ));
+    let (control, inbox) = crate::host::channel();
+    let done = Arc::new((Mutex::new(false), Condvar::new()));
+    let d = done.clone();
+    let handler = move |ctrl: u32| {
+        control.shutdown();
+        // CTRL_CLOSE_EVENT, LOGOFF and SHUTDOWN end the process when the
+        // handler returns (Learn, HandlerRoutine). Wait for the host to
+        // reset the clock rate first, inside the 5 s close timeout.
+        if matches!(ctrl, 2 | 5 | 6) {
+            let (lock, cv) = &*d;
+            let g = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = cv.wait_timeout_while(g, Duration::from_secs(4), |finished| !*finished);
+        }
+    };
+    if let Err(e) = ntpc_platform::service_host::set_console_handler(Box::new(handler)) {
+        let _ = writeln!(
+            err,
+            "Cannot install the Ctrl+C handler (OS error {}). Not starting: Ctrl+C would skip \
+             the clock rate reset.",
+            e.raw_os_error().unwrap_or(-1)
+        );
+        return exit::RUN_FAILED;
+    }
+    let result = run_console(&launcher, cfg, logger, inbox);
+    {
+        let (lock, cv) = &*done;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cv.notify_all();
+    }
+    match result {
+        Ok(()) => cli::exit::OK,
+        Err(JobError::Host(crate::host::HostError::Config(e))) => {
+            let _ = writeln!(err, "{e}");
+            exit::CONFIG
+        }
+        Err(e) => {
+            let _ = writeln!(err, "The host ended with an error: {e:?}");
+            exit::RUN_FAILED
+        }
+    }
+}
+
+fn service(err: &mut dyn Write) -> u8 {
+    let make = || {
+        let config = exe_dir().and_then(|d| load_config(&default_config_path(&d)));
+        let event_sink = RealEventApi::open()
+            .and_then(|api| EventLogSink::start(Box::new(api)))
+            .ok()
+            .map(Arc::new);
+        let sink: Box<dyn LogSink> = match &event_sink {
+            Some(s) => Box::new(s.clone()),
+            None => Box::new(DiscardSink::default()),
+        };
+        let logger: Arc<dyn Logger> =
+            Arc::new(LineLogger::new(sink, Arc::new(StdTimeSource::new())));
+        let drain: Box<dyn Fn(Duration) + Send + Sync> = match event_sink {
+            Some(s) => Box::new(move |d| {
+                let _ = s.drain(d);
+            }),
+            None => Box::new(|_| {}),
+        };
+        ServiceRun {
+            config,
+            launcher: Arc::new(launcher()),
+            logger,
+            drain,
+        }
+    };
+    match ntpc_platform::service_host::run_dispatcher(
+        SERVICE_NAME,
+        Box::new(move || service_main(make)),
+    ) {
+        Ok(()) => cli::exit::OK,
+        Err(e)
+            if e.raw_os_error() == Some(ntpc_platform::service_host::ERROR_NOT_STARTED_BY_SCM) =>
+        {
+            let _ = writeln!(
+                err,
+                "The service command is for the service control manager. To run in this \
+                 console use: run. {USAGE}"
+            );
+            exit::NOT_SCM
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "The service dispatcher failed: OS error {}.",
+                e.raw_os_error().unwrap_or(-1)
+            );
+            exit::SERVICE_FAILED
+        }
+    }
+}

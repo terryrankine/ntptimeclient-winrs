@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The library keeps the crate name. The exe is named after the product,
+# which the Task 15 scripts and workflow expect.
+[[bin]]
+name = "ntptimeclient-winrs"
+path = "src/main.rs"
+
 [dependencies]
 ntpc-core.workspace = true
 ntpc-platform.workspace = true
