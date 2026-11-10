@@ -120,3 +120,64 @@ Task 11 facts. Each line names its source. "Measured" means read on the builder'
 - R74: parent owners are checked, parent DACLs are not. A parent owned by SYSTEM, Administrators or TrustedInstaller whose DACL grants Users `FILE_DELETE_CHILD` would let them remove the state directory. That is an administrator misconfiguration, out of scope.
 - Error text carries no paths (engine host contract).
 - Load-side hardening (reparse flag and `SECURITY_IDENTIFICATION` on opens of `drift.txt` and the config) lives in `ntpc-service` `safe_open`. It is not duplicated here.
+
+## Platform: `w32time` takeover and domain join (Task 12)
+
+Each line names its source. "Measured" means read on the builder's Windows 11 machine with read-only calls (`sc qc`, `sc enumdepend`, `sc qtriggerinfo` and the read-only live tests). "Guess" means not found in the docs.
+
+### Sources
+
+- [NetGetJoinInformation](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/nf-lmjoin-netgetjoininformation)
+- [NetGetAadJoinInformation](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/nf-lmjoin-netgetaadjoininformation)
+- [QueryServiceStatusEx](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex)
+- [QueryServiceConfigW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryserviceconfigw)
+- [ChangeServiceConfigW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfigw)
+- [ControlService](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-controlservice)
+- [StartServiceW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-startservicew)
+- [SERVICE_DELAYED_AUTO_START_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_delayed_auto_start_info)
+- [Service Trigger Events](https://learn.microsoft.com/en-us/windows/win32/services/service-trigger-events)
+- [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings)
+
+### Domain join
+
+- `NET_API_STATUS NetGetJoinInformation(LPCWSTR lpServer, LPWSTR *lpNameBuffer, PNETSETUP_JOIN_STATUS BufferType)`. A null server means the local computer. Netapi32. No special group membership is needed (Learn).
+- The name buffer "is allocated by the system and must be freed using the NetApiBufferFree function" (Learn). The code frees it on every path and never reads it. No domain or workgroup name leaves `join_state`.
+- `NETSETUP_JOIN_STATUS` (Learn, the enum on the function page): `NetSetupUnknownStatus = 0`, `NetSetupUnjoined = 1`, `NetSetupWorkgroupName = 2`, `NetSetupDomainName = 3`.
+- Mapping: 3 is `Domain`. 1 and 2 are `Workgroup`. 0, any other value and any error are `Unknown`.
+- Install rule: `Unknown` is treated like `Domain`, the safe direction. A silent install aborts on both unless `--confirm-domain-joined` is given. An interactive install warns and asks.
+- Out of scope for version one: Entra ID (Azure AD) join and hybrid join. `NetGetAadJoinInformation` (Windows 10 and Server 2016 or later, Learn) reports Entra join and work accounts. It is not called. Guess: an Entra-only device reports `NetSetupWorkgroupName` and a hybrid device reports `NetSetupDomainName`. Not verified. A `DsRegGetJoinInfo` function was not found on Learn. It is not needed for v1.
+
+### Service control
+
+- Service name `w32time` (Learn, the `sc qtriggerinfo w32time` example on the trigger page).
+- Access rights per call (Learn): `QueryServiceStatusEx` needs `SERVICE_QUERY_STATUS`. `QueryServiceConfigW` needs `SERVICE_QUERY_CONFIG`. `ControlService(SERVICE_CONTROL_STOP)` needs `SERVICE_STOP`. `StartServiceW` needs `SERVICE_START`. `ChangeServiceConfigW` needs `SERVICE_CHANGE_CONFIG`. Each wrapper opens its own handle with only the rights its call needs. The query path never asks for more than `SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG`.
+- `QueryServiceConfigW` buffer: "The maximum size of this array is 8K bytes". A null buffer of size 0 fails with `ERROR_INSUFFICIENT_BUFFER` and sets the size (Learn). The code uses that two-call pattern with a u64 buffer for alignment. Only `dwStartType` is read. The strings in the struct are never read.
+- The config query reflects "the configuration of the service when it is next run" if it was changed while running (Learn). So the recorded start type is the one that applies at next boot.
+- Start types (Learn, ChangeServiceConfigW): `SERVICE_BOOT_START 0` and `SERVICE_SYSTEM_START 1` (drivers only), `SERVICE_AUTO_START 2`, `SERVICE_DEMAND_START 3`, `SERVICE_DISABLED 4`. Disabled: "Attempts to start the service result in the error code ERROR_SERVICE_DISABLED".
+- Delayed auto start is a separate flag, `SERVICE_CONFIG_DELAYED_AUTO_START_INFO` (3), read and set with `QueryServiceConfig2W` and `ChangeServiceConfig2W`. "This setting is ignored unless the service is an auto-start service" (Learn). `StartType::AutomaticDelayed` is auto start plus the flag. Setting `Automatic` clears the flag. `Manual` and `Disabled` leave it alone, because it is ignored.
+- Boot and system start are driver-only (Learn). A query that returns them is refused with `SvcError::UnsupportedStartType`. The restore record cannot hold them.
+- Stop: `ControlService` returns `ERROR_DEPENDENT_SERVICES_RUNNING` (1051) when running services depend on the target. We never stop dependents. `ERROR_SERVICE_NOT_ACTIVE` (1062) means it is already stopped. The stop is asynchronous. The code polls the status until `SERVICE_STOPPED`, for at most 30 s (our choice).
+- `ControlService` and `StartServiceW` "will block for 30 seconds if any service is busy handling a control code" (Learn).
+- `StartServiceW` returns once the service thread is created, in `SERVICE_START_PENDING` (Learn). Restore does not wait for running. `ERROR_SERVICE_ALREADY_RUNNING` (1056) counts as success.
+- Measured: `w32time` is `WIN32_SHARE_PROCESS`, start type `AUTO_START (DELAYED)`, no dependencies, 0 dependent services.
+- Measured: `w32time` has two start triggers, "DOMAIN JOINED STATUS" and a "CUSTOM SYSTEM STATE CHANGE EVENT". The trigger page example also shows a not-joined stop trigger.
+- Trigger start of a disabled service: not stated on the trigger page. Guess: a disabled service is not trigger-started, because a disabled service "cannot be started" (ChangeServiceConfigW). Not verified. The triggers are left untouched, so restore needs nothing for them. If the guess is wrong, the 30 s monitor sees `w32time` running and stops clock adjustment.
+- Group Policy: policy values "overwrite any preexisting values in the W32Time section of the registry" (Learn, Tools and Settings). The page says nothing about policy changing the start type. Guess: a GPO "System Services" setting can set `w32time` back to automatic. The monitor covers that case.
+
+### Takeover and restore rules
+
+- Order: query the original state, persist the restore record, stop, disable, query again to verify. A crash between record and stop leaves a record of the true original. Restore from it is idempotent.
+- A valid existing record always wins over the current state. Re-running install on a taken-over machine must not record "disabled, stopped" as the original.
+- Stop refused: nothing changed. Stop timeout: the stop was sent and may still finish. The record stays so uninstall can restore. Disable fails after the stop: `w32time` is started again if it was running (rollback), and both errors are reported.
+- Restore sets the recorded start type. It starts `w32time` only if it was running and the recorded start type is not `Disabled`, because a disabled service cannot be started.
+- Uninstall with no record leaves `w32time` alone and says so. Guessing a start type could undo an administrator's deliberate choice.
+- `is_running` reports true on any query error. When we cannot tell, the engine must not adjust the clock.
+- Monitor: every 30 s the host sends `AdjustmentAllowed(!running)`. The event is a level, so it is sent every period, not only on change. After a clock failure latch (R39) only `false` then `true` reopens adjustment. `monitor_decision` also says when the state changed, so the host logs transitions only.
+
+### `restore.json`
+
+- Location: `restore.json` in the default state directory, always, whatever the config says. Uninstall must find it even when the config file is gone.
+- The state directory is secured by `secure_state_dir` before the record is written. If it cannot be secured or the record cannot be written, install refuses and changes nothing. A stopped `w32time` with no record is worse than no install.
+- Content: one of eight canonical byte strings, `{"version":1,"service":"w32time","start_type":"<t>","was_running":<b>}` and a newline. `<t>` is one of `automatic`, `automatic_delayed`, `manual`, `disabled`. The reader accepts only an exact match. A wrong version, another service name, an unknown start type, a duplicate key, extra whitespace or a truncated file are all refused. Reads stop at 512 bytes.
+- No checksum. A checksum does not stop anyone who can write the file. The defences are the secured directory, the fixed service name and the closed set of values.
+- `secure_state_dir` (R68) refuses to re-ACL a directory with unknown children, and `restore.json` is unknown to it. That case needs a directory whose DACL was already wrong. Install then refuses. Safe direction.
