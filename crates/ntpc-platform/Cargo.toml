@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# A scripted ServiceControl for tests in this and other crates. No OS calls.
+fake = []
+
 [dependencies]
 ntpc-core.workspace = true
 thiserror.workspace = true
@@ -21,10 +25,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Dhcp",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_NetManagement",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Services",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Time",

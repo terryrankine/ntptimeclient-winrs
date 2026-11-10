@@ -1,6 +1,20 @@
-fn main() {
-    println!(
-        "{} (pre-alpha, no service logic yet)",
-        ntpc_service::CRATE_NAME
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    // Lossy is fine: every accepted argument is ASCII, anything else is a
+    // usage error anyway.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    // Task 14 owns the full command line (run, service, status) and loads the
+    // config file. Until then the defaults give the state directory.
+    let config = ntpc_service::config::Config::default();
+    let code = ntpc_service::cli::dispatch(
+        &args,
+        &config,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
     );
+    ExitCode::from(code)
 }

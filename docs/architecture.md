@@ -140,6 +140,79 @@ Task 11 facts. Each line names its source. "Measured" means read on the builder'
 - Error text carries no paths (engine host contract).
 - Load-side hardening (reparse flag and `SECURITY_IDENTIFICATION` on opens of `drift.txt` and the config) lives in `ntpc-service` `safe_open`. It is not duplicated here.
 
+## Platform: `w32time` takeover and domain join (Task 12)
+
+Each line names its source. "Measured" means read on the builder's Windows 11 machine with read-only calls (`sc qc`, `sc enumdepend`, `sc qtriggerinfo` and the read-only live tests). "Guess" means not found in the docs.
+
+### Sources
+
+- [NetGetJoinInformation](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/nf-lmjoin-netgetjoininformation)
+- [NetGetAadJoinInformation](https://learn.microsoft.com/en-us/windows/win32/api/lmjoin/nf-lmjoin-netgetaadjoininformation)
+- [QueryServiceStatusEx](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex)
+- [QueryServiceConfigW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryserviceconfigw)
+- [ChangeServiceConfigW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfigw)
+- [ControlService](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-controlservice)
+- [StartServiceW](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-startservicew)
+- [SERVICE_DELAYED_AUTO_START_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_delayed_auto_start_info)
+- [Service Trigger Events](https://learn.microsoft.com/en-us/windows/win32/services/service-trigger-events)
+- [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings)
+
+### Domain join
+
+- `NET_API_STATUS NetGetJoinInformation(LPCWSTR lpServer, LPWSTR *lpNameBuffer, PNETSETUP_JOIN_STATUS BufferType)`. A null server means the local computer. Netapi32. No special group membership is needed (Learn).
+- The name buffer "is allocated by the system and must be freed using the NetApiBufferFree function" (Learn). The code frees it on every path and never reads it. No domain or workgroup name leaves `join_state`.
+- `NETSETUP_JOIN_STATUS` (Learn, the enum on the function page): `NetSetupUnknownStatus = 0`, `NetSetupUnjoined = 1`, `NetSetupWorkgroupName = 2`, `NetSetupDomainName = 3`.
+- Mapping: 3 is `Domain`. 1 and 2 are `Workgroup`. 0, any other value and any error are `Unknown`.
+- Install rule: `Unknown` is treated like `Domain`, the safe direction. A silent install aborts on both unless `--confirm-domain-joined` is given. An interactive install warns and asks.
+- Out of scope for version one: Entra ID (Azure AD) join and hybrid join. `NetGetAadJoinInformation` (Windows 10 and Server 2016 or later, Learn) reports Entra join and work accounts. It is not called. Guess: an Entra-only device reports `NetSetupWorkgroupName` and a hybrid device reports `NetSetupDomainName`. Not verified. A `DsRegGetJoinInfo` function was not found on Learn. It is not needed for v1.
+
+### Service control
+
+- Service name `w32time` (Learn, the `sc qtriggerinfo w32time` example on the trigger page).
+- Access rights per call (Learn): `QueryServiceStatusEx` needs `SERVICE_QUERY_STATUS`. `QueryServiceConfigW` needs `SERVICE_QUERY_CONFIG`. `ControlService(SERVICE_CONTROL_STOP)` needs `SERVICE_STOP`. `StartServiceW` needs `SERVICE_START`. `ChangeServiceConfigW` needs `SERVICE_CHANGE_CONFIG`. Each wrapper opens its own handle with only the rights its call needs. The query path never asks for more than `SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG`.
+- `QueryServiceConfigW` buffer: "The maximum size of this array is 8K bytes". A null buffer of size 0 fails with `ERROR_INSUFFICIENT_BUFFER` and sets the size (Learn). The code uses that two-call pattern with a u64 buffer for alignment. Only `dwStartType` is read. The strings in the struct are never read.
+- The config query reflects "the configuration of the service when it is next run" if it was changed while running (Learn). So the recorded start type is the one that applies at next boot.
+- Start types (Learn, ChangeServiceConfigW): `SERVICE_BOOT_START 0` and `SERVICE_SYSTEM_START 1` (drivers only), `SERVICE_AUTO_START 2`, `SERVICE_DEMAND_START 3`, `SERVICE_DISABLED 4`. Disabled: "Attempts to start the service result in the error code ERROR_SERVICE_DISABLED".
+- Delayed auto start is a separate flag, `SERVICE_CONFIG_DELAYED_AUTO_START_INFO` (3), read and set with `QueryServiceConfig2W` and `ChangeServiceConfig2W`. "This setting is ignored unless the service is an auto-start service" (Learn). `StartType::AutomaticDelayed` is auto start plus the flag. Setting `Automatic` clears the flag. `Manual` and `Disabled` leave it alone, because it is ignored.
+- Boot and system start are driver-only (Learn). A query that returns them is refused with `SvcError::UnsupportedStartType`. The restore record cannot hold them.
+- Stop: `ControlService` returns `ERROR_DEPENDENT_SERVICES_RUNNING` (1051) when running services depend on the target. We never stop dependents. `ERROR_SERVICE_NOT_ACTIVE` (1062) means it is already stopped. The stop is asynchronous. The code polls the status until `SERVICE_STOPPED`, for at most 30 s (our choice).
+- `ControlService` and `StartServiceW` "will block for 30 seconds if any service is busy handling a control code" (Learn).
+- `StartServiceW` returns once the service thread is created, in `SERVICE_START_PENDING` (Learn). Restore does not wait for running. `ERROR_SERVICE_ALREADY_RUNNING` (1056) counts as success.
+- Measured: `w32time` is `WIN32_SHARE_PROCESS`, start type `AUTO_START (DELAYED)`, no dependencies, 0 dependent services.
+- Measured: `w32time` has two start triggers, "DOMAIN JOINED STATUS" and a "CUSTOM SYSTEM STATE CHANGE EVENT". The trigger page example also shows a not-joined stop trigger.
+- Trigger start of a disabled service: not stated on the trigger page. Guess: a disabled service is not trigger-started, because a disabled service "cannot be started" (ChangeServiceConfigW). Not verified. The triggers are left untouched, so restore needs nothing for them. If the guess is wrong, the 30 s monitor sees `w32time` running and stops clock adjustment.
+- Group Policy: policy values "overwrite any preexisting values in the W32Time section of the registry" (Learn, Tools and Settings). The page says nothing about policy changing the start type. Guess: a GPO "System Services" setting can set `w32time` back to automatic. The monitor covers that case.
+
+### Takeover and restore rules
+
+- Order: query the original state, persist the restore record, stop, disable, query again to verify. A crash between record and stop leaves a record of the true original. Restore from it is idempotent.
+- A valid existing record always wins over the current state. Re-running install on a taken-over machine must not record "disabled, stopped" as the original.
+- Stop refused: nothing changed. Stop timeout: the stop was sent and may still finish. The record stays so uninstall can restore. Disable fails after the stop: `w32time` is started again if it was running (rollback), and both errors are reported.
+- Restore sets the recorded start type. It starts `w32time` only if it was running and the recorded start type is not `Disabled`, because a disabled service cannot be started.
+- Uninstall with no record leaves `w32time` alone and says so. Guessing a start type could undo an administrator's deliberate choice. If `w32time` is disabled at that point (no record, a `Dropped` or untrusted record, an invalid record, or a missing state directory), uninstall exits 18 (`NO_RECORD_DISABLED`) instead of 0, says `w32time` is still disabled and prints the manual restore hint once (R92).
+- Uninstall order (R94): stop our service, put `w32time` back, then remove our registration. When `w32time` was not put back (exit 10 or 18) the registration is kept, stopped, and the run says so. The machine then keeps our time sync rather than none. Gap: the hook has no "start our service again", so it stays stopped until the next boot or a manual start.
+- Uninstall does not create a missing state directory (N5). It looks first without creating anything (`symlink_metadata` on the path and its parent). Missing means no record. A missing parent folder is reported as "state directory unavailable". Install refuses on a missing parent folder with exit 6 and that text. The read-only verify variant of `secure_state_dir` is still deferred. For an existing directory, uninstall calls `secure_state_dir`, which may fix its DACL.
+- Install exit 9 means registration is not built (not ready), nothing changed. Exit 19 means registering failed after the takeover. The text says whether `w32time` was put back (R95).
+- `is_running` reports true on any query error, `NotFound` included (R85). When we cannot tell, the engine must not adjust the clock. A "not found" can also come from a broken service database.
+- The rollback start after a failed disable keys on the state seen at entry, not on the record. On a re-install the record can say "was running" while `w32time` was stopped at entry (M2).
+- A takeover that fails before any change (first query, record save, refused stop) removes the record this run wrote. A pre-existing record is never removed there. A failure after a change keeps the record and says to run uninstall (M8).
+- No record and `w32time` already disabled: install refuses with exit 12 and changes nothing, unless `--accept-disabled-original` is given (R84). A lost record must not make "disabled" the original for ever.
+- Interactive means stdin and stderr are both consoles (R83). The question goes to stderr with a newline. The answer read stops at a newline, at end of input or at 16 bytes (M11). End of input, a read error and an overlong line are a no. Under a wrapper that pipes stderr the run is silent and aborts on a domain-joined machine. The message names `--confirm-domain-joined` and the script's `-ConfirmDomainJoined`. The domain warning goes to stderr too, next to the question, so redirecting stdout cannot hide it (N6).
+- The answer waits at most 120 s (`ANSWER_TIMEOUT`), then counts as no, exit 5 (R93). A console read cannot be cancelled, so the read runs on a helper thread and the main thread uses `recv_timeout`. The helper is never joined on timeout. The process exits right after. A deployment tool, a scheduled task or a hidden console must pass `--silent` or `--confirm-domain-joined`, so no question is asked.
+- Monitor: every 30 s the host sends `AdjustmentAllowed(!running)`. The event is a level, so it is sent every period, not only on change. After a clock failure latch (R39) only `false` then `true` reopens adjustment. `monitor_decision` also says when the state changed, so the host logs transitions only.
+
+### `restore.json`
+
+- Location: `restore.json` in `Config.state_dir` (R86). Install and uninstall take the directory from the config value the caller passes, never from `current_exe` or the environment. Until Task 14 loads the config file, `main` passes `Config::default()`. Risk: a `state_dir` changed between install and uninstall points uninstall at a directory with no record. It then leaves `w32time` alone and says so (safe direction).
+- The state directory is secured by `secure_state_dir` before the record is written. If it cannot be secured or the record cannot be written, install refuses and changes nothing. A stopped `w32time` with no record is worse than no install.
+- Content: one of eight canonical byte strings, `{"version":1,"service":"w32time","start_type":"<t>","was_running":<b>}` and a newline. `<t>` is one of `automatic`, `automatic_delayed`, `manual`, `disabled`. The reader accepts only an exact match. A wrong version, another service name, an unknown start type, a duplicate key, extra whitespace or a truncated file are all refused. Reads stop at 512 bytes.
+- Write: temp file, `sync_all`, then `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (M1). Learn ([MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)): with write-through "The function does not return until the file is actually moved on the disk". The page then says the flag "guarantees that a move performed as a copy and delete operation is flushed". Whether a same-volume rename is also flushed is not stated in more words. Guess: yes, per the first sentence. Non-Windows builds (fuzz job only) use `std::fs::rename` and never write a record.
+- Read (R86): install and uninstall both call `secure_state_dir` first and read only from the directory it verified. The file is opened through `safe_open` (no reparse follow, a symlink is refused). Before any byte is read, the open handle must show a plain file, no reparse attribute, one hard link, at most 512 bytes and an owner of SYSTEM or Administrators (`ntpc_platform::w32time::record_file_facts`, built on the existing `attribute_tag`, `link_info` and `read_security` wrappers). A `Kept` file was only checked on the fast path of `secure_state_dir`, so the read checks again. A junction at the record name fails both read and write, and nothing is written through it (M10, tested).
+- Uninstall when the directory cannot be secured, the record was `Dropped`, or the file fails a check: `w32time` is left alone, exit 17 (`RECORD_NOT_TRUSTED`), or 18 if `w32time` is disabled, and a manual restore hint that names no start type. A `Dropped` record gets uninstall's own words: it may be in a sibling directory named like the state directory with `.old-` and a hex suffix (N3).
+- Install exit codes per `secure_state_dir` refusal class: directory refused 6, bad configured path (bad path, trailing dot or space, reserved name, not a fixed drive) 16, `RollbackFailed` 14, `RestoreCarryFailed` 15, a `Dropped` record 13, an untrusted record file 17. A future `AclError` variant (the enum is non-exhaustive) falls into class 6. Every one of these refusals touches neither `w32time` nor the record.
+- No checksum. A checksum does not stop anyone who can write the file. The defences are the secured directory, the fixed service name and the closed set of values.
+- Since the Task 11 merge `restore.json` and `restore.json.tmp` are in `KNOWN_CHILDREN`, and a weak directory is replaced with `restore.json` carried over when it passes the checks (R80). The earlier note that the record blocks a re-ACL no longer applies.
+
 ## Platform: DHCP option 42 (Task 13)
 
 Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe on the builder's Windows 11 machine (build 26300). Probes read registry value names, value kinds and option numbers only. No address, name or lease value was copied anywhere.

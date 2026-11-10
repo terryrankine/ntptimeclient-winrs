@@ -1,5 +1,6 @@
 //! Service wiring. Config and runtime arrive in later tasks.
 
+pub mod cli;
 pub mod config;
 pub mod drift_store;
 pub mod proto;
