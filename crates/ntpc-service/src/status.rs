@@ -87,7 +87,8 @@ pub struct Counters {
     pub kiss_of_death: u64,
     /// Queries that could not be sent or got only ICMP errors.
     pub unreachable: u64,
-    /// Queries ended by too many bad datagrams.
+    /// Queries the transport ended as malformed. `UdpTransport` never does
+    /// (R97), so this counts other transports only.
     pub malformed: u64,
     /// Engine queries skipped because one for the same source was in flight.
     pub duplicate_queries: u64,

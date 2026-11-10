@@ -12,7 +12,7 @@ use ntpc_core::{KodCode, QueryFailure, SourceId};
 use ntpc_service::logging::{LineLogger, MemorySink};
 use ntpc_service::proto::NtpTime;
 use ntpc_service::proto::codec::{self, Header, MODE_SERVER};
-use ntpc_service::transport::{MAX_DISCARDS, NoTuning, StdTimeSource, Transport, UdpTransport};
+use ntpc_service::transport::{NoTuning, StdTimeSource, Transport, UdpTransport};
 
 /// What the server does for one request.
 #[derive(Debug, Clone)]
@@ -33,6 +33,8 @@ enum Act {
     Replay,
     /// This many garbage datagrams, then a good reply.
     Garbage(u32),
+    /// Garbage without pause for this long, and no reply.
+    Flood(Duration),
     /// No reply.
     Silent,
 }
@@ -156,6 +158,14 @@ fn serve(local: IpAddr, acts: Vec<Act>) -> (SocketAddr, JoinHandle<()>) {
                     std::thread::sleep(Duration::from_millis(20));
                     let _ = sock.send_to(&good(0.0), from);
                 }
+                Act::Flood(d) => {
+                    let end = Instant::now() + d;
+                    let mut i = 0u8;
+                    while Instant::now() < end {
+                        let _ = sock.send_to(&[i; 48], from);
+                        i = i.wrapping_add(1);
+                    }
+                }
                 Act::Silent => {}
             }
         }
@@ -185,8 +195,8 @@ fn udp_transport_handles_fake_server_faults() {
         Act::Spoof,
         Act::Good(0.0),
         Act::Replay,
-        Act::Garbage(MAX_DISCARDS),
-        Act::Garbage(MAX_DISCARDS + 1),
+        Act::Garbage(1000),
+        Act::Flood(Duration::from_millis(600)),
         Act::Silent,
     ];
     let (server, handle) = serve(IpAddr::V4(Ipv4Addr::LOCALHOST), acts);
@@ -227,11 +237,24 @@ fn udp_transport_handles_fake_server_faults() {
     q(1000).expect("replay then good");
     assert_eq!(t.stats().discarded - before, 1);
 
-    // Up to MAX_DISCARDS bad datagrams are survived.
-    q(1000).expect("eight garbage then good");
-    // One more ends the query as malformed and the real reply is lost.
-    // Documented in the transport module.
-    assert_eq!(q(1000), Err(QueryFailure::Malformed));
+    // R97: no count of bad datagrams ends a query.
+    let before = t.stats().discarded;
+    q(3000).expect("1000 garbage then good");
+    assert!(
+        t.stats().discarded - before >= 900,
+        "most of the garbage arrived"
+    );
+    // A flood for the whole timeout ends at the deadline, not before and
+    // not much after. Each loop turn waits in the socket for a datagram.
+    let started = Instant::now();
+    assert_eq!(q(300), Err(QueryFailure::Timeout));
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_millis(800),
+        "{took:?}"
+    );
+    // Let the rest of the flood land on the closed socket.
+    std::thread::sleep(Duration::from_millis(400));
 
     assert_eq!(q(200), Err(QueryFailure::Timeout));
     handle.join().expect("server thread");

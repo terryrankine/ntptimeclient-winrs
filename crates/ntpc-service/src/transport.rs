@@ -14,14 +14,18 @@
 //!   port.
 //! - The receive time is read right after `recv_from` returns, before any
 //!   parsing, so parse cost does not show up as delay.
-//! - Ruling R55: a datagram that fails a check (malformed, wrong sender,
-//!   wrong origin, truncated) is discarded and the wait goes on until the
-//!   deadline. Only a good reply, a kiss-of-death or the deadline ends the
-//!   query. Otherwise one spoofed datagram could cancel every real query.
-//! - At most [`MAX_DISCARDS`] datagrams are discarded per query. The next
-//!   bad one ends the query as [`QueryFailure::Malformed`]. That bounds the
-//!   work a flood can cause. The real reply may then be lost, and the engine
-//!   sees one failed query.
+//! - Rulings R55 and R97: a datagram that fails a check (malformed, wrong
+//!   sender, wrong origin, truncated, too long) is discarded, and so is an
+//!   ICMP error report. The wait goes on until the deadline. Only a good
+//!   reply, a kiss-of-death or the deadline ends the query. No count of bad
+//!   datagrams ends it, or a blind spoofer who knows the port could cancel
+//!   every real query. A flood costs CPU for at most the timeout, and each
+//!   loop turn waits in the socket for a datagram, so the work is bounded
+//!   by what arrives.
+//! - One guard against a hot loop: [`MAX_IO_ERRORS_IN_ROW`] socket errors in
+//!   a row that are not about one datagram end the query as
+//!   [`QueryFailure::Unreachable`]. A broken socket fails at once on every
+//!   call, so without the guard the loop would spin until the deadline.
 //! - The query returns at the first good reply or kiss-of-death, so the
 //!   request token and its socket are dropped then. A replay of that reply
 //!   reaches a closed port, and a later query has a new origin (Task 9 M4).
@@ -39,10 +43,13 @@ use ntpc_core::{Mono, QueryFailure, Sample, SourceId};
 use crate::logging::{Level, Logger};
 use crate::proto::{NtpTime, build_request, parse_response};
 
-/// Most datagrams discarded in one query before it ends as malformed.
-/// An honest server sends one reply. Eight leaves room for strays and
-/// duplicates on a bad path.
-pub const MAX_DISCARDS: u32 = 8;
+/// Socket errors in a row, not tied to one datagram, that end a query as
+/// unreachable. A datagram, an ICMP report or a read timeout in between
+/// resets the count. Only a broken socket gets there.
+pub const MAX_IO_ERRORS_IN_ROW: u32 = 16;
+
+/// Windows `WSAEMSGSIZE`: one datagram was longer than the buffer.
+const WSAEMSGSIZE: i32 = 10040;
 
 /// Receive buffer. A plain reply is 48 bytes. Extension fields can make it
 /// longer. Only the header is read, but a larger datagram must still fit,
@@ -210,26 +217,7 @@ impl UdpTransport {
         UdpSocket::bind(local)
     }
 
-    fn discard(&self, discards: &mut u32) -> Option<QueryFailure> {
-        self.counters.discarded.fetch_add(1, Ordering::Relaxed);
-        *discards += 1;
-        (*discards > MAX_DISCARDS).then_some(QueryFailure::Malformed)
-    }
-}
-
-impl Transport for UdpTransport {
-    fn query(
-        &self,
-        source: SourceId,
-        dest: SocketAddr,
-        timeout: Duration,
-    ) -> Result<Sample, QueryFailure> {
-        self.tuning.raise_priority();
-        let deadline = Instant::now() + timeout;
-        let socket = self
-            .socket_for(dest)
-            .map_err(|_| QueryFailure::Unreachable)?;
-        let (request, token) = build_request(NtpTime::from_unix_nanos(self.time.wall_ns()), dest);
+    fn check_nonce(&self, request: &[u8]) {
         // R57: proto keeps the origin private. A failed RNG sends a zero
         // transmit field, which a real nonce is with chance 2^-64.
         if request
@@ -246,12 +234,28 @@ impl Transport for UdpTransport {
                 ),
             );
         }
+    }
+
+    /// One request and the wait for its answer, on any socket.
+    fn exchange<S: Socket>(
+        &self,
+        socket: &S,
+        source: SourceId,
+        dest: SocketAddr,
+        deadline: Instant,
+    ) -> Result<Sample, QueryFailure> {
+        // T1 is read here. `build_request` draws the nonce after it (proto.rs
+        // takes T1 as an argument and is not ours to change), so T1 is early
+        // by one CSPRNG call and an encode, about a microsecond. That adds
+        // about half of it to the offset.
+        let (request, token) = build_request(NtpTime::from_unix_nanos(self.time.wall_ns()), dest);
+        self.check_nonce(&request);
         socket
-            .send_to(&request, dest)
+            .send(&request, dest)
             .map_err(|_| QueryFailure::Unreachable)?;
 
         let mut buf = [0u8; RECV_BUF];
-        let mut discards = 0u32;
+        let mut errors_in_row = 0u32;
         let mut reset_seen = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -262,17 +266,15 @@ impl Transport for UdpTransport {
                     QueryFailure::Timeout
                 });
             }
-            if socket
-                .set_read_timeout(Some(left.max(MIN_READ_TIMEOUT)))
-                .is_err()
-            {
+            if socket.set_timeout(left.max(MIN_READ_TIMEOUT)).is_err() {
                 return Err(QueryFailure::Unreachable);
             }
-            match socket.recv_from(&mut buf) {
+            match socket.recv(&mut buf) {
                 Ok((n, from)) => {
                     // T4 first. Everything after this is not network delay.
                     let received = NtpTime::from_unix_nanos(self.time.wall_ns());
                     let at = self.time.mono();
+                    errors_in_row = 0;
                     let bytes = buf.get(..n).unwrap_or(&[]);
                     match parse_response(bytes, from, &token, received, source, at) {
                         Ok(sample) => return Ok(sample),
@@ -280,36 +282,71 @@ impl Transport for UdpTransport {
                             return Err(QueryFailure::KissOfDeath(code));
                         }
                         Err(_) => {
-                            if let Some(fail) = self.discard(&mut discards) {
-                                return Err(fail);
-                            }
+                            self.counters.discarded.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {}
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => errors_in_row = 0,
                     io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused => {
                         // ICMP port unreachable on Windows. Spoofable, so it
-                        // does not end the wait. It counts against the
-                        // discard cap, so a socket that keeps reporting it
-                        // cannot spin this loop until the deadline.
+                        // never ends the wait. One arrives per ICMP packet.
                         self.counters.resets.fetch_add(1, Ordering::Relaxed);
                         reset_seen = true;
-                        discards += 1;
-                        if discards > MAX_DISCARDS {
-                            return Err(QueryFailure::Unreachable);
-                        }
+                        errors_in_row = 0;
                     }
-                    // A datagram longer than the buffer, or any other
-                    // per-datagram error.
+                    _ if e.raw_os_error() == Some(WSAEMSGSIZE) => {
+                        // One datagram too long for the buffer.
+                        self.counters.discarded.fetch_add(1, Ordering::Relaxed);
+                        errors_in_row = 0;
+                    }
                     _ => {
-                        if let Some(fail) = self.discard(&mut discards) {
-                            return Err(fail);
+                        errors_in_row += 1;
+                        if errors_in_row >= MAX_IO_ERRORS_IN_ROW {
+                            return Err(QueryFailure::Unreachable);
                         }
                     }
                 },
             }
         }
+    }
+}
+
+/// The three socket calls a query makes. A trait so tests can feed errors
+/// that loopback cannot produce, such as a run of ICMP reports.
+trait Socket {
+    fn send(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize>;
+    fn set_timeout(&self, d: Duration) -> io::Result<()>;
+    fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+}
+
+impl Socket for UdpSocket {
+    fn send(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
+        self.send_to(buf, dest)
+    }
+
+    fn set_timeout(&self, d: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(d))
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf)
+    }
+}
+
+impl Transport for UdpTransport {
+    fn query(
+        &self,
+        source: SourceId,
+        dest: SocketAddr,
+        timeout: Duration,
+    ) -> Result<Sample, QueryFailure> {
+        self.tuning.raise_priority();
+        let deadline = Instant::now() + timeout;
+        let socket = self
+            .socket_for(dest)
+            .map_err(|_| QueryFailure::Unreachable)?;
+        self.exchange(&socket, source, dest, deadline)
     }
 
     fn stats(&self) -> TransportStats {
@@ -318,5 +355,121 @@ impl Transport for UdpTransport {
             discarded: self.counters.discarded.load(Ordering::Relaxed),
             resets: self.counters.resets.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::{LineLogger, MemorySink};
+    use crate::proto::codec::{self, Header, MODE_SERVER};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    const SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)), 123);
+
+    enum Step {
+        Reset,
+        Broken,
+        Good,
+    }
+
+    /// Plays a script of receive results. `Good` answers the request.
+    struct Script {
+        steps: RefCell<VecDeque<Step>>,
+        request: RefCell<Vec<u8>>,
+        calls: RefCell<u32>,
+    }
+
+    impl Socket for Script {
+        fn send(&self, buf: &[u8], _dest: SocketAddr) -> io::Result<usize> {
+            *self.request.borrow_mut() = buf.to_vec();
+            Ok(buf.len())
+        }
+
+        fn set_timeout(&self, _d: Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            *self.calls.borrow_mut() += 1;
+            match self.steps.borrow_mut().pop_front() {
+                Some(Step::Reset) => Err(io::ErrorKind::ConnectionReset.into()),
+                Some(Step::Broken) => Err(io::Error::other("socket broken")),
+                Some(Step::Good) => {
+                    let req = codec::decode(&self.request.borrow()).expect("request");
+                    let now = NtpTime::from_unix_nanos(StdTimeSource::new().wall_ns()).to_bits();
+                    let reply = codec::encode(&Header {
+                        leap: 0,
+                        version: 4,
+                        mode: MODE_SERVER,
+                        stratum: 2,
+                        poll: 6,
+                        precision: -20,
+                        root_delay: 0,
+                        root_dispersion: 0,
+                        reference_id: *b"TEST",
+                        reference_time: now,
+                        origin_time: req.transmit_time,
+                        receive_time: now,
+                        transmit_time: now,
+                    });
+                    buf[..48].copy_from_slice(&reply);
+                    Ok((48, SERVER))
+                }
+                // Nothing more: the socket read times out.
+                None => Err(io::ErrorKind::TimedOut.into()),
+            }
+        }
+    }
+
+    fn run(steps: Vec<Step>) -> (Result<Sample, QueryFailure>, u32, TransportStats) {
+        let time = Arc::new(StdTimeSource::new());
+        let log = Arc::new(LineLogger::new(Box::new(MemorySink::new()), time.clone()));
+        let t = UdpTransport::new(time, Arc::new(NoTuning), log);
+        let s = Script {
+            steps: RefCell::new(steps.into()),
+            request: RefCell::new(Vec::new()),
+            calls: RefCell::new(0),
+        };
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let r = t.exchange(&s, SourceId::new(1), SERVER, deadline);
+        let calls = *s.calls.borrow();
+        (r, calls, t.stats())
+    }
+
+    #[test]
+    fn fifty_icmp_resets_then_a_good_reply_is_ok() {
+        let mut steps: Vec<Step> = (0..50).map(|_| Step::Reset).collect();
+        steps.push(Step::Good);
+        let (r, _, stats) = run(steps);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(stats.resets, 50);
+    }
+
+    #[test]
+    fn a_run_of_socket_errors_ends_as_unreachable() {
+        let steps: Vec<Step> = (0..100).map(|_| Step::Broken).collect();
+        let (r, calls, _) = run(steps);
+        assert_eq!(r, Err(QueryFailure::Unreachable));
+        assert_eq!(calls, MAX_IO_ERRORS_IN_ROW);
+    }
+
+    #[test]
+    fn socket_errors_split_by_resets_do_not_end_the_query() {
+        let mut steps = Vec::new();
+        for _ in 0..5 {
+            steps.extend((1..MAX_IO_ERRORS_IN_ROW).map(|_| Step::Broken));
+            steps.push(Step::Reset);
+        }
+        steps.push(Step::Good);
+        let (r, _, _) = run(steps);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn resets_alone_end_as_unreachable_at_the_deadline() {
+        assert_eq!(run(vec![Step::Reset]).0, Err(QueryFailure::Unreachable));
+        assert_eq!(run(vec![]).0, Err(QueryFailure::Timeout));
     }
 }
