@@ -2,11 +2,15 @@
 //! It never touches the clock, the network or the file system.
 
 mod error;
+pub mod filter;
 mod ports;
+pub mod select;
 mod types;
 
 pub use error::{ClockError, StoreError};
+pub use filter::SourceFilter;
 pub use ports::{Clock, DriftStore};
+pub use select::{Selection, SelectionConfig, select};
 pub use types::{
     Delay, KodCode, Mono, Offset, Ppm, QueryFailure, Sample, SourceId, SourceSpec, Tier,
 };
