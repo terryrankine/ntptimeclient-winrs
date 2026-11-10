@@ -1,4 +1,4 @@
-Tracking pool.ntp.org [203.14.0.251:123].
+Tracking pool.ntp.org [192.0.2.2:123].
 Collecting 120 samples.
 The current time is 10/11/2026 11:43:59 AM.
 11:43:59, +00.0009058s
