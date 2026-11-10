@@ -1,7 +1,7 @@
 //! NTP protocol adapter. Builds client requests and checks server replies.
 //!
-//! The `ntp-proto` parser decodes the 48 byte header and draws the random
-//! origin. Every check that decides whether a reply is trusted is here.
+//! [`codec`] moves the 48 header bytes. Every check that decides whether a
+//! reply is trusted is here.
 //!
 //! Rules:
 //! - The transmit timestamp of a request is random, not our clock. A blind
@@ -9,28 +9,24 @@
 //! - A reply counts only if it comes from the address and port the request
 //!   went to and echoes that random value exactly. Kiss-o'-Death is honoured
 //!   only after both checks, so a spoofer cannot silence a source.
-//! - Only the header is read. We send no extension fields and hold no key,
-//!   so anything after byte 48 cannot be checked and is ignored.
+//! - Only the header is read. An unauthenticated client has nothing to check
+//!   extension fields or a MAC against, so it ignores anything after byte 48.
 //! - Absolute times become integer nanosecond deltas before any `f64`.
 //!   NTP subtraction wraps, so a reply across the 2036 era boundary works.
 
-use std::io::Cursor;
+pub mod codec;
+
 use std::net::SocketAddr;
 
-use ntp_proto::{
-    NoCipher, NtpAssociationMode, NtpDuration, NtpLeapIndicator, NtpPacket, NtpTimestamp,
-    PollInterval,
-};
 use ntpc_core::{Delay, KodCode, Mono, Offset, QueryFailure, Sample, SourceId};
 
-/// Header length in bytes for versions 3 and 4.
-const HEADER_LEN: usize = 48;
+use codec::{Header, LEAP_ALARM, MODE_SERVER};
 
 /// Highest stratum a usable server can report. 16 means unsynchronised.
 const MAX_STRATUM: u8 = 15;
 
 /// Poll exponent sent in the request, 2^6 = 64 s, the engine's shortest.
-const REQUEST_POLL: u8 = 6;
+const REQUEST_POLL: i8 = 6;
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
 
@@ -72,14 +68,6 @@ impl NtpTime {
         let bits = (era_secs << 32) | fraction;
         Self(u64::try_from(bits).unwrap_or(0))
     }
-
-    fn to_timestamp(self) -> NtpTimestamp {
-        let secs = u32::try_from(self.0 >> 32).unwrap_or(u32::MAX);
-        let fraction = self.0 & 0xFFFF_FFFF;
-        // Below 1e9 because `fraction` is below 2^32.
-        let nanos = u32::try_from((fraction * 1_000_000_000) >> 32).unwrap_or(0);
-        NtpTimestamp::from_seconds_nanos_since_ntp_era(secs, nanos)
-    }
 }
 
 /// What a reply must match. Built by [`build_request`].
@@ -87,8 +75,9 @@ impl NtpTime {
 /// `Debug` prints no field. The origin is a secret until the reply comes
 /// back, and a log line holding it would help a spoofer.
 pub struct RequestToken {
-    /// The random transmit timestamp we sent, as wire bytes.
-    origin: [u8; 8],
+    /// The random transmit timestamp we sent. `None` if the OS gave no
+    /// random bytes. Then no reply can match.
+    origin: Option<u64>,
     /// Where the request went.
     dest: SocketAddr,
     /// Our real clock when the request left (T1).
@@ -107,25 +96,16 @@ impl std::fmt::Debug for RequestToken {
 /// packet.
 #[must_use]
 pub fn build_request(now: NtpTime, dest: SocketAddr) -> (Vec<u8>, RequestToken) {
-    // `ntp-proto` fills the transmit timestamp from `rand::thread_rng`,
-    // a ChaCha CSPRNG seeded by the OS. Its own identifier type is not
-    // nameable outside the crate, so the token keeps the wire bytes.
-    let (packet, _) = NtpPacket::poll_message(PollInterval::from_byte(REQUEST_POLL));
-    let mut buf = [0u8; HEADER_LEN];
-    let written = packet
-        .serialize(&mut Cursor::new(&mut buf[..]), &NoCipher, None)
-        .is_ok();
-    // A v4 poll message with no extension fields is exactly 48 bytes, so
-    // the write cannot fail. Should a future `ntp-proto` change that, an
-    // all-zero origin makes every reply fail the origin check.
-    let origin = if written {
-        transmit_bytes(&buf)
-    } else {
-        buf = [0; HEADER_LEN];
-        [0; 8]
-    };
+    // `getrandom` reads the OS CSPRNG (`ProcessPrng` on Windows).
+    let mut nonce = [0u8; 8];
+    let origin = getrandom::fill(&mut nonce)
+        .ok()
+        .map(|()| u64::from_be_bytes(nonce));
+    // On failure the request still goes out with a zero transmit time. The
+    // token holds no origin, so even a reply that echoes zero is refused.
+    let header = Header::client_request(REQUEST_POLL, origin.unwrap_or(0));
     (
-        buf.to_vec(),
+        codec::encode(&header).to_vec(),
         RequestToken {
             origin,
             dest,
@@ -158,52 +138,53 @@ pub fn parse_response(
     if !same_endpoint(from, token.dest) {
         return Err(BAD);
     }
-    let header = bytes.get(..HEADER_LEN).ok_or(BAD)?;
-    let first = header.first().copied().ok_or(BAD)?;
-    // Version 5 has another layout and other kiss rules. We send v4, so a v5
-    // answer is wrong. Rejecting it here keeps that parser path unused.
-    if !matches!((first >> 3) & 0x07, 3 | 4) {
+    let h = codec::decode(bytes).ok_or(BAD)?;
+    // We send version 4. Old servers answer with 3. Version 5 has another
+    // layout and other kiss rules.
+    if !matches!(h.version, 3 | 4) {
         return Err(BAD);
     }
-    if header.get(24..32) != Some(&token.origin[..]) {
+    if token.origin != Some(h.origin_time) {
         return Err(BAD);
     }
-    let (packet, _) = NtpPacket::deserialize(header, &NoCipher).map_err(|_| BAD)?;
-    if packet.mode() != NtpAssociationMode::Server {
+    if h.mode != MODE_SERVER {
         return Err(BAD);
     }
     // A kiss usually carries LI 3, so it is read before the leap check.
-    if packet.stratum() == 0 {
-        return Err(kiss(&packet, header));
+    if h.stratum == 0 {
+        return Err(kiss(h.reference_id));
     }
-    if packet.stratum() > MAX_STRATUM || packet.leap() == NtpLeapIndicator::Unsynchronized {
+    // Rejected here, not passed on as flags. The engine filter keeps the
+    // lowest-delay sample per source before selection drops flagged ones,
+    // so one flagged sample could hide that source's good samples.
+    if h.stratum > MAX_STRATUM || h.leap == LEAP_ALARM {
         return Err(BAD);
     }
 
-    let t1 = token.sent.to_timestamp();
-    let t2 = packet.receive_timestamp();
-    let t3 = packet.transmit_timestamp();
-    let t4 = received.to_timestamp();
+    let t1 = token.sent.to_bits();
+    let t2 = h.receive_time;
+    let t3 = h.transmit_time;
+    let t4 = received.to_bits();
     // Zero means the server never set the field.
-    if t2 == NtpTimestamp::default() || t3 == NtpTimestamp::default() {
+    if t2 == 0 || t3 == 0 {
         return Err(BAD);
     }
 
-    let round_trip = nanos(t4 - t1);
-    let in_server = nanos(t3 - t2);
+    let round_trip = diff_nanos(t4, t1);
+    let in_server = diff_nanos(t3, t2);
     let delay = round_trip - in_server;
     // Each step backwards is impossible on an honest path. A negative delay
     // would also win the lowest-delay filter.
     if round_trip < 0 || in_server < 0 || delay < 0 {
         return Err(BAD);
     }
-    let offset = i128::midpoint(nanos(t2 - t1), nanos(t3 - t4));
+    let offset = i128::midpoint(diff_nanos(t2, t1), diff_nanos(t3, t4));
 
     Ok(Sample {
         source,
         offset: Offset::from_secs(secs(offset)),
         delay: Delay::from_secs(secs(delay)),
-        stratum: packet.stratum(),
+        stratum: h.stratum,
         // LI 3 is rejected above, so a sample never carries either flag.
         unsynchronised: false,
         leap_alarm: false,
@@ -213,23 +194,18 @@ pub fn parse_response(
 
 /// Maps a stratum 0 reply. RFC 5905 puts the kiss code in the refid as four
 /// ASCII characters. Anything else at stratum 0 is not a kiss.
-fn kiss(packet: &NtpPacket<'_>, header: &[u8]) -> QueryFailure {
-    // The interval only matters for v5 kiss rules. v5 is rejected earlier.
-    let poll = PollInterval::from_byte(REQUEST_POLL);
-    if packet.is_kiss_deny() {
-        QueryFailure::KissOfDeath(KodCode::Deny)
-    } else if packet.is_kiss_rstr() {
-        QueryFailure::KissOfDeath(KodCode::Rstr)
-    } else if packet.is_kiss_rate(poll) {
-        QueryFailure::KissOfDeath(KodCode::Rate)
-    } else if header.get(12..16).is_some_and(|c| {
-        c.iter()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-    }) {
-        // `ntp-proto` cannot name other codes. The shape check is ours.
-        QueryFailure::KissOfDeath(KodCode::Other)
-    } else {
-        QueryFailure::Malformed
+fn kiss(code: [u8; 4]) -> QueryFailure {
+    match &code {
+        b"DENY" => QueryFailure::KissOfDeath(KodCode::Deny),
+        b"RSTR" => QueryFailure::KissOfDeath(KodCode::Rstr),
+        b"RATE" => QueryFailure::KissOfDeath(KodCode::Rate),
+        c if c
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) =>
+        {
+            QueryFailure::KissOfDeath(KodCode::Other)
+        }
+        _ => QueryFailure::Malformed,
     }
 }
 
@@ -239,16 +215,13 @@ fn same_endpoint(a: SocketAddr, b: SocketAddr) -> bool {
     a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical()
 }
 
-fn transmit_bytes(header: &[u8; HEADER_LEN]) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&header[40..48]);
-    out
-}
-
-/// A wrapped NTP difference as signed nanoseconds.
-fn nanos(d: NtpDuration) -> i128 {
-    let (s, n) = d.as_seconds_nanos();
-    i128::from(s) * NANOS_PER_SEC + i128::from(n)
+/// `later - earlier` in nanoseconds, floored. The subtraction wraps and is
+/// read as signed, so the result is the nearest one within +-2^31 s. This is
+/// what makes era rollover work.
+fn diff_nanos(later: u64, earlier: u64) -> i128 {
+    let units = i128::from(later.wrapping_sub(earlier).cast_signed());
+    // At most 2^63 * 1e9, well inside i128. The shift floors.
+    (units * NANOS_PER_SEC) >> 32
 }
 
 #[expect(
@@ -264,17 +237,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nanos_keeps_sign_and_fraction() {
-        let base = NtpTime::from_bits(0x0000_0010_0000_0000).to_timestamp();
-        let later = NtpTime::from_bits(0x0000_0010_8000_0000).to_timestamp();
-        assert_eq!(nanos(later - base), 500_000_000);
-        assert_eq!(nanos(base - later), -500_000_000);
+    fn diff_nanos_keeps_sign_and_fraction() {
+        let base = 0x0000_0010_0000_0000;
+        let later = 0x0000_0010_8000_0000;
+        assert_eq!(diff_nanos(later, base), 500_000_000);
+        assert_eq!(diff_nanos(base, later), -500_000_000);
     }
 
     #[test]
-    fn to_timestamp_extremes_do_not_panic() {
-        for bits in [0, 1, u64::MAX, 0xFFFF_FFFF, 0xFFFF_FFFF_0000_0000] {
-            let _ = NtpTime::from_bits(bits).to_timestamp();
+    fn diff_nanos_wraps_across_the_era() {
+        // Era 0 last second plus 0.5 to era 1 second 0 plus 0.5: one second.
+        assert_eq!(
+            diff_nanos(0x0000_0000_8000_0000, 0xFFFF_FFFF_8000_0000),
+            1_000_000_000
+        );
+    }
+
+    #[test]
+    fn diff_nanos_extremes_do_not_panic() {
+        for (a, b) in [(0, u64::MAX), (u64::MAX, 0), (1 << 63, 0), (0, 1 << 63)] {
+            let _ = diff_nanos(a, b);
         }
+    }
+
+    #[test]
+    fn kiss_maps_named_codes_and_shape() {
+        assert_eq!(kiss(*b"DENY"), QueryFailure::KissOfDeath(KodCode::Deny));
+        assert_eq!(kiss(*b"X9ZZ"), QueryFailure::KissOfDeath(KodCode::Other));
+        assert_eq!(kiss(*b"deny"), QueryFailure::Malformed);
     }
 }
