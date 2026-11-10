@@ -303,7 +303,7 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 ### Thread priority (`thread::set_current_thread_priority`)
 
 - `SetThreadPriority` and `GetThreadPriority` on the `GetCurrentThread` pseudo handle. Only the calling thread is touched. No process priority class, no other thread.
-- Query workers use `THREAD_PRIORITY_ABOVE_NORMAL` (1). Not time critical: a busy worker must not starve the machine.
+- Query workers use `THREAD_PRIORITY_ABOVE_NORMAL` (1). The API offers `Normal` and `AboveNormal` only. Not time critical: a busy worker must not starve the machine.
 - The guard restores the previous level on drop, on the same thread (the guard is not `Send`). A short worker thread may `keep` the level for the rest of its life.
 
 ### Hard link count (`file_link_count`)
@@ -321,5 +321,6 @@ Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe
 - `w32time` monitor: query rights only, true on any error or a missing service (R85).
 - DHCP: the per-adapter read. Only a real "no option 42" goes to the host's negative cache, never a failed adapter.
 - Network events: a watcher thread waits on the address subscription, sets a flag and wakes the loop. The host reads and clears the flag each turn.
-- Resume: the service control handler calls `ResumeNotifier::notify_resumed` on a resume power event. It sets the flag the host reads and wakes the loop.
+- Resume: the service control handler calls `ResumeNotifier::notify_resumed` on both `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND`. It sets the flag the host reads and wakes the loop. Notifications within 5 s of the last counted one are one resume (R107). The window is measured in wall time, because monotonic time stops during sleep. A wall clock that went back counts as a new resume.
+- Log file failure: the first time `service.log` cannot be written, the other sinks get one Error line saying so. Later failures only count.
 - Query workers raise their own thread to above normal before each query.

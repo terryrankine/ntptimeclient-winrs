@@ -67,6 +67,44 @@ fn a_refused_directory_gets_no_log_file() {
 }
 
 #[test]
+fn a_failing_log_file_is_told_to_the_other_sinks_once() {
+    let s = Scratch::new("logfail");
+    // The directory does not exist, so every file write fails.
+    let gone = s.0.join("missing");
+    let mem = MemorySink::new();
+    let logger = build_logger(
+        SecureOutcome::Ok,
+        &gone,
+        vec![Box::new(mem.clone())],
+        time(),
+    );
+    for _ in 0..3 {
+        logger.log(Level::Info, "test", "hello");
+    }
+    let lines = mem.lines();
+    let told: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains(FILE_FAILED_LINE))
+        .collect();
+    assert_eq!(told.len(), 1, "{lines:?}");
+    assert!(
+        told[0].contains(" ERROR "),
+        "logger line format: {}",
+        told[0]
+    );
+    assert_eq!(lines.iter().filter(|l| l.ends_with("hello")).count(), 3);
+}
+
+#[test]
+fn a_working_log_file_tells_nothing() {
+    let s = Scratch::new("logok");
+    let mem = MemorySink::new();
+    let logger = build_logger(SecureOutcome::Ok, &s.0, vec![Box::new(mem.clone())], time());
+    logger.log(Level::Info, "test", "hello");
+    assert!(!mem.lines().iter().any(|l| l.contains(FILE_FAILED_LINE)));
+}
+
+#[test]
 fn the_log_names_are_known_state_children() {
     assert!(ntpc_platform::KNOWN_CHILDREN.contains(&LOG_FILE_NAME));
     let rotated = format!("{LOG_FILE_NAME}.1");

@@ -407,4 +407,17 @@ mod tests {
         let k = AdapterKey::new(&guid_of(&adapter_name_wide(b"{0A-1b}").unwrap()), S1);
         assert_eq!(k.0, "{0A-1b}/192.0.2.67");
     }
+
+    /// Ignored: it may send a DHCPINFORM on every leased adapter and block
+    /// up to 2 minutes each. Never run it outside a throwaway VM. It checks
+    /// the shape only and prints nothing, never a key or a server.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "may send a DHCPINFORM: network action, throwaway VM only"]
+    fn live_per_adapter_read_returns_without_panic() {
+        match read_lease_servers_per_adapter(&HashSet::new()) {
+            Ok(leases) => assert!(leases.iter().all(|l| l.options != LeaseOptions::Skipped)),
+            Err(e) => assert_ne!(e.to_string(), ""),
+        }
+    }
 }
