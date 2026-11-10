@@ -8,13 +8,18 @@
 //! 1. Refuse unless the service registration hook is ready (Task 14).
 //! 2. Refuse unless elevated.
 //! 3. Domain join rule. `Unknown` counts as domain joined. A silent install
-//!    (`--silent`, or stdin not a terminal) aborts unless
+//!    (`--silent`, or stdin or stderr not a console, R83) aborts unless
 //!    `--confirm-domain-joined` is given. An interactive install warns and
-//!    asks, default no.
+//!    asks on stderr, default no.
 //! 4. Secure the state directory. Refuse if it cannot be secured: a
 //!    stopped `w32time` with no restore record is worse than no install.
 //! 5. Load an existing record. A tampered one refuses and changes nothing.
+//!    With no record and `w32time` already disabled, refuse unless
+//!    `--accept-disabled-original` (R84): a lost record must not turn
+//!    "disabled" into the original for ever.
 //! 6. Take over `w32time`. The record is written before anything changes.
+//!    If the takeover fails before any change, the record this run wrote is
+//!    removed again (M8).
 //! 7. Register our service (Task 14 hook). On failure `w32time` is put back.
 //!
 //! Uninstall: stop our service (hook), restore `w32time` from the record,
@@ -24,17 +29,23 @@
 //!
 //! Messages carry no paths, machine names, user names or domain names.
 
-use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use ntpc_platform::JoinState;
 use ntpc_platform::w32time::{
-    Restore, RestoreFormatError, ServiceControl, TakeoverError, restore, take_over,
+    Restore, RestoreFormatError, ServiceControl, StartType, TakeoverError, W32TIME, restore,
+    take_over,
 };
 use thiserror::Error;
 
-use crate::safe_open;
+mod console;
+mod record_file;
+
+#[cfg(windows)]
+pub use console::ConsoleHost;
+pub use console::{Console, MAX_ANSWER_BYTES, read_answer};
+pub use record_file::{FileRecordStore, RECORD_FILE_NAME, RECORD_TEMP_NAME};
 
 /// Process exit codes. Stable: the packaging scripts read them.
 pub mod exit {
@@ -58,16 +69,21 @@ pub mod exit {
     /// The `w32time` takeover failed. The message says what changed. The
     /// record stays so uninstall can restore.
     pub const TAKEOVER: u8 = 8;
-    /// Our service could not be registered, or registration is not built
-    /// yet. `w32time` was put back.
+    /// Our service registration is not built yet: install refused before
+    /// any change. Or registering failed after the takeover: `w32time` was
+    /// put back (the message says whether that worked).
     pub const REGISTER: u8 = 9;
     /// Uninstall could not restore `w32time`. The record stays.
     pub const RESTORE: u8 = 10;
     /// Uninstall could not stop or remove our service registration.
     pub const UNREGISTER: u8 = 11;
+    /// No restore record and `w32time` is already disabled, without
+    /// `--accept-disabled-original`. `w32time` was not changed. Distinct from
+    /// the packaging wrapper's own codes 40 to 47.
+    pub const DISABLED_ORIGINAL: u8 = 12;
 
     /// Every code, for tests.
-    pub const ALL: [u8; 11] = [
+    pub const ALL: [u8; 12] = [
         OK,
         USAGE,
         NOT_ELEVATED,
@@ -79,25 +95,24 @@ pub mod exit {
         REGISTER,
         RESTORE,
         UNREGISTER,
+        DISABLED_ORIGINAL,
     ];
 }
-
-/// Name of the restore record in the state directory.
-pub const RECORD_FILE_NAME: &str = "restore.json";
-/// Temp name for the atomic write. Same directory, so the rename stays on
-/// one volume.
-pub const RECORD_TEMP_NAME: &str = "restore.json.tmp";
 
 /// Install flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallOptions {
-    /// Never ask. Also implied when stdin is not a terminal.
+    /// Never ask. Also implied when stdin or stderr is not a console.
     pub silent: bool,
     /// Proceed on a domain-joined machine without asking.
     pub confirm_domain_joined: bool,
+    /// Proceed with no restore record while `w32time` is already disabled,
+    /// and record "disabled" as the original.
+    pub accept_disabled_original: bool,
 }
 
-const INSTALL_USAGE: &str = "usage: install [--silent] [--confirm-domain-joined]";
+const INSTALL_USAGE: &str =
+    "usage: install [--silent] [--confirm-domain-joined] [--accept-disabled-original]";
 const UNINSTALL_USAGE: &str = "usage: uninstall [--silent]";
 
 /// Parses the arguments after `install`. Each flag at most once.
@@ -108,11 +123,13 @@ pub fn parse_install_args(args: &[String]) -> Result<InstallOptions, String> {
     let mut o = InstallOptions {
         silent: false,
         confirm_domain_joined: false,
+        accept_disabled_original: false,
     };
     for a in args {
         let slot = match a.as_str() {
             "--silent" => &mut o.silent,
             "--confirm-domain-joined" => &mut o.confirm_domain_joined,
+            "--accept-disabled-original" => &mut o.accept_disabled_original,
             _ => return Err(format!("unknown argument. {INSTALL_USAGE}")),
         };
         if *slot {
@@ -145,9 +162,10 @@ pub trait Host {
     fn is_elevated(&self) -> Result<bool, String>;
     /// The classic domain join state.
     fn join_state(&self) -> JoinState;
-    /// Whether stdin is an interactive terminal.
-    fn stdin_is_terminal(&self) -> bool;
-    /// Asks a yes or no question. Anything but yes is no.
+    /// Whether a question can be asked and seen: stdin and stderr are both
+    /// consoles (R83).
+    fn is_interactive(&self) -> bool;
+    /// Asks a yes or no question on stderr. Anything but yes is no.
     fn ask_yes_no(&mut self, question: &str) -> bool;
     /// Prints one line for the user.
     fn say(&mut self, line: &str);
@@ -162,6 +180,9 @@ pub enum LoadError {
     /// The file is there and could not be read.
     #[error("cannot read the restore record: {0}")]
     Io(io::ErrorKind),
+    /// The file has more than one hard link.
+    #[error("the restore record has more than one hard link")]
+    Linked,
 }
 
 /// Where the restore record lives.
@@ -253,7 +274,7 @@ pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
     if let Some(code) = domain_rule(*opts, d.host) {
         return code;
     }
-    install_after_checks(d)
+    install_after_checks(*opts, d)
 }
 
 /// `None` when elevated. Else says why and gives the exit code.
@@ -292,7 +313,7 @@ fn domain_rule(opts: InstallOptions, host: &mut dyn Host) -> Option<u8> {
             "{warning} Proceeding: --confirm-domain-joined was given."
         ));
         None
-    } else if !opts.silent && host.stdin_is_terminal() {
+    } else if !opts.silent && host.is_interactive() {
         host.say(warning);
         if host.ask_yes_no("Take over from w32time on this machine?") {
             None
@@ -302,15 +323,16 @@ fn domain_rule(opts: InstallOptions, host: &mut dyn Host) -> Option<u8> {
         }
     } else {
         host.say(&format!(
-            "{warning} A silent install stops here. Nothing changed. \
-             Pass --confirm-domain-joined to install anyway."
+            "{warning} No question can be asked here (silent, or stdin or stderr is not a \
+             console). Install stops. Nothing changed. To install anyway pass \
+             --confirm-domain-joined to the exe, or -ConfirmDomainJoined to the install script."
         ));
         Some(exit::DOMAIN_JOINED)
     }
 }
 
 /// Install steps 4 to 7, after the checks that change nothing.
-fn install_after_checks(d: &mut Deps<'_>) -> u8 {
+fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
     if let Err(e) = d.store.secure() {
         d.host.say(&format!(
             "Cannot secure the state directory ({e}). The w32time restore record cannot be kept safely. Nothing changed."
@@ -335,6 +357,8 @@ fn install_after_checks(d: &mut Deps<'_>) -> u8 {
         d.host.say(
             "Found the restore record of an earlier install. It is kept as the original state.",
         );
+    } else if let Some(code) = disabled_original_rule(opts, d) {
+        return code;
     }
 
     let store = &mut *d.store;
@@ -349,8 +373,7 @@ fn install_after_checks(d: &mut Deps<'_>) -> u8 {
         Err(e) => {
             d.host
                 .say(&format!("Taking over from w32time failed: {e}."));
-            d.host
-                .say("The restore record is kept. Run uninstall to put w32time back.");
+            report_failed_takeover(&e, existing.is_none(), d);
             return exit::TAKEOVER;
         }
     };
@@ -383,6 +406,58 @@ fn install_after_checks(d: &mut Deps<'_>) -> u8 {
     }
     d.host.say("Installed.");
     exit::OK
+}
+
+/// R84: no record and `w32time` already disabled. Refuse unless the flag
+/// says the disabled state really is the original. A query error is left to
+/// the takeover, which reports it.
+fn disabled_original_rule(opts: InstallOptions, d: &mut Deps<'_>) -> Option<u8> {
+    let Ok(now) = d.scm.query(W32TIME) else {
+        return None;
+    };
+    if now.start != StartType::Disabled {
+        return None;
+    }
+    if opts.accept_disabled_original {
+        d.host.say(
+            "w32time is already disabled and there is no restore record. Recording disabled \
+             as the original: --accept-disabled-original was given.",
+        );
+        return None;
+    }
+    d.host.say(
+        "w32time is already disabled and there is no restore record. An earlier record may \
+         have been lost, and recording disabled now would make uninstall leave w32time \
+         disabled. w32time was not changed. Set its start type by hand and run install again, \
+         or pass --accept-disabled-original if disabled really is the original.",
+    );
+    Some(exit::DISABLED_ORIGINAL)
+}
+
+/// M8: a takeover that failed before any change removes the record this
+/// run wrote, so it cannot later win over an administrator's change. A
+/// pre-existing record is never removed here.
+fn report_failed_takeover(e: &TakeoverError, record_is_new: bool, d: &mut Deps<'_>) {
+    if !e.changed_nothing() {
+        d.host.say(
+            "w32time may have been changed. The restore record is kept. Run uninstall to put \
+             w32time back.",
+        );
+        return;
+    }
+    if !record_is_new {
+        d.host
+            .say("Nothing on w32time changed. The earlier restore record is kept.");
+        return;
+    }
+    match d.store.remove() {
+        Ok(()) => d
+            .host
+            .say("Nothing on w32time changed. The new restore record was removed."),
+        Err(re) => d.host.say(&format!(
+            "Nothing on w32time changed. The new restore record could not be removed ({re})."
+        )),
+    }
 }
 
 /// Runs the uninstall steps. Returns an [`exit`] code. Later steps run even
@@ -473,94 +548,6 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
     })
 }
 
-/// The restore record as a file in one directory.
-#[derive(Debug)]
-pub struct FileRecordStore {
-    dir: PathBuf,
-}
-
-impl FileRecordStore {
-    /// A store in `dir`. Nothing is touched until a call.
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
-    }
-
-    fn path(&self) -> PathBuf {
-        self.dir.join(RECORD_FILE_NAME)
-    }
-
-    fn temp_path(&self) -> PathBuf {
-        self.dir.join(RECORD_TEMP_NAME)
-    }
-}
-
-/// OS error text without a path. `std` does not add paths to `io::Error`.
-fn io_text(step: &str, e: &io::Error) -> String {
-    format!("{step}: {e}")
-}
-
-impl RecordStore for FileRecordStore {
-    #[cfg(windows)]
-    fn secure(&mut self) -> Result<(), String> {
-        ntpc_platform::secure_state_dir(&self.dir).map_err(|e| e.to_string())
-    }
-
-    #[cfg(not(windows))]
-    fn secure(&mut self) -> Result<(), String> {
-        Err("the state directory can be secured on Windows only".to_owned())
-    }
-
-    fn load(&self) -> Result<Option<Restore>, LoadError> {
-        let file = match safe_open::open_read(&self.path()) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(LoadError::Io(e.kind())),
-        };
-        let mut bytes = Vec::new();
-        // One byte over the limit is enough to know it is too large.
-        file.take(Restore::MAX_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| LoadError::Io(e.kind()))?;
-        Restore::decode(&bytes)
-            .map(Some)
-            .map_err(LoadError::Invalid)
-    }
-
-    /// Temp file, flush, rename over the target. A crash leaves the old
-    /// record or the new one, never half of either.
-    fn save(&mut self, r: &Restore) -> Result<(), String> {
-        let temp = self.temp_path();
-        match fs::remove_file(&temp) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_text("remove old record temp file", &e)),
-        }
-        let mut f =
-            safe_open::create_new(&temp).map_err(|e| io_text("create record temp file", &e))?;
-        if let Err(e) = f
-            .write_all(r.encode().as_bytes())
-            .and_then(|()| f.sync_all())
-        {
-            drop(f);
-            let _ = fs::remove_file(&temp);
-            return Err(io_text("write record temp file", &e));
-        }
-        drop(f);
-        fs::rename(&temp, self.path()).map_err(|e| {
-            let _ = fs::remove_file(&temp);
-            io_text("replace record file", &e)
-        })
-    }
-
-    fn remove(&mut self) -> Result<(), String> {
-        match fs::remove_file(self.path()) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_text("remove record file", &e)),
-        }
-    }
-}
-
 /// The registration hook until Task 14 builds it.
 ///
 /// TODO(Task 14): replace with a real implementation over `CreateServiceW`,
@@ -585,42 +572,40 @@ impl Registration for PendingRegistration {
     }
 }
 
-/// The real console.
-#[cfg(windows)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ConsoleHost;
-
-#[cfg(windows)]
-impl Host for ConsoleHost {
-    fn is_elevated(&self) -> Result<bool, String> {
-        ntpc_platform::is_elevated().map_err(|e| e.to_string())
-    }
-    fn join_state(&self) -> JoinState {
-        ntpc_platform::join_state()
-    }
-    fn stdin_is_terminal(&self) -> bool {
-        use std::io::IsTerminal;
-        io::stdin().is_terminal()
-    }
-    fn ask_yes_no(&mut self, question: &str) -> bool {
-        print!("{question} [y/N] ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        // A read error or end of input is a no.
-        if io::stdin().read_line(&mut line).is_err() {
-            return false;
-        }
-        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    }
-    fn say(&mut self, line: &str) {
-        println!("{line}");
-    }
-}
-
 /// The default state directory. The record always lives here, whatever the
 /// config says, so uninstall finds it even when the config is gone.
 fn state_dir() -> PathBuf {
     crate::config::Config::default().state_dir
+}
+
+/// The line `--help` prints. It does not list `install` or `uninstall` yet:
+/// the release gate must stay red until Task 14 makes them real (R85).
+pub const HELP: &str = "usage: ntptimeclient-winrs (pre-alpha: no subcommands are available yet)";
+
+/// Dispatches the command line. No arguments keeps the pre-alpha stub
+/// (exit 0). `--help` prints [`HELP`] (exit 0). An unknown subcommand or
+/// argument prints one usage line to `err` and exits [`exit::USAGE`] (M6).
+pub fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    match args.first().map(String::as_str) {
+        None => {
+            let _ = writeln!(
+                out,
+                "{} (pre-alpha, no service logic yet)",
+                crate::CRATE_NAME
+            );
+            exit::OK
+        }
+        Some("--help" | "-h") if args.len() == 1 => {
+            let _ = writeln!(out, "{HELP}");
+            exit::OK
+        }
+        Some("install") => run_install(&args[1..]),
+        Some("uninstall") => run_uninstall(&args[1..]),
+        Some(_) => {
+            let _ = writeln!(err, "unknown subcommand or argument. Run with --help.");
+            exit::USAGE
+        }
+    }
 }
 
 /// `install` from the command line. Returns an [`exit`] code.
@@ -651,7 +636,7 @@ fn run_install_real(opts: InstallOptions) -> u8 {
     install(
         &opts,
         &mut Deps {
-            host: &mut ConsoleHost,
+            host: &mut ConsoleHost::new(),
             store: &mut FileRecordStore::new(state_dir()),
             scm: &mut ntpc_platform::ScmControl,
             reg: &mut PendingRegistration,
@@ -662,7 +647,7 @@ fn run_install_real(opts: InstallOptions) -> u8 {
 #[cfg(windows)]
 fn run_uninstall_real() -> u8 {
     uninstall(&mut Deps {
-        host: &mut ConsoleHost,
+        host: &mut ConsoleHost::new(),
         store: &mut FileRecordStore::new(state_dir()),
         scm: &mut ntpc_platform::ScmControl,
         reg: &mut PendingRegistration,
