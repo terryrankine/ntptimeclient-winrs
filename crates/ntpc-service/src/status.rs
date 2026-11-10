@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use ntpc_core::Tier;
 use thiserror::Error;
 
-use crate::logging::{format_utc, tier_label};
+use crate::logging::{escape, format_utc, tier_label};
 use crate::safe_open;
 
 /// Name of the status file in the state directory.
@@ -112,6 +112,9 @@ pub struct Counters {
     pub log_suppressed: u64,
     /// DHCP reads that failed.
     pub dhcp_read_failures: u64,
+    /// ICMP error reports seen on query sockets. Ignored, since ICMP can be
+    /// spoofed, but counted.
+    pub icmp_resets: u64,
 }
 
 /// One snapshot. Field names are the JSON keys.
@@ -235,7 +238,7 @@ fn token(out: &mut String, s: &str) {
 }
 
 /// The counters, in the order the file holds them.
-fn counter_fields(c: &Counters) -> [(&'static str, u64); 17] {
+fn counter_fields(c: &Counters) -> [(&'static str, u64); 18] {
     [
         ("queries", c.queries),
         ("samples", c.samples),
@@ -254,6 +257,7 @@ fn counter_fields(c: &Counters) -> [(&'static str, u64); 17] {
         ("datagrams_discarded", c.datagrams_discarded),
         ("log_suppressed", c.log_suppressed),
         ("dhcp_read_failures", c.dhcp_read_failures),
+        ("icmp_resets", c.icmp_resets),
     ]
 }
 
@@ -340,8 +344,23 @@ impl FileStatusWriter {
     }
 }
 
+/// Refuses a report the reader would refuse. A required number that is not
+/// finite would be written as `null`, and the strict reader rejects that,
+/// so the `status` command would fail on every later read.
+///
+/// # Errors
+/// A message naming the field.
+pub fn check(report: &StatusReport) -> Result<(), String> {
+    if report.drift_ppm.is_finite() {
+        Ok(())
+    } else {
+        Err("drift_ppm is not a finite number. Status not written".to_owned())
+    }
+}
+
 impl StatusWriter for FileStatusWriter {
     fn write(&self, report: &StatusReport) -> Result<(), String> {
+        check(report)?;
         let temp = self.dir.join(TEMP_NAME);
         let fail = |step: &str, e: &io::Error| format!("{step}: {e}");
         // A temp file left by a crash is ours to remove. A directory or a
@@ -382,6 +401,16 @@ enum Value {
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+}
+
+/// A key name from the file, safe to print: escaped and cut short.
+fn key_text(key: &str) -> String {
+    let mut k = escape(key);
+    if k.chars().count() > 64 {
+        k = k.chars().take(64).collect();
+        k.push_str("...");
+    }
+    k
 }
 
 fn bad(why: &str) -> StatusError {
@@ -506,7 +535,10 @@ impl Parser<'_> {
             self.ws();
             let key = self.string()?;
             if out.iter().any(|(k, _)| *k == key) {
-                return Err(StatusError::Invalid(format!("repeated key {key}")));
+                return Err(StatusError::Invalid(format!(
+                    "repeated key {}",
+                    key_text(&key)
+                )));
             }
             self.eat(b':')?;
             let v = self.value(depth)?;
@@ -540,7 +572,7 @@ impl Fields {
     fn done(self) -> Result<(), StatusError> {
         match self.0.first() {
             None => Ok(()),
-            Some((k, _)) => Err(StatusError::Invalid(format!("unknown key {k}"))),
+            Some((k, _)) => Err(StatusError::Invalid(format!("unknown key {}", key_text(k)))),
         }
     }
 
@@ -685,7 +717,7 @@ pub fn parse(text: &str) -> Result<StatusReport, StatusError> {
     let mut c = Fields(cobj);
     let mut counters = Counters::default();
     {
-        let slots: [(&str, &mut u64); 17] = [
+        let slots: [(&str, &mut u64); 18] = [
             ("queries", &mut counters.queries),
             ("samples", &mut counters.samples),
             ("timeouts", &mut counters.timeouts),
@@ -703,6 +735,7 @@ pub fn parse(text: &str) -> Result<StatusReport, StatusError> {
             ("datagrams_discarded", &mut counters.datagrams_discarded),
             ("log_suppressed", &mut counters.log_suppressed),
             ("dhcp_read_failures", &mut counters.dhcp_read_failures),
+            ("icmp_resets", &mut counters.icmp_resets),
         ];
         for (k, slot) in slots {
             *slot = c.u64(k)?;
@@ -761,7 +794,7 @@ pub fn format_status(r: &StatusReport) -> String {
     let _ = writeln!(
         o,
         "ntptimeclient-winrs {} ({})",
-        r.service_version,
+        escape(&r.service_version),
         if r.running { "running" } else { "stopped" }
     );
     let _ = writeln!(
@@ -824,127 +857,4 @@ fn yes_no(b: bool) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample() -> StatusReport {
-        StatusReport {
-            service_version: "0.0.0".into(),
-            written_unix_s: 1_794_268_800,
-            running: true,
-            uptime_s: 3600,
-            active_tier: Some(Tier::Pool),
-            last_offset_s: Some(-0.000_123_4),
-            drift_ppm: 12.5,
-            last_good_age_s: Some(30),
-            holdover: false,
-            adjustment_allowed: true,
-            adjustment_blocked: Blocked::None,
-            last_step_unix_s: None,
-            last_step_s: None,
-            persistence: true,
-            sources_config: 0,
-            sources_dhcp: 1,
-            sources_pool: 4,
-            dhcp_differs: false,
-            counters: Counters {
-                queries: 7,
-                log_suppressed: 2,
-                ..Counters::default()
-            },
-        }
-    }
-
-    #[test]
-    fn round_trips() {
-        let r = sample();
-        assert_eq!(parse(&to_json(&r)).expect("parses"), r);
-        let mut r2 = r;
-        r2.active_tier = None;
-        r2.last_offset_s = None;
-        r2.last_good_age_s = None;
-        r2.last_step_unix_s = Some(-5);
-        r2.last_step_s = Some(1e-9);
-        r2.adjustment_blocked = Blocked::ClockFailure;
-        assert_eq!(parse(&to_json(&r2)).expect("parses"), r2);
-    }
-
-    #[test]
-    fn refuses_unknown_missing_and_repeated_keys() {
-        let text = to_json(&sample());
-        let extra = text.replacen("\"running\"", "\"extra\": 1,\n  \"running\"", 1);
-        assert!(matches!(parse(&extra), Err(StatusError::Invalid(_))));
-        let missing = text.replacen("  \"holdover\": false,\n", "", 1);
-        assert!(matches!(parse(&missing), Err(StatusError::Invalid(_))));
-        let repeated = text.replacen(
-            "\"running\": true",
-            "\"running\": true, \"running\": true",
-            1,
-        );
-        assert!(matches!(parse(&repeated), Err(StatusError::Invalid(_))));
-    }
-
-    #[test]
-    fn refuses_wrong_types_escapes_arrays_and_depth() {
-        let text = to_json(&sample());
-        for (from, to) in [
-            ("\"running\": true", "\"running\": 1"),
-            ("\"uptime_s\": 3600", "\"uptime_s\": -1"),
-            ("\"uptime_s\": 3600", "\"uptime_s\": 1.5"),
-            (
-                "\"service_version\": \"0.0.0\"",
-                "\"service_version\": \"a\\nb\"",
-            ),
-            ("\"uptime_s\": 3600", "\"uptime_s\": [1]"),
-            ("\"queries\": 7", "\"queries\": {\"a\": 1}"),
-            ("\"drift_ppm\": 12.5", "\"drift_ppm\": 1e999"),
-            ("\"drift_ppm\": 12.5", "\"drift_ppm\": 01"),
-            ("\"active_tier\": \"pool\"", "\"active_tier\": \"moon\""),
-        ] {
-            let bad_text = text.replacen(from, to, 1);
-            assert_ne!(bad_text, text, "{from}");
-            assert!(parse(&bad_text).is_err(), "{to} accepted");
-        }
-        assert!(parse(&format!("{text}x")).is_err());
-        assert!(parse("").is_err());
-        assert!(parse("[]").is_err());
-    }
-
-    #[test]
-    fn refuses_other_version_and_format() {
-        let text = to_json(&sample());
-        let v2 = text.replacen("\"version\": 1", "\"version\": 2", 1);
-        assert_eq!(parse(&v2), Err(StatusError::Version(2)));
-        let other = text.replacen(FORMAT, "something-else", 1);
-        assert!(matches!(parse(&other), Err(StatusError::Invalid(_))));
-    }
-
-    #[test]
-    fn refuses_oversize() {
-        let big = format!("{}{}", to_json(&sample()), " ".repeat(5000));
-        assert_eq!(parse(&big), Err(StatusError::TooLarge));
-    }
-
-    #[test]
-    fn garbage_never_panics() {
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for _ in 0..2000 {
-            let mut s = Vec::new();
-            for _ in 0..(x % 64) {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                s.push(b"{}[]\":,0123456789-+.eEtrufalsn \\x"[(x % 33) as usize]);
-            }
-            let _ = parse(&String::from_utf8_lossy(&s));
-        }
-    }
-
-    #[test]
-    fn version_string_cannot_break_the_file() {
-        let mut r = sample();
-        r.service_version = "1\"} evil\n".into();
-        let parsed = parse(&to_json(&r)).expect("still valid");
-        assert_eq!(parsed.service_version, "1_}_evil_");
-    }
-}
+mod tests;

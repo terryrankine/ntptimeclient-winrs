@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ntpc_core::engine::{Action, Engine, Event};
@@ -11,18 +11,34 @@ use ntpc_core::{Mono, Offset, Ppm, QueryFailure, SourceId, SourceSpec, Tier};
 
 use super::dhcp::DhcpSchedule;
 use super::inflight::InFlight;
-use super::startup::{load_drift, log_start, resolve_note, secure_state_dir, start_dhcp_reader};
+use super::startup::{load_drift, log_start, secure_state_dir, start_dhcp_reader};
 use super::{
     AdapterKey, ClockControl, DriftFile, HostDeps, HostResolver, Inbox, Inner, LEVEL_PERIOD, Msg,
-    NetworkEvents, OFFLINE_RESOLVE_CAP, PowerEvents, QUERY_TIMEOUT, QUERY_WATCHDOG, REARM_FIRST,
-    REARM_MAX, RESOLVE_GIVE_UP, STATUS_PERIOD, ServiceMonitor, SharedLookup, SharedOwn, Spawn,
-    Waiter,
+    NetworkEvents, PowerEvents, QUERY_TIMEOUT, QUERY_WATCHDOG, REARM_FIRST, REARM_MAX,
+    RESOLVE_GIVE_UP, STATUS_PERIOD, ServiceMonitor, SharedLookup, SharedOwn, Spawn, Waiter,
 };
 use crate::config::Config;
 use crate::logging::{Level, Logger, engine_event};
-use crate::resolver::{ResolveNote, Resolver};
+use crate::resolver::Resolver;
 use crate::status::{Blocked, Counters, StatusReport, StatusWriter};
 use crate::transport::{TimeSource, Transport};
+
+/// Lookup workers given up and still stuck before no new one starts. Each
+/// is a thread blocked in the system resolver.
+const MAX_ABANDONED_LOOKUPS: usize = 3;
+
+/// True when the engine must see a `Tick(now)` before `ev`. The contract
+/// asks for one before an event without a time when time has moved. A
+/// `ClockResult` is not such an event: it belongs to the batch that made
+/// the action, and a tick in between could run new clock actions before
+/// the engine hears of a failure, or pair a result with the wrong action.
+fn needs_tick(ev: &Event, fed: Option<Mono>, now: Mono) -> bool {
+    let timeless = matches!(
+        ev,
+        Event::Failed(..) | Event::SourcesChanged(_) | Event::AdjustmentAllowed(_)
+    );
+    timeless && fed.is_none_or(|f| f < now)
+}
 
 /// Name of every query worker thread.
 const QUERY_THREAD: &str = "ntpc-query";
@@ -64,6 +80,10 @@ pub(super) struct Host {
     resolver: Arc<Mutex<HostResolver>>,
     generation: u64,
     resolving_since: Option<Mono>,
+    /// Generations whose lookup worker was given up and has not returned.
+    abandoned: BTreeSet<u64>,
+    /// New lookups are held back because too many are stuck.
+    lookups_held: bool,
     resolve_force: bool,
     last_resolved: Option<Mono>,
 
@@ -160,6 +180,8 @@ impl Host {
             resolver,
             generation: 0,
             resolving_since: None,
+            abandoned: BTreeSet::new(),
+            lookups_held: false,
             resolve_force: true,
             last_resolved: None,
             specs: Vec::new(),
@@ -280,8 +302,7 @@ impl Host {
     /// Feeds one event and performs its actions, as the engine contract asks.
     fn feed(&mut self, ev: Event) {
         let now = self.time.mono();
-        let timeless = !matches!(ev, Event::Tick(_) | Event::Sample(_) | Event::Resumed(_));
-        if timeless && self.fed.is_none_or(|f| f < now) {
+        if needs_tick(&ev, self.fed, now) {
             self.feed(Event::Tick(now));
         }
         match &ev {
@@ -389,6 +410,27 @@ impl Host {
             // after w32time stops opens adjustment.
             self.latched = false;
             self.send_level(false);
+            // R98: hand the rate back at once, so our last frequency with
+            // the OS kept out does not stay in force under w32time. The
+            // next enable takes it again. Stop then leaves it alone.
+            if self.rate_taken {
+                self.rate_taken = false;
+                match self.clock.reset_frequency() {
+                    Ok(()) => self.log(
+                        Level::Info,
+                        "rate_control",
+                        "w32time runs: clock rate handed back to the system",
+                    ),
+                    Err(e) => {
+                        self.counters.clock_failures += 1;
+                        self.log(
+                            Level::Error,
+                            "rate_control",
+                            &format!("w32time runs: could not hand the clock rate back: {e}"),
+                        );
+                    }
+                }
+            }
             return;
         }
         if self.w32time_running {
@@ -452,7 +494,7 @@ impl Host {
             self.feed(Event::Failed(source, QueryFailure::Unreachable));
             return;
         };
-        let Some(ticket) = self.in_flight.begin(source, self.time.mono()) else {
+        let Some(ticket) = self.in_flight.begin(source, addr, self.time.mono()) else {
             // R15: the running query answers this one too.
             self.counters.duplicate_queries += 1;
             return;
@@ -503,7 +545,14 @@ impl Host {
         result: Result<ntpc_core::Sample, QueryFailure>,
     ) {
         // A late answer after the watchdog gave up is dropped.
-        if !self.in_flight.finish(source, ticket) {
+        let Some(sent_to) = self.in_flight.finish(source, ticket) else {
+            return;
+        };
+        // A fresh resolver restarts ids at 0, so this id may now name
+        // another server. The answer ends its wait but is not a sample of
+        // the server the id names now.
+        if self.addrs.get(&source).is_some_and(|(a, _)| *a != sent_to) {
+            self.feed(Event::Failed(source, QueryFailure::Timeout));
             return;
         }
         match result {
@@ -520,130 +569,6 @@ impl Host {
                 }
                 self.feed(Event::Failed(source, why));
             }
-        }
-    }
-
-    // ------------------------------------------------------------ resolver
-
-    fn names(&self) -> Vec<(String, Tier)> {
-        let mut names: Vec<(String, Tier)> = self
-            .cfg
-            .servers
-            .iter()
-            .map(|s| (s.clone(), Tier::Config))
-            .collect();
-        names.extend(
-            self.dhcp_servers
-                .iter()
-                .map(|ip| (ip.to_string(), Tier::Dhcp)),
-        );
-        names.push((self.cfg.pool.clone(), Tier::Pool));
-        names
-    }
-
-    fn maybe_resolve(&mut self, now: Mono) {
-        if self.stopping {
-            return;
-        }
-        if let Some(since) = self.resolving_since {
-            if now.saturating_duration_since(since) < RESOLVE_GIVE_UP {
-                return;
-            }
-            self.log(
-                Level::Warn,
-                "resolve_stuck",
-                "a name lookup did not return. Starting a fresh resolver",
-            );
-            self.generation += 1;
-            self.resolver = Arc::new(Mutex::new(Resolver::new(
-                self.lookup.clone(),
-                self.own.clone(),
-            )));
-            self.resolving_since = None;
-            self.resolve_force = true;
-        }
-        let due = match self.resolver.try_lock() {
-            Ok(r) => r.due(now),
-            // A worker holds it. It reports when done.
-            Err(TryLockError::WouldBlock) => return,
-            Err(TryLockError::Poisoned(p)) => p.into_inner().due(now),
-        };
-        // R66: no back-off longer than the cap while no tier is active.
-        let offline = self.engine.status().active_tier.is_none()
-            && self
-                .last_resolved
-                .is_some_and(|t| now.saturating_duration_since(t) >= OFFLINE_RESOLVE_CAP);
-        if !(due || self.resolve_force || offline) {
-            return;
-        }
-        self.resolve_force = false;
-        self.start_resolve(now);
-    }
-
-    fn start_resolve(&mut self, now: Mono) {
-        let names = self.names();
-        let resolver = Arc::clone(&self.resolver);
-        let tx = self.tx.clone();
-        let generation = self.generation;
-        let job = Box::new(move || {
-            let (specs, notes) = {
-                let mut r = resolver
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let specs = r.expand(now, &names);
-                (specs, r.take_notes())
-            };
-            let _ = tx.send(Msg(Inner::Resolved {
-                generation,
-                specs,
-                notes,
-            }));
-        });
-        self.resolving_since = Some(now);
-        if !self.spawn.spawn(RESOLVE_THREAD, job) {
-            self.resolving_since = None;
-            self.log(
-                Level::Error,
-                "spawn",
-                "could not start a lookup thread. Retrying at the next check",
-            );
-        }
-    }
-
-    fn on_resolved(&mut self, generation: u64, specs: Vec<SourceSpec>, notes: Vec<ResolveNote>) {
-        if generation != self.generation {
-            return;
-        }
-        let now = self.time.mono();
-        self.resolving_since = None;
-        self.last_resolved = Some(now);
-        match self.resolver.try_lock() {
-            Ok(mut r) => r.mark_resolved(now),
-            Err(TryLockError::Poisoned(p)) => p.into_inner().mark_resolved(now),
-            Err(TryLockError::WouldBlock) => {}
-        }
-        for n in notes {
-            let (level, msg) = resolve_note(&n);
-            self.log(level, "resolve", &msg);
-        }
-        if specs != self.specs {
-            let count = |t: Tier| specs.iter().filter(|s| s.tier == t).count();
-            self.log(
-                Level::Info,
-                "sources",
-                &format!(
-                    "sources: config {}, dhcp {}, pool {}",
-                    count(Tier::Config),
-                    count(Tier::Dhcp),
-                    count(Tier::Pool)
-                ),
-            );
-            self.addrs = specs
-                .iter()
-                .map(|s| (s.id, (s.addr, s.label.clone())))
-                .collect();
-            self.specs.clone_from(&specs);
-            self.feed(Event::SourcesChanged(specs));
         }
     }
 
@@ -715,6 +640,7 @@ impl Host {
                 specs,
                 notes,
             } => self.on_resolved(generation, specs, notes),
+            Inner::ResolveFailed { generation } => self.on_resolve_failed(generation),
             Inner::Dhcp(result) => self.on_dhcp(result),
         }
     }
@@ -750,6 +676,7 @@ impl Host {
         let mut counters = self.counters;
         counters.nonce_failures = stats.nonce_failures;
         counters.datagrams_discarded = stats.discarded;
+        counters.icmp_resets = stats.resets;
         counters.log_suppressed = self.logger.suppressed();
         let wall_s = |ns: i128| i64::try_from(ns.div_euclid(1_000_000_000)).unwrap_or(i64::MAX);
         StatusReport {
@@ -792,6 +719,14 @@ impl Host {
 
     // ------------------------------------------------------------ stop
 
+    pub(super) fn log_panic(&self, message: &str) {
+        self.log(
+            Level::Error,
+            "panic",
+            &format!("the host loop panicked: {message}. Stopping"),
+        );
+    }
+
     pub(super) fn shutdown(&mut self) {
         let now = self.time.mono();
         self.stopping = true;
@@ -827,5 +762,34 @@ impl Host {
     /// True unless the drift is still the zero a fresh engine starts with.
     fn learnt(&self, drift: Ppm) -> bool {
         self.last_saved_drift.is_some() || drift.value() != 0.0
+    }
+}
+
+mod resolve;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ntpc_core::ClockError;
+
+    #[test]
+    fn clock_result_never_gets_a_tick_first() {
+        let then = Mono::from_nanos(10);
+        let fed = Some(then);
+        let now = Mono::from_nanos(11);
+        assert!(!needs_tick(&Event::ClockResult(Ok(())), fed, now));
+        assert!(!needs_tick(
+            &Event::ClockResult(Err(ClockError::Unavailable)),
+            fed,
+            now
+        ));
+        assert!(needs_tick(
+            &Event::Failed(SourceId::new(1), QueryFailure::Timeout),
+            fed,
+            now
+        ));
+        assert!(needs_tick(&Event::AdjustmentAllowed(true), fed, now));
+        assert!(!needs_tick(&Event::AdjustmentAllowed(true), fed, then));
+        assert!(!needs_tick(&Event::Tick(now), fed, now));
     }
 }
