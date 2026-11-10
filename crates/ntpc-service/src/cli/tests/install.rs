@@ -470,3 +470,95 @@ fn domain_warnings_use_the_warning_stream() {
         );
     }
 }
+
+// ---- Task 14c-B: exe location and start after register ----
+
+#[test]
+fn install_refuses_an_unsafe_exe_location_before_any_change() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.unsafe_location = true;
+    assert_eq!(w.install(SILENT), exit::EXE_LOCATION);
+    assert!(w.untouched());
+    assert!(
+        w.host.text().contains("only administrators"),
+        "{}",
+        w.host.text()
+    );
+}
+
+#[test]
+fn install_starts_our_service_after_registering() {
+    let mut w = World::new(JoinState::Workgroup);
+    assert_eq!(w.install(SILENT), exit::OK);
+    assert!(w.reg.registered);
+    assert_eq!(w.reg.start_calls, 1);
+}
+
+#[test]
+fn a_failed_start_puts_w32time_back_and_keeps_the_registration() {
+    // R109: the service never reached RUNNING, so this machine would have
+    // no time sync. w32time comes back, our registration stays.
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.start_error = Some(
+        "the service stopped right after it started (exit code 1066, service exit code 8)"
+            .to_owned(),
+    );
+    assert_eq!(w.install(SILENT), exit::START_FAILED);
+    assert!(w.reg.registered);
+    assert_eq!(w.w32time(), original());
+    assert_eq!(w.store.saved(), None, "record removed after the put back");
+    let t = w.host.text();
+    assert!(t.contains("service exit code 8"), "{t}");
+    assert!(t.contains("w32time was put back"), "{t}");
+    // R112: parked, so no restart loop and no adjustment.
+    assert!(w.reg.parked);
+    assert!(t.contains("manual start"), "{t}");
+}
+
+#[test]
+fn a_failed_start_with_a_disabled_original_says_it_stays_disabled() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    w.reg.start_error = Some("stopped".to_owned());
+    assert_eq!(w.install(ACCEPT_DISABLED), exit::START_FAILED);
+    let t = w.host.text();
+    assert!(t.contains("stays disabled"), "{t}");
+    assert!(!t.contains("keeps time sync"), "{t}");
+}
+
+#[test]
+fn a_successful_install_is_not_parked() {
+    let mut w = World::new(JoinState::Workgroup);
+    assert_eq!(w.install(SILENT), exit::OK);
+    assert!(!w.reg.parked);
+}
+
+#[test]
+fn a_non_elevated_prompt_gets_exit_3_before_any_readiness_check() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.host.elevated = Ok(false);
+    w.reg.bad_owner = true;
+    assert_eq!(w.install(SILENT), exit::NOT_ELEVATED);
+}
+
+#[test]
+fn a_register_failure_never_starts_anything() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.reg.register_error = Some("create failed".to_owned());
+    assert_eq!(w.install(SILENT), exit::REGISTER_FAILED);
+    assert_eq!(w.reg.start_calls, 0);
+}
+
+#[test]
+fn a_foreign_service_or_untrusted_owner_refuses_before_any_change() {
+    for (foreign, owner, code) in [
+        (true, false, exit::FOREIGN_SERVICE),
+        (false, true, exit::TOKEN_OWNER),
+    ] {
+        let mut w = World::new(JoinState::Workgroup);
+        w.reg.foreign = foreign;
+        w.reg.bad_owner = owner;
+        assert_eq!(w.install(SILENT), code);
+        assert!(w.untouched());
+    }
+}
