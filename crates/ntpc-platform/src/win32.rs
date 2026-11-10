@@ -34,10 +34,10 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_FULL_DIR_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
-    FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GetDriveTypeW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
-    SetFileInformationByHandle,
+    FILE_FULL_DIR_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+    FileRenameInfo, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    OPEN_EXISTING, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemTimeAdjustmentPrecise, GetSystemTimePreciseAsFileTime, SetSystemTime,
@@ -814,6 +814,10 @@ pub fn parse_dir_records(buf: &[u8], out: &mut Vec<DirEntry>) -> io::Result<()> 
         let next = read_u32(buf, offset + REC_NEXT)? as usize;
         let attributes = read_u32(buf, offset + REC_ATTRIBUTES)?;
         let name_len = read_u32(buf, offset + REC_NAME_LENGTH)? as usize;
+        if !name_len.is_multiple_of(2) {
+            // UTF-16 names have an even byte length. Odd means a bad record.
+            return Err(io::Error::other("directory listing name has an odd length"));
+        }
         let name_start = offset + REC_NAME;
         let name = name_start
             .checked_add(name_len)
@@ -921,6 +925,62 @@ pub fn link_info(handle: &OwnedHandle) -> io::Result<LinkInfo> {
     })
 }
 
+/// Renames the object behind `handle` to `new_path` (an absolute path),
+/// failing if something already exists there. The handle needs `DELETE`.
+///
+/// Renaming through the handle moves exactly the object that was checked,
+/// whatever the old path names by now. `MoveFileExW` would look the source
+/// up by path again. The rename fails with a sharing error if another handle
+/// to the object was opened without `FILE_SHARE_DELETE`.
+///
+/// # Errors
+/// The OS error if the rename fails.
+pub fn rename_by_handle(handle: &OwnedHandle, new_path: &Path) -> io::Result<()> {
+    let name: Vec<u16> = new_path.as_os_str().encode_wide().collect();
+    if name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path holds a NUL",
+        ));
+    }
+    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let name_bytes = name.len() * 2;
+    // Header, name and a terminating NUL, which the docs describe.
+    let total = header + name_bytes + 2;
+    let Ok(name_len) = u32::try_from(name_bytes) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
+    };
+    let Ok(size) = u32::try_from(total) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
+    };
+    // u64 elements give the 8-byte alignment of the HANDLE field.
+    let mut buf = vec![0u64; total.div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buf` holds at least `total` zeroed, aligned bytes, so the
+    // header fields lie inside it. All zero already means ReplaceIfExists
+    // FALSE and RootDirectory NULL. The name goes right after the header
+    // and the copy stays inside `buf` because `total` counts it.
+    unsafe {
+        (*info).FileNameLength = name_len;
+        let dst = buf.as_mut_ptr().cast::<u8>().add(header);
+        ptr::copy_nonoverlapping(name.as_ptr().cast::<u8>(), dst, name_bytes);
+    }
+    // SAFETY: `buf` is a filled FILE_RENAME_INFO of `size` bytes that lives
+    // across the call. The handle is open.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FileRenameInfo,
+            buf.as_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `GetDriveTypeW` for a drive root such as `C:\`. Read only.
 #[must_use]
 pub fn drive_type(root: &Path) -> u32 {
@@ -1023,6 +1083,13 @@ mod tests {
         let mut huge = record(0, 0x20, "x", false);
         huge[REC_NAME_LENGTH..REC_NAME_LENGTH + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse(&huge).is_err());
+    }
+
+    #[test]
+    fn walker_refuses_an_odd_name_length() {
+        let mut buf = record(0, 0x20, "drift.txt", true);
+        buf[REC_NAME_LENGTH..REC_NAME_LENGTH + 4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(parse(&buf).is_err());
     }
 
     #[test]

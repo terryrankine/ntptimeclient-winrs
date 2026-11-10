@@ -17,10 +17,15 @@
 //! - The DACL is protected (nothing inherited from the parent) and grants
 //!   SYSTEM and Administrators full control, inherited by files and
 //!   folders. Users get nothing: the directory holds only the drift value.
-//! - A wrong DACL under a right owner is fixed only after the children are
-//!   cleaned (R68): `drift.txt` and `drift.txt.tmp` are deleted if each is a
-//!   plain file with one link. Anything else refuses. A DACL that is already
-//!   right is left alone with its children.
+//! - An existing directory is never re-ACLed (R78). A handle opened before a
+//!   DACL change keeps the rights it was granted, so a re-ACLed old object can
+//!   still be written, even turned into a junction, through such a handle.
+//!   If the DACL or a child is wrong, the known children are cleaned, the old
+//!   directory is renamed to a quarantine sibling `<name>.old-<hex>`, and a
+//!   fresh directory is created with the secure descriptor from birth. No
+//!   foreign handle or child can predate a fresh object.
+//! - Every start checks every child, also when the DACL is right: known
+//!   names only, plain file, one link, owner SYSTEM or Administrators.
 //! - Any failure is an error. The host then runs without a saved drift.
 //!
 //! Error text names no path, per the engine host contract.
@@ -75,6 +80,21 @@ pub enum AclError {
     /// The path no longer names the directory that was secured.
     #[error("state directory changed while it was being secured")]
     PathChanged,
+    /// A component is a DOS device name (CON, NUL, COM1 and so on) or holds
+    /// a colon (named stream syntax).
+    #[error("state directory path has a device name or a colon")]
+    ReservedName,
+    /// Securing a fresh directory failed after the old one was moved to
+    /// quarantine, and moving it back failed too. Both errors are kept.
+    #[error(
+        "state directory replacement failed ({cause}), and restoring the old directory failed ({rollback})"
+    )]
+    RollbackFailed {
+        /// Why the fresh directory could not be secured.
+        cause: String,
+        /// Why the old directory could not be moved back.
+        rollback: String,
+    },
     /// The directory itself is a symlink or junction.
     #[error("state directory is a link or junction")]
     Link,
@@ -121,9 +141,21 @@ fn os(op: &'static str, e: &io::Error) -> AclError {
 /// directory already exists. Only the last component is created. Its parent
 /// must exist.
 ///
+/// On Ok the path names a directory, not a link, owned by SYSTEM or
+/// Administrators, with exactly the protected secure DACL, whose children are
+/// only plain single-link `drift.txt` or `drift.txt.tmp` files owned by
+/// SYSTEM or Administrators. A directory with a wrong DACL or a wrong-owned
+/// known child is replaced by a fresh one (R78). The old one goes to a
+/// quarantine sibling `<name>.old-<hex>`, which is deleted best effort and
+/// may be left behind, empty or holding whatever an attacker put there
+/// later. Nothing reads it.
+///
 /// A directory this call creates and then cannot secure is removed again,
 /// best effort. It is empty and ours, and a half-secured directory must not
 /// be left behind.
+///
+/// A `subst` drive is accepted as a fixed drive. Pointing one at a user
+/// directory is an administrator misconfiguration (R79), like R74 below.
 ///
 /// Parents are checked for links and for their owner, not for their DACL
 /// (R74). A parent owned by SYSTEM, Administrators or `TrustedInstaller` whose
@@ -194,7 +226,11 @@ fn drive_root(path: &Path) -> Result<PathBuf, AclError> {
 /// user-owned temp tree can reach the later checks.
 fn secure_final(path: &Path) -> Result<(), AclError> {
     let (handle, created) = open_or_create(path)?;
-    let result = secure_open_dir(&handle, path, created);
+    let result = if created {
+        secure_fresh(&handle, path)
+    } else {
+        secure_existing(&handle, path)
+    };
     drop(handle);
     if result.is_err() && created {
         let _ = std::fs::remove_dir(path);
@@ -221,6 +257,16 @@ fn ancestors(path: &Path) -> Result<Vec<PathBuf>, AclError> {
     if rest.iter().any(|c| ends_in_dot_or_space(c.as_os_str())) {
         return Err(AclError::TrailingDotOrSpace);
     }
+    let verbatim = matches!(
+        path.components().next(),
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::VerbatimDisk(_))
+    );
+    if rest
+        .iter()
+        .any(|c| has_colon(c.as_os_str()) || (!verbatim && is_device_name(c.as_os_str())))
+    {
+        return Err(AclError::ReservedName);
+    }
     let mut out = Vec::with_capacity(rest.len());
     let mut current: PathBuf = path.components().take(2).collect();
     out.push(current.clone());
@@ -239,6 +285,29 @@ fn ends_in_dot_or_space(name: &std::ffi::OsStr) -> bool {
         name.encode_wide().last(),
         Some(u) if u == u16::from(b'.') || u == u16::from(b' ')
     )
+}
+
+/// A colon in a component is named stream syntax (`dir:stream`).
+fn has_colon(name: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    name.encode_wide().any(|u| u == u16::from(b':'))
+}
+
+/// DOS device names: CON, PRN, AUX, NUL, COM1 to COM9, LPT1 to LPT9, with
+/// or without an extension, any case. In a non-verbatim path Win32 maps
+/// them to the device, not to a file.
+fn is_device_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    let stem = name.split('.').next().unwrap_or("").trim_end();
+    match stem {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let b = stem.as_bytes();
+            b.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && (b'1'..=b'9').contains(&b[3])
+        }
+    }
 }
 
 /// Checks one parent through a single no-follow handle: not a link, a
@@ -270,23 +339,31 @@ fn parent_owner_trusted(owner: Option<Principal>) -> bool {
     )
 }
 
-/// Opens the directory with the rights needed to fix it, creating it first
-/// if it is missing. Returns whether this call created it.
+/// Rights on the state directory handle. `DELETE` lets the quarantine
+/// rename and the quarantine delete go through the checked handle.
+const DIR_RIGHTS: u32 =
+    READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | DELETE;
+
+/// Refuses before creating when new objects would get an untrusted owner.
+/// Such a directory could never pass, and a user could not even delete it
+/// again once it has the secure DACL.
+fn require_trusted_token_owner() -> Result<(), AclError> {
+    let owner = win32::token_default_owner().map_err(|e| os("read token", &e))?;
+    if matches!(owner, Principal::System | Principal::Administrators) {
+        Ok(())
+    } else {
+        Err(AclError::UntrustedOwner)
+    }
+}
+
+/// Opens the directory with the rights needed to secure it, creating it
+/// first if it is missing. Returns whether this call created it.
 fn open_or_create(path: &Path) -> Result<(OwnedHandle, bool), AclError> {
-    let rights =
-        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY;
     let mut created = false;
-    match win32::open_no_follow(path, rights) {
+    match win32::open_no_follow(path, DIR_RIGHTS) {
         Ok(h) => return Ok((h, false)),
         Err(e) if matches!(e.raw_os_error(), Some(FILE_NOT_FOUND | PATH_NOT_FOUND)) => {
-            // A new directory gets the token's default owner. If that is not
-            // trusted the directory could never pass, and a user could not
-            // even delete it again once it has the secure DACL. So refuse
-            // before creating anything.
-            let owner = win32::token_default_owner().map_err(|e| os("read token", &e))?;
-            if !matches!(owner, Principal::System | Principal::Administrators) {
-                return Err(AclError::UntrustedOwner);
-            }
+            require_trusted_token_owner()?;
             match win32::create_secure_dir(path) {
                 Ok(()) => created = true,
                 // Someone made it in between. Treat it as pre-existing.
@@ -297,7 +374,7 @@ fn open_or_create(path: &Path) -> Result<(OwnedHandle, bool), AclError> {
         Err(e) if e.raw_os_error() == Some(ACCESS_DENIED) => return Err(denied(path, &e)),
         Err(e) => return Err(os("open", &e)),
     }
-    match win32::open_no_follow(path, rights) {
+    match win32::open_no_follow(path, DIR_RIGHTS) {
         Ok(h) => Ok((h, created)),
         Err(e) => {
             let err = if e.raw_os_error() == Some(ACCESS_DENIED) {
@@ -340,46 +417,247 @@ fn check_handle(h: &OwnedHandle) -> Result<(), AclError> {
     Ok(())
 }
 
-/// Every check and the DACL write go through the handle, so a swap of the
-/// path after the open cannot redirect them. `path` is used only to open
-/// the known children for clean-up.
-fn secure_open_dir(h: &OwnedHandle, path: &Path, created: bool) -> Result<(), AclError> {
+/// The steps after a fresh create, behind a trait so a test can pin their
+/// order: the checks must run after the DACL write and before Ok.
+trait DirOps {
+    fn write_dacl(&self, h: &OwnedHandle) -> Result<(), AclError>;
+    fn read_security(&self, h: &OwnedHandle) -> Result<Security, AclError>;
+    fn require_empty(&self, h: &OwnedHandle) -> Result<(), AclError>;
+    fn same_object(&self, h: &OwnedHandle, path: &Path) -> Result<(), AclError>;
+}
+
+/// The real OS.
+struct OsOps;
+
+impl DirOps for OsOps {
+    fn write_dacl(&self, h: &OwnedHandle) -> Result<(), AclError> {
+        match win32::write_secure_dacl(h, true) {
+            Ok(()) => Ok(()),
+            // The token cannot assign Administrators as owner. Keep the
+            // owner, which is checked after, and set only the DACL.
+            Err(e) if e.raw_os_error() == Some(INVALID_OWNER) => {
+                win32::write_secure_dacl(h, false).map_err(|e| os("set security", &e))
+            }
+            Err(e) => Err(os("set security", &e)),
+        }
+    }
+
+    fn read_security(&self, h: &OwnedHandle) -> Result<Security, AclError> {
+        win32::read_security(h).map_err(|e| os("read security", &e))
+    }
+
+    fn require_empty(&self, h: &OwnedHandle) -> Result<(), AclError> {
+        require_empty(h)
+    }
+
+    fn same_object(&self, h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+        same_object(h, path)
+    }
+}
+
+/// A directory this run created, born with the secure DACL. No foreign
+/// handle or child can predate it.
+fn secure_fresh(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+    check_handle(h)?;
+    finish_fresh(&OsOps, h, path)
+}
+
+/// Sets the owner where the token can (the DACL is the one it was born
+/// with), reads it back, then checks the directory is still empty and still
+/// the object at `path`.
+fn finish_fresh(ops: &impl DirOps, h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+    ops.write_dacl(h)?;
+    let after = ops.read_security(h)?;
+    if !owner_trusted(&after) {
+        return Err(AclError::UntrustedOwner);
+    }
+    if !dacl_is_secure(&after) {
+        return Err(AclError::DaclNotApplied);
+    }
+    ops.require_empty(h)?;
+    ops.same_object(h, path)
+}
+
+/// The fast path: the DACL and every child were right. Only the identity
+/// is checked again.
+fn finish_keep(ops: &impl DirOps, h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+    ops.same_object(h, path)
+}
+
+/// A directory that was there before this run.
+fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
     check_handle(h)?;
     let sec = win32::read_security(h).map_err(|e| os("read security", &e))?;
     if !owner_trusted(&sec) {
         return Err(AclError::UntrustedOwner);
     }
-    let fix = !dacl_is_secure(&sec);
-    if fix && !created {
-        // Validate, clean the known names, then set the DACL (R68). A
-        // planted child must not survive into a directory we then call
-        // secure, and the inheritance pass must not touch it.
-        clean_known_children(h, path)?;
+    let children = inspect_children(h, path)?;
+    match decide(dacl_is_secure(&sec), &children) {
+        Decision::Keep => finish_keep(&OsOps, h, path),
+        Decision::Refuse => Err(AclError::UnexpectedChild),
+        Decision::Quarantine => quarantine_and_recreate(h, path),
     }
-    if created || fix {
-        match win32::write_secure_dacl(h, true) {
-            Ok(()) => {}
-            // The token cannot assign Administrators as owner. Keep the
-            // owner, which was checked above, and set only the DACL.
-            Err(e) if e.raw_os_error() == Some(INVALID_OWNER) => {
-                win32::write_secure_dacl(h, false).map_err(|e| os("set security", &e))?;
+}
+
+/// What a child is, as far as the rules care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildKind {
+    File,
+    Directory,
+    /// Any reparse point: symlink, junction or other tag.
+    Link,
+}
+
+/// One observed child of the state directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildObs {
+    /// `drift.txt` or `drift.txt.tmp`.
+    known: bool,
+    kind: ChildKind,
+    /// Hard link count. Zero when not read (unknown name or not a file).
+    links: u32,
+    /// Owned by SYSTEM or Administrators.
+    owner_trusted: bool,
+}
+
+/// What to do with an existing, trusted-owned directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// DACL exact and every child right: use it as it is.
+    Keep,
+    /// Fixable: clean the known children, quarantine, start fresh (R78).
+    Quarantine,
+    /// Something the service never writes is there. Persistence off.
+    Refuse,
+}
+
+/// The rule table. Unknown names, directories, links and extra hard links
+/// refuse. A wrong DACL or a wrong-owned known file quarantines. Else keep.
+fn decide(dacl_exact: bool, children: &[ChildObs]) -> Decision {
+    let shape_ok = |c: &ChildObs| c.known && c.kind == ChildKind::File && c.links == 1;
+    if !children.iter().all(shape_ok) {
+        return Decision::Refuse;
+    }
+    if dacl_exact && children.iter().all(|c| c.owner_trusted) {
+        Decision::Keep
+    } else {
+        Decision::Quarantine
+    }
+}
+
+fn kind_of(attributes: u32) -> ChildKind {
+    if attributes & ATTR_REPARSE_POINT != 0 {
+        ChildKind::Link
+    } else if attributes & ATTR_DIRECTORY != 0 {
+        ChildKind::Directory
+    } else {
+        ChildKind::File
+    }
+}
+
+/// Lists the children through `dir` and observes each. Unknown names and
+/// non-files are not opened. A known file is opened by path without
+/// following a reparse point, and its kind, link count and owner are read
+/// from that handle.
+fn inspect_children(dir: &OwnedHandle, path: &Path) -> Result<Vec<ChildObs>, AclError> {
+    let entries = win32::list_dir(dir).map_err(|e| os("list", &e))?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let known = KNOWN_CHILDREN.iter().any(|k| entry.name == *k);
+        let listed = kind_of(entry.attributes);
+        if !known || listed != ChildKind::File {
+            out.push(ChildObs {
+                known,
+                kind: listed,
+                links: 0,
+                owner_trusted: false,
+            });
+            continue;
+        }
+        let child =
+            win32::open_no_follow(&path.join(&entry.name), READ_CONTROL | FILE_READ_ATTRIBUTES)
+                .map_err(|e| os("open child", &e))?;
+        let info = win32::link_info(&child).map_err(|e| os("check child", &e))?;
+        let sec = win32::read_security(&child).map_err(|e| os("check child", &e))?;
+        out.push(ChildObs {
+            known,
+            kind: kind_of(info.attributes),
+            links: info.links,
+            owner_trusted: owner_trusted(&sec),
+        });
+    }
+    Ok(out)
+}
+
+/// R78: clean the known children, move the old directory to a quarantine
+/// sibling through its own handle, create a fresh secure directory, and
+/// delete the quarantine best effort. If the fresh directory fails, move
+/// the old one back and report both errors if that fails too.
+fn quarantine_and_recreate(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
+    clean_known_children(h, path)?;
+    rename_to_quarantine(h, path)?;
+    match create_fresh(path) {
+        Ok(()) => {
+            // Best effort, as R78 says: the old directory is empty unless
+            // someone added to it through a held handle. Delete through the
+            // handle, so no link is followed. A failure leaves an inert
+            // quarantine directory that nothing reads.
+            let _ = win32::delete_by_handle(h);
+            Ok(())
+        }
+        Err(cause) => match win32::rename_by_handle(h, path) {
+            Ok(()) => Err(cause),
+            Err(e) => Err(AclError::RollbackFailed {
+                cause: cause.to_string(),
+                rollback: e.to_string(),
+            }),
+        },
+    }
+}
+
+/// Renames the directory behind `h` to `<name>.old-<16 hex>` next to it.
+/// The suffix comes from the standard library's per-process random hash
+/// keys, so another user cannot predict it and pre-create the name. Three
+/// tries on a name clash, then refuse.
+fn rename_to_quarantine(h: &OwnedHandle, path: &Path) -> Result<PathBuf, AclError> {
+    use std::hash::BuildHasher;
+    /// `ERROR_FILE_EXISTS` and `ERROR_ALREADY_EXISTS`.
+    const FILE_EXISTS: i32 = 80;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(AclError::BadPath);
+    };
+    let keys = std::collections::hash_map::RandomState::new();
+    let mut last = None;
+    for attempt in 0u32..3 {
+        let suffix = keys.hash_one((attempt, win32::unbiased_interrupt_time_precise()));
+        let mut q = name.to_os_string();
+        q.push(format!(".old-{suffix:016x}"));
+        let target = parent.join(q);
+        match win32::rename_by_handle(h, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if matches!(e.raw_os_error(), Some(FILE_EXISTS | ALREADY_EXISTS)) => {
+                last = Some(e);
             }
-            Err(e) => return Err(os("set security", &e)),
+            Err(e) => return Err(os("quarantine", &e)),
         }
-        let after = win32::read_security(h).map_err(|e| os("read security", &e))?;
-        if !owner_trusted(&after) {
-            return Err(AclError::UntrustedOwner);
-        }
-        if !dacl_is_secure(&after) {
-            return Err(AclError::DaclNotApplied);
-        }
-        // Before the DACL landed, Users may still have had create rights and
-        // planted a file after the clean-up listing. Now nobody unprivileged
-        // can add an entry, so this listing is authoritative. Refuse, delete
-        // nothing.
-        require_empty(h)?;
     }
-    same_object(h, path)
+    let e = last.unwrap_or_else(|| io::Error::other("no quarantine name"));
+    Err(os("quarantine", &e))
+}
+
+/// Creates a fresh directory at `path` with the secure descriptor and
+/// secures it. Refuses if anything already took the name. Removes it again
+/// if securing fails.
+fn create_fresh(path: &Path) -> Result<(), AclError> {
+    require_trusted_token_owner()?;
+    win32::create_secure_dir(path).map_err(|e| os("create", &e))?;
+    let result = win32::open_no_follow(path, DIR_RIGHTS)
+        .map_err(|e| os("open", &e))
+        .and_then(|h| secure_fresh(&h, path));
+    if result.is_err() {
+        let _ = std::fs::remove_dir(path);
+    }
+    result
 }
 
 /// Refuses unless the directory behind `dir` is empty.
@@ -392,12 +670,15 @@ fn require_empty(dir: &OwnedHandle) -> Result<(), AclError> {
 }
 
 /// Refuses if `path` no longer names the object behind `h`, for example
-/// after a rename swap while it was being secured. Compares volume serial
-/// and file index.
+/// after a rename swap while it was being secured, or if the path is a
+/// reparse point now. Compares volume serial and file index.
 fn same_object(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
     let again = win32::open_no_follow(path, FILE_READ_ATTRIBUTES).map_err(|e| os("reopen", &e))?;
     let a = win32::link_info(h).map_err(|e| os("identify", &e))?;
     let b = win32::link_info(&again).map_err(|e| os("identify", &e))?;
+    if b.attributes & ATTR_REPARSE_POINT != 0 {
+        return Err(AclError::Link);
+    }
     if a.same_file(&b) {
         Ok(())
     } else {
@@ -408,8 +689,8 @@ fn same_object(h: &OwnedHandle, path: &Path) -> Result<(), AclError> {
 /// The only names the drift store writes.
 const KNOWN_CHILDREN: [&str; 2] = ["drift.txt", "drift.txt.tmp"];
 
-/// Deletes `drift.txt` and `drift.txt.tmp` from a directory whose DACL is
-/// about to be fixed.
+/// Deletes `drift.txt` and `drift.txt.tmp` from a directory before it goes
+/// to quarantine.
 ///
 /// - Any other entry, or a known name that is a directory, a link of any
 ///   kind or has more than one hard link: `UnexpectedChild`, nothing deleted.
@@ -591,6 +872,11 @@ mod tests {
             AclError::TrailingDotOrSpace,
             AclError::NotFixedDrive,
             AclError::PathChanged,
+            AclError::ReservedName,
+            AclError::RollbackFailed {
+                cause: "a".into(),
+                rollback: "b".into(),
+            },
             AclError::DaclNotApplied,
             os("open", &io::Error::from_raw_os_error(5)),
         ];
@@ -846,8 +1132,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_dir_under_an_untrusted_token_creates_nothing() {
-        // `secure_final` alone: the parent exists, the directory does not.
+    fn missing_parent_through_secure_final_creates_nothing() {
+        // `secure_final` alone, with the parent `missing` absent. Non-elevated
+        // the token owner check refuses first. Elevated the create fails
+        // because the parent is not there. Either way nothing is created.
         let s = Scratch::new("nodir");
         let dir = s.0.join("missing").join("state");
         assert!(secure_final(&dir).is_err());
@@ -912,15 +1200,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_real_non_fixed_drive_is_refused() {
-        // Read only: GetDriveTypeW on each letter until one is not fixed.
-        // No file is opened on that drive, the drive check comes first.
-        let Some(root) = (b'D'..=b'Z')
+    /// The first drive letter from D to Z whose `GetDriveTypeW` is `want`.
+    /// Read only.
+    fn drive_of_type(want: u32) -> Option<PathBuf> {
+        (b'D'..=b'Z')
             .map(|l| PathBuf::from(format!("{}:\\", char::from(l))))
-            .find(|r| win32::drive_type(r) != DRIVE_FIXED)
-        else {
-            eprintln!("skip: every drive letter is a fixed disk");
+            .find(|r| win32::drive_type(r) == want)
+    }
+
+    #[test]
+    fn a_real_remote_drive_is_refused() {
+        // DRIVE_REMOTE is 4. No file is opened there: the drive check comes
+        // before any open.
+        let Some(root) = drive_of_type(4) else {
+            eprintln!("skip: no mapped network drive");
+            return;
+        };
+        eprintln!("remote drive used: {}", root.display());
+        assert_eq!(
+            secure_state_dir(&root.join("ntpc-state")),
+            Err(AclError::NotFixedDrive)
+        );
+    }
+
+    #[test]
+    fn an_unused_drive_letter_is_refused() {
+        // DRIVE_NO_ROOT_DIR is 1: the letter is not in use.
+        let Some(root) = drive_of_type(1) else {
+            eprintln!("skip: every letter from D to Z is in use");
             return;
         };
         assert_eq!(
@@ -963,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn post_dacl_check_refuses_a_planted_file_and_deletes_nothing() {
+    fn require_empty_helper_refuses_a_planted_file_and_deletes_nothing() {
         let s = Scratch::new("planted");
         let dir = state_dir(&s);
         let h = listing_handle(&dir);
@@ -1134,9 +1441,9 @@ mod tests {
     }
 
     #[test]
-    fn elevated_wrong_dacl_is_cleaned_then_fixed() {
+    fn elevated_wrong_dacl_is_quarantined_and_replaced() {
         if !elevated() {
-            eprintln!("skip: not elevated, re-ACL needs Administrators");
+            eprintln!("skip: not elevated, a trusted owner needs Administrators");
             return;
         }
         // Elevated, the new directory is owned by Administrators and keeps
@@ -1144,9 +1451,319 @@ mod tests {
         let s = Scratch::new("elevatedfix");
         let dir = state_dir(&s);
         std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
+        let before = win32::link_info(&listing_handle(&dir)).unwrap();
         secure_final(&dir).unwrap();
-        assert!(!dir.join("drift.txt").exists());
         let h = win32::open_no_follow(&dir, READ_CONTROL | FILE_READ_ATTRIBUTES).unwrap();
+        let after = win32::link_info(&h).unwrap();
+        assert!(!before.same_file(&after), "the old object was kept");
         assert!(dacl_is_secure(&win32::read_security(&h).unwrap()));
+        assert!(!dir.join("drift.txt").exists());
+        drop(h);
+        // A known file written by an Administrators token is kept.
+        std::fs::write(dir.join("drift.txt"), b"2.0").unwrap();
+        let kept = win32::link_info(&listing_handle(&dir)).unwrap();
+        secure_final(&dir).unwrap();
+        let now = win32::link_info(&listing_handle(&dir)).unwrap();
+        assert!(kept.same_file(&now), "fast path should keep the directory");
+        assert!(dir.join("drift.txt").exists());
+        // An unknown name refuses.
+        std::fs::write(dir.join("other"), b"x").unwrap();
+        assert_eq!(secure_final(&dir), Err(AclError::UnexpectedChild));
+        // A user-owned known file cannot be planted from an elevated test
+        // without changing an owner, so that row is covered by `decide`.
+        eprintln!("quarantine leftovers: {:?}", quarantine_leftovers(&s.0));
+    }
+
+    fn quarantine_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".old-"))
+            .collect()
+    }
+
+    fn obs(known: bool, kind: ChildKind, links: u32, owner_trusted: bool) -> ChildObs {
+        ChildObs {
+            known,
+            kind,
+            links,
+            owner_trusted,
+        }
+    }
+
+    #[test]
+    fn decision_table() {
+        use ChildKind::{Directory, File, Link};
+        let good = obs(true, File, 1, true);
+        let user_owned = obs(true, File, 1, false);
+        // (DACL exact, children, expected)
+        let rows: Vec<(bool, Vec<ChildObs>, Decision)> = vec![
+            (true, vec![], Decision::Keep),
+            (true, vec![good], Decision::Keep),
+            (true, vec![good, good], Decision::Keep),
+            (false, vec![], Decision::Quarantine),
+            (false, vec![good], Decision::Quarantine),
+            (true, vec![user_owned], Decision::Quarantine),
+            (false, vec![user_owned], Decision::Quarantine),
+            (true, vec![good, user_owned], Decision::Quarantine),
+            (true, vec![obs(false, File, 1, true)], Decision::Refuse),
+            (false, vec![obs(false, File, 1, false)], Decision::Refuse),
+            (true, vec![obs(true, Directory, 0, true)], Decision::Refuse),
+            (true, vec![obs(true, Link, 0, true)], Decision::Refuse),
+            (true, vec![obs(true, File, 2, true)], Decision::Refuse),
+            (false, vec![obs(true, File, 2, false)], Decision::Refuse),
+            (true, vec![obs(true, File, 0, true)], Decision::Refuse),
+            (
+                true,
+                vec![good, obs(false, File, 1, true)],
+                Decision::Refuse,
+            ),
+            (
+                false,
+                vec![user_owned, obs(true, Link, 0, false)],
+                Decision::Refuse,
+            ),
+        ];
+        for (dacl, children, want) in rows {
+            assert_eq!(decide(dacl, &children), want, "{dacl} {children:?}");
+        }
+    }
+
+    fn inspect(dir: &Path) -> Vec<ChildObs> {
+        let h = win32::open_no_follow(dir, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES).unwrap();
+        inspect_children(&h, dir).unwrap()
+    }
+
+    #[test]
+    fn validator_empty_dir_keeps() {
+        let s = Scratch::new("valempty");
+        let dir = state_dir(&s);
+        assert_eq!(inspect(&dir), vec![]);
+        assert_eq!(decide(true, &inspect(&dir)), Decision::Keep);
+    }
+
+    #[test]
+    fn validator_user_owned_known_file_quarantines() {
+        if elevated() {
+            eprintln!("skip: elevated, the file would be owned by Administrators");
+            return;
+        }
+        let s = Scratch::new("valuser");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
+        let c = inspect(&dir);
+        assert_eq!(c, vec![obs(true, ChildKind::File, 1, false)]);
+        assert_eq!(decide(true, &c), Decision::Quarantine);
+    }
+
+    #[test]
+    fn validator_refuses_a_hard_link() {
+        let s = Scratch::new("valhard");
+        let dir = state_dir(&s);
+        let outside = s.0.join("victim.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::fs::hard_link(&outside, dir.join("drift.txt")).unwrap();
+        let c = inspect(&dir);
+        assert_eq!(c[0].links, 2);
+        assert_eq!(decide(true, &c), Decision::Refuse);
+    }
+
+    #[test]
+    fn validator_refuses_a_symlink() {
+        let s = Scratch::new("valsym");
+        let dir = state_dir(&s);
+        let target = s.0.join("target.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        if std::os::windows::fs::symlink_file(&target, dir.join("drift.txt")).is_err() {
+            eprintln!("skip: no right to create a symlink");
+            return;
+        }
+        let c = inspect(&dir);
+        assert_eq!(c[0].kind, ChildKind::Link);
+        assert_eq!(decide(true, &c), Decision::Refuse);
+    }
+
+    #[test]
+    fn validator_refuses_an_unknown_name() {
+        let s = Scratch::new("valunknown");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let c = inspect(&dir);
+        assert!(!c[0].known);
+        assert_eq!(decide(true, &c), Decision::Refuse);
+    }
+
+    #[test]
+    fn validator_refuses_a_subdirectory() {
+        let s = Scratch::new("valsubdir");
+        let dir = state_dir(&s);
+        std::fs::create_dir(dir.join("drift.txt")).unwrap();
+        let c = inspect(&dir);
+        assert_eq!(c[0].kind, ChildKind::Directory);
+        assert_eq!(decide(true, &c), Decision::Refuse);
+    }
+
+    /// Records the order of the steps and can fail one of them.
+    struct FakeOps {
+        log: std::cell::RefCell<Vec<&'static str>>,
+        fail: Option<&'static str>,
+    }
+
+    impl FakeOps {
+        fn new(fail: Option<&'static str>) -> Self {
+            Self {
+                log: std::cell::RefCell::new(Vec::new()),
+                fail,
+            }
+        }
+
+        fn step(&self, name: &'static str) -> Result<(), AclError> {
+            self.log.borrow_mut().push(name);
+            if self.fail == Some(name) {
+                Err(AclError::UnexpectedChild)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DirOps for FakeOps {
+        fn write_dacl(&self, _: &OwnedHandle) -> Result<(), AclError> {
+            self.step("write_dacl")
+        }
+
+        fn read_security(&self, _: &OwnedHandle) -> Result<Security, AclError> {
+            self.step("read_security").map(|()| secure())
+        }
+
+        fn require_empty(&self, _: &OwnedHandle) -> Result<(), AclError> {
+            self.step("require_empty")
+        }
+
+        fn same_object(&self, _: &OwnedHandle, _: &Path) -> Result<(), AclError> {
+            self.step("same_object")
+        }
+    }
+
+    #[test]
+    fn fresh_path_runs_every_check_after_the_dacl_write() {
+        let s = Scratch::new("pinfresh");
+        let h = listing_handle(&s.0);
+        let ops = FakeOps::new(None);
+        assert_eq!(finish_fresh(&ops, &h, &s.0), Ok(()));
+        assert_eq!(
+            *ops.log.borrow(),
+            vec![
+                "write_dacl",
+                "read_security",
+                "require_empty",
+                "same_object"
+            ]
+        );
+        for step in ["require_empty", "same_object"] {
+            let ops = FakeOps::new(Some(step));
+            assert_eq!(
+                finish_fresh(&ops, &h, &s.0),
+                Err(AclError::UnexpectedChild),
+                "{step}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_path_checks_the_identity() {
+        let s = Scratch::new("pinkeep");
+        let h = listing_handle(&s.0);
+        let ops = FakeOps::new(None);
+        assert_eq!(finish_keep(&ops, &h, &s.0), Ok(()));
+        assert_eq!(*ops.log.borrow(), vec!["same_object"]);
+        let ops = FakeOps::new(Some("same_object"));
+        assert!(finish_keep(&ops, &h, &s.0).is_err());
+    }
+
+    fn rename_handle(dir: &Path) -> OwnedHandle {
+        // The temp dir grants Modify, not WRITE_OWNER, so not DIR_RIGHTS.
+        win32::open_no_follow(dir, DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES).unwrap()
+    }
+
+    #[test]
+    fn quarantine_rename_and_rename_back() {
+        let s = Scratch::new("qrename");
+        let dir = state_dir(&s);
+        let h = rename_handle(&dir);
+        let q = rename_to_quarantine(&h, &dir).unwrap();
+        let name = q.file_name().unwrap().to_string_lossy().into_owned();
+        let hex = name.strip_prefix("state.old-").unwrap();
+        assert_eq!(hex.len(), 16);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!dir.exists() && q.is_dir());
+        win32::rename_by_handle(&h, &dir).unwrap();
+        assert!(dir.is_dir() && !q.exists());
+    }
+
+    #[test]
+    fn failed_fresh_create_rolls_the_old_directory_back() {
+        if !matches!(win32::token_default_owner().unwrap(), Principal::Other) {
+            eprintln!("skip: the token's default owner is trusted, the fresh create would work");
+            return;
+        }
+        // Non-elevated, `create_fresh` refuses (untrusted token owner) after
+        // the rename. The old directory must come back under its own name.
+        let s = Scratch::new("qrollback");
+        let dir = state_dir(&s);
+        std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
+        let before = win32::link_info(&listing_handle(&dir)).unwrap();
+        let h = rename_handle(&dir);
+        assert_eq!(
+            quarantine_and_recreate(&h, &dir),
+            Err(AclError::UntrustedOwner)
+        );
+        drop(h);
+        let back = win32::link_info(&listing_handle(&dir)).unwrap();
+        assert!(before.same_file(&back), "old directory not restored");
+        assert!(!dir.join("drift.txt").exists(), "known file cleaned first");
+        assert_eq!(quarantine_leftovers(&s.0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn identity_check_refuses_a_junction_now_at_the_path() {
+        let s = Scratch::new("swapjunction");
+        let dir = state_dir(&s);
+        let h = listing_handle(&dir);
+        std::fs::rename(&dir, s.0.join("moved")).unwrap();
+        if !junction(&dir, &s.0.join("moved")) {
+            eprintln!("skip: mklink /J failed");
+            return;
+        }
+        assert_eq!(same_object(&h, &dir), Err(AclError::Link));
+    }
+
+    #[test]
+    fn device_names_and_colons_are_refused() {
+        for p in [
+            r"C:\ProgramData\CON",
+            r"C:\ProgramData\nul.txt",
+            r"C:\ProgramData\Aux\state",
+            r"C:\ProgramData\com1",
+            r"C:\ProgramData\LPT9.log",
+            r"C:\ProgramData\prn .x",
+            r"C:\ProgramData\ntpc:stream",
+            r"C:\ProgramData\ntpc::$DATA",
+            r"\\?\C:\ProgramData\ntpc:x",
+        ] {
+            assert_eq!(ancestors(Path::new(p)), Err(AclError::ReservedName), "{p}");
+        }
+        for p in [
+            r"C:\ProgramData\console",
+            r"C:\ProgramData\COM0",
+            r"C:\ProgramData\COM10",
+            r"C:\ProgramData\LPT",
+            r"C:\ProgramData\nulled",
+            // Verbatim paths do not map device names.
+            r"\\?\C:\ProgramData\CON",
+        ] {
+            assert!(ancestors(Path::new(p)).is_ok(), "{p}");
+        }
     }
 }
