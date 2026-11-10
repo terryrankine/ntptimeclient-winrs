@@ -1,4 +1,6 @@
-//! Service wiring. Protocol adapter, config and runtime arrive in later tasks.
+//! Service wiring. Config and runtime arrive in later tasks.
+
+pub mod proto;
 
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-service";
