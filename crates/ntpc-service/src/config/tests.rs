@@ -42,8 +42,104 @@ fn empty_file_gives_defaults() {
 }
 
 #[test]
-fn engine_defaults_equal_config_defaults() {
-    assert_eq!(Config::default().engine_config(), EngineConfig::default());
+fn engine_defaults_equal_config_defaults_except_max_age() {
+    // R59: max_age follows max_poll. Nothing else moves.
+    let mut want = EngineConfig::default();
+    want.selection.max_age = Duration::from_secs(2 * 1024 + 30);
+    assert_eq!(Config::default().engine_config(), want);
+}
+
+#[test]
+fn max_age_is_two_polls_and_30_seconds() {
+    for (max_poll, want) in [(64, 158), (100, 230), (1024, 2078)] {
+        let c = ok(&format!(
+            "max_poll_s = {max_poll}
+"
+        ));
+        assert_eq!(
+            c.engine_config().selection.max_age,
+            Duration::from_secs(want)
+        );
+    }
+    // The other selection fields keep the engine default.
+    let d = EngineConfig::default().selection;
+    let s = Config::default().engine_config().selection;
+    assert_eq!(
+        (s.min_survivors, s.max_stratum),
+        (d.min_survivors, d.max_stratum)
+    );
+}
+
+#[test]
+fn cross_check_cap_is_unchanged_at_the_default_poll() {
+    // The engine caps the cross-check window at min(max_age, reprobe_every).
+    let e = Config::default().engine_config();
+    assert_eq!(
+        e.selection.max_age.min(e.tier.reprobe_every),
+        EngineConfig::default()
+            .selection
+            .max_age
+            .min(EngineConfig::default().tier.reprobe_every)
+    );
+}
+
+#[test]
+fn step_threshold_must_be_at_least_min_poll() {
+    let cases = [
+        (64, 63, false),
+        (64, 64, true),
+        (64, 65, true),
+        (128, 127, false),
+        (128, 128, true),
+        (100, 99, false),
+    ];
+    for (min_poll, step, good) in cases {
+        let r = Config::parse(&format!(
+            "min_poll_s = {min_poll}
+step_threshold_ms = {step}
+"
+        ));
+        assert_eq!(r.is_ok(), good, "min_poll {min_poll} step {step}: {r:?}");
+    }
+    let m = invalid_text(
+        "step_threshold_ms = 63
+",
+    );
+    assert!(
+        m.contains("step_threshold_ms") && m.contains("min_poll_s") && m.contains("cross-check"),
+        "{m}"
+    );
+    // The default 128 ms still fits the largest allowed min_poll of 128 s.
+    assert!(
+        Config::parse(
+            "min_poll_s = 128
+"
+        )
+        .is_ok()
+    );
+    Config::default().validate().expect("defaults are valid");
+}
+
+#[test]
+fn bare_and_local_names_warn() {
+    let c = ok(
+        r#"servers = ["ntp", "pool.local", "Host.LOCAL.", "time.example.com", "192.0.2.1", "::1"]"#,
+    );
+    let w = c.warnings();
+    assert_eq!(w.len(), 3, "{w:?}");
+    assert!(w[0].contains("servers[0]") && w[0].contains("LLMNR"));
+    assert!(w[1].contains("servers[1]"));
+    assert!(w[2].contains("servers[2]"));
+    assert_eq!(Config::default().warnings().len(), 0);
+}
+
+#[test]
+fn a_bare_pool_name_warns() {
+    let c = ok("pool = \"ntp\"
+");
+    let w = c.warnings();
+    assert_eq!(w.len(), 1);
+    assert!(w[0].starts_with("pool "));
 }
 
 #[test]
@@ -182,7 +278,9 @@ fn engine_config_maps_units() {
     assert_eq!(e.max_poll, Duration::from_secs(800));
     // Everything the file cannot set keeps the engine default.
     let d = EngineConfig::default();
-    assert_eq!(e.selection, d.selection);
+    assert_eq!(e.selection.max_age, Duration::from_secs(2 * 800 + 30));
+    assert_eq!(e.selection.min_survivors, d.selection.min_survivors);
+    assert_eq!(e.selection.max_stratum, d.selection.max_stratum);
     assert_eq!(e.tier, d.tier);
     assert_eq!(e.discipline.max_slew, d.discipline.max_slew);
 }
@@ -276,7 +374,7 @@ fn state_dir_must_be_absolute_on_windows() {
 }
 
 #[test]
-fn parse_error_has_position_and_no_file_text() {
+fn parse_error_has_position_and_no_other_lines_of_the_file() {
     let secret = "SuperSecretValue123";
     let text = format!("dhcp = true\nservers = \"{secret}\"\n");
     let e = err(&text);
