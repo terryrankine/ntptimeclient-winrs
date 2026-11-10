@@ -120,3 +120,66 @@ Task 11 facts. Each line names its source. "Measured" means read on the builder'
 - R74: parent owners are checked, parent DACLs are not. A parent owned by SYSTEM, Administrators or TrustedInstaller whose DACL grants Users `FILE_DELETE_CHILD` would let them remove the state directory. That is an administrator misconfiguration, out of scope.
 - Error text carries no paths (engine host contract).
 - Load-side hardening (reparse flag and `SECURITY_IDENTIFICATION` on opens of `drift.txt` and the config) lives in `ntpc-service` `safe_open`. It is not duplicated here.
+
+## Platform: DHCP option 42 (Task 13)
+
+Task 13 facts. "Learn" means Microsoft Learn. "Observed" means a read-only probe on the builder's Windows 11 machine (build 26300). Probes read registry value names, value kinds and option numbers only. No address, name or lease value was copied anywhere.
+
+### Sources
+
+- [DhcpRequestParams](https://learn.microsoft.com/en-us/windows/win32/api/dhcpcsdk/nf-dhcpcsdk-dhcprequestparams)
+- [DhcpCApiInitialize](https://learn.microsoft.com/en-us/windows/win32/api/dhcpcsdk/nf-dhcpcsdk-dhcpcapiinitialize)
+- [DHCP Client API Examples](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/dhcp/dhcp-client-api-examples) (archived)
+- [IP_ADAPTER_ADDRESSES_LH](https://learn.microsoft.com/en-us/windows/win32/api/iptypes/ns-iptypes-ip_adapter_addresses_lh)
+- [Win32_NetworkAdapterConfiguration](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-networkadapterconfiguration)
+- [NotifyUnicastIpAddressChange](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-notifyunicastipaddresschange)
+- [CancelMibChangeNotify2](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2)
+- RFC 2132 section 8.3: option 42 holds one or more IPv4 addresses, minimum length 4, length a multiple of 4. From training data, not re-read.
+
+### Candidates
+
+| Candidate | Documented | Gives option 42 | Admin | Network traffic | Observed |
+| --- | --- | --- | --- | --- | --- |
+| IP Helper `GetAdaptersAddresses` | yes | no. Members cover DNS, WINS, gateways and `Dhcpv4Server`. Nothing for NTP or other options | no | none | used for the adapter list |
+| Registry `Tcpip\Parameters\Interfaces\{GUID}` named values | only in old KB pages | no. There is no `DhcpNTPServer` value | no | none | 14 interface keys. Named DHCP values found: `DhcpIPAddress`, `DhcpServer`, `DhcpSubnetMask`, `DhcpDefaultGateway`, `DhcpNameServer`, `DhcpDomain`, lease times and a few more. No value names NTP. |
+| Registry `DhcpInterfaceOptions` (REG_BINARY) | no | only if the client asked for it | no | none | Present on 2 keys. A guessed record layout (20-byte header, data padded to 4) walks both blobs exactly. Option 42 is absent on both. |
+| Registry `Dhcp\Parameters\Options\<n>` | no | no | read no, write yes | none | Keys exist for options 1, 3, 6, 15, 44, 46, 47 and 220. No key for 42. |
+| DHCP client API `DhcpRequestParams` | yes, since Windows 2000 | yes, as the raw option data | not stated. Guess: no | from the cache if every option asked for is there, else a DHCPINFORM to the server (Learn remarks). May block up to 2 minutes (Learn) | NOT RUN. Option 42 is not in the cache on this machine, so a call would send an INFORM. Forbidden here. |
+| WMI `Win32_NetworkAdapterConfiguration` | yes | no. DHCP properties are `DHCPEnabled`, `DHCPLeaseExpires`, `DHCPLeaseObtained`, `DHCPServer` only | no | none | not needed |
+| `w32time` learning from DHCP | n/a | out of scope | n/a | n/a | not checked |
+
+### Choice
+
+- Method: `DhcpRequestParams` with `DHCPCAPI_REQUEST_SYNCHRONOUS`, asking for option 42 only, once per adapter that has a DHCPv4 lease. It is the only documented and supported way to get option 42. It exists since Windows 2000, so it is stable across every supported release.
+- DHCP ships in version one with this method. The live read is UNVERIFIED on a real network. It was not run on the builder's machine because it may send a DHCPINFORM.
+- Cost: option 42 is not in the Windows default request list (observed). So in the normal case every read sends one DHCPINFORM per leased adapter. That is an ordinary DHCP client message on the local link. The call may block up to 2 minutes. `read_lease_servers` blocks and must run on its own thread. The host reads at start, after a network change and on a long timer. It never reads in a tight loop.
+- `Flags = 0` (no SYNCHRONOUS) is not described by Learn. Not used.
+- Not chosen: `DhcpInterfaceOptions`. It is undocumented, the layout is a guess and option 42 is never there unless something asked for it. It stays a possible cache-only fallback for Terry to decide.
+- Possible later step, for Terry: a persistent request (`DHCPCAPI_REQUEST_PERSISTENT` with a `RequestIdStr`, undone by `DhcpUndoRequestParams`) would make the client ask for 42 in every lease. Reads would then come from the cache with no INFORM. It changes system state, so it belongs to install and uninstall. Whether the cache then also records "server sent no 42" is not documented.
+
+### Reader rules (`read_lease_servers`)
+
+- Adapters come from `GetAdaptersAddresses(AF_INET)`. Kept: operational status up, DHCPv4 enabled, a non-zero `Dhcpv4Server` (that is "has a lease"), not loopback, not a tunnel. Virtual adapters with a lease are kept. They carry real traffic.
+- Order: lowest `Ipv4Metric` first, then lowest `IfIndex`. The route the OS prefers comes first. The order is deterministic.
+- An adapter with no lease is skipped before any DHCP call. So an unplugged or APIPA adapter never triggers an INFORM.
+- Servers from all adapters are joined in that order, deduplicated (first wins) and capped at 16.
+- `Ok(empty)` when no adapter has a lease or no lease carries option 42. `Err` only when every adapter call failed, or the adapter list or API start failed. A failed adapter next to a working one is skipped.
+- The OS buffers are walked with bounds checks. Every pointer the OS returns must lie inside the buffer we passed, or the record is skipped. The adapter name must be a plain GUID string of at most 255 ASCII characters before it is widened.
+- Error text holds Win32 error codes only. No address, adapter name or GUID.
+
+### Parser rules (`parse_option42`)
+
+- Input is the option data only (no code or length byte), as `DhcpRequestParams` returns it.
+- Empty input or a length that is not a multiple of 4 gives an empty list. A malformed option must not give a half-trusted list.
+- Duplicates are removed, first wins. At most 16 addresses are returned. Parsing stops there, so a huge input costs no memory.
+- Address classes are NOT filtered here. The resolver (`ntpc-service` `is_usable_address`) already drops unspecified, loopback, link-local, multicast, broadcast and own addresses for every tier. DHCP servers reach it as IP literals with `Tier::Dhcp`. One layer owns the rule. A junk address still counts towards the cap of 16. The resolver caps the tier at 8 anyway.
+
+### Watcher (`DhcpWatcher`)
+
+- Subscription: `NotifyUnicastIpAddressChange(AF_INET)`. Read only. It fires when an IPv4 unicast address is added, removed or changed. A new or lost lease changes the address. Learn says callbacks are serialised.
+- Not chosen: `NotifyAddrChange` needs an overlapped event and a cancel whose completion we would have to wait for. `RegNotifyChangeKeyValue` on the Interfaces key watches undocumented data. `DhcpRegisterParamChange` is per adapter, and adapters come and go.
+- Signal: any IPv4 address change. That is the R66 "network change" that resets the resolver backoff. It is not only a lease change. The host then calls `read_lease_servers` and feeds the list to `LeaseTracker`, which says whether the DHCP servers changed.
+- Gap: a renewal that keeps the address and only changes option 42 may not fire. Guess, not checked. The host's long re-read timer covers it.
+- `wait(timeout)` blocks until a change, the timeout or a cancel. Bursts coalesce into one change. `WatchCanceller` wakes a blocked `wait` from another thread.
+- Drop: cancels waiters, then calls `CancelMibChangeNotify2`. Learn says the cancel must not run on the callback thread, else deadlock. That only makes sense if the cancel waits for a running callback. So the context is freed after the cancel returns. Inference, not stated outright. If the cancel fails, the context is leaked on purpose (a few bytes) and never freed under a live callback. The callback only takes a short mutex and never blocks, so the cancel cannot hang on it.
+- `LeaseTracker`: the first list counts as a change. The same set in another order is not a change, because the resolver keys sources by address and the reader's order is already deterministic. Any add or remove is a change. All removed is a change to empty. On a read error the host keeps the last good list. An error is not a lost lease.
