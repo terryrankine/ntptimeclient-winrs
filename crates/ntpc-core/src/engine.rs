@@ -813,6 +813,16 @@ impl Engine {
         let x = sel.offset.as_secs();
         let big = x.abs() > self.cfg.discipline.step_threshold.as_secs_f64();
         let limit = sel.error_bound.max(JITTER_FLOOR).as_secs_f64();
+        // A reading the slew history no longer covers cannot be brought to
+        // now, so it says nothing about jitter. The history reaches back at
+        // least `max_age` and always to the previous update at the longest
+        // poll, whose gap is 1024 s plus the round trip.
+        if self
+            .prev_offset
+            .is_some_and(|(_, at)| !self.steer.covers(at))
+        {
+            self.prev_offset = None;
+        }
         let jumpy = self.prev_offset.is_some_and(|(prev, at)| {
             // A positive slew closes a positive offset.
             let expected = prev.as_secs() - self.steer.since(at, self.now);

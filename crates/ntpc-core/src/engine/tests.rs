@@ -882,9 +882,10 @@ fn slewed_config_offset_does_not_slip_under_stale_pool_veto() {
 #[test]
 fn old_sample_is_left_out_of_step_decision() {
     // Config source 1 answers once. Its sample stays in the filter until it
-    // ages out at 1024 s. It predates the refusal at 64 s, so it is left out
-    // of every later selection. The step rests on source 3 alone, soon after
-    // the pool agrees from 800 s.
+    // ages out at 1024 s. It predates the refusal at 64 s, so it never feeds
+    // the loop or decides the step. It still counts for tier usability,
+    // corrected for the slew since (ruling R50). The step rests on source 3
+    // alone, soon after the pool agrees from 800 s.
     let n = Rc::new(Cell::new(0_u32));
     let k = Rc::clone(&n);
     let reply: Reply = Box::new(move |s, t| {
