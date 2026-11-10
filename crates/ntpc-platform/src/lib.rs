@@ -5,7 +5,7 @@
 /// Windows only, so the crate still builds where the fuzz job runs.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub mod win32;
+pub(crate) mod win32;
 
 pub mod clock;
 
