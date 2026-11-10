@@ -9,6 +9,9 @@ pub(crate) mod win32;
 
 pub mod clock;
 
+/// DHCP option 42 servers and the lease watcher.
+pub mod dhcp;
+
 /// State directory security. Windows only.
 #[cfg(windows)]
 pub mod acl;
