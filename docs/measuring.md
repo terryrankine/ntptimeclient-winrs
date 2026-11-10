@@ -1,183 +1,133 @@
-# Measuring ntptimeclient-winrs against Windows time
+# Measuring ntptimeclient-winrs against Windows time: procedure
 
-Status: procedure only. No results exist yet. Every number marked "proposal" is the author's call. The owner must confirm them and freeze them (section 8) before the first run.
+This file says how to run the measurement. The rules for judging it are in [measuring-plan.md](measuring-plan.md). The plan is frozen before round 1. This procedure is not part of the freeze, but every change to it is recorded in the report.
 
-## 1. Purpose and what a measurement can show
+Status: no results exist yet. Every number marked "proposal" is the author's call and the owner confirms it in the plan.
+
+## 1. Purpose
 
 The spec says success is measured, not promised. Success means the service beats the Windows default in each case and never makes the clock worse.
 
-The earlier spike (`docs/superpowers/notes/ntp-proto-spike.md`) ran `w32tm /stripchart` once idle and once under load. It gave a median of +4.9 ms idle and +9.0 ms under load, with 28 of 120 samples failing under load. The two runs used different pool servers. One run against a random pool server cannot tell clock error from path error. The load figure may also be partly a sampler artefact (section 5). Nobody has yet compared a tuned `w32time`, Meinberg NTP and the service against one independent reference on one host over a long run. This procedure does that.
+An earlier spike ran `w32tm /stripchart` once idle and once under load against two different pool servers. One run against a random pool server cannot tell clock error from path error. The load figure, with 28 of 120 samples failing, may also be partly a sampler artefact. Nobody has yet compared a tuned `w32time`, Meinberg NTP and the service against independent references on one host over a long run. This procedure does that.
 
-### What is measured
+### What a measurement is
 
-- The sampler reads the offset between this computer's clock and a reference server, as seen through the network path.
-- The reading is `w32tm /stripchart` output. Its columns are described in [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings) (`/stripchart` and `/rdtsc`).
-- It is not true UTC error. The reference has its own error. The path adds a bias if the outbound and return delays differ.
-- NTP bounds that bias. The offset error cannot exceed half the round trip delay. This is the NTP design bound. It is not restated on the Microsoft page. The sampler records the delay so the bound is known per case.
-- Sign: a POSITIVE offset means the reference is AHEAD, so the local clock is SLOW. Checked by the reviewer with a raw NTP exchange. The offset formula (server transmit time minus local receive time, with the usual round trip correction) gave the same sign as `w32tm /stripchart`. A positive slope of the offset over time therefore means the local clock is losing time relative to the reference.
-- `w32tm /stripchart` does not set the clock. Its help text lists no set action and it uses an ephemeral source port. In the author's smoke tests 13 samples over about 5 minutes on two references stayed inside a 5.5 ms band with no step. That shows no step. It is not proof that nothing is touched.
+- The sampler reads the offset between this computer's clock and a reference server, as seen through the network path, with `w32tm /stripchart`. The columns are described in [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings) (`/stripchart` and `/rdtsc`).
+- It is not true UTC error. The reference has its own error. The path adds a bias if the outbound and return delays differ. NTP bounds that bias at half the round trip delay. This is the NTP design bound. The Microsoft page does not state it. The sampler records the delay.
+- Sign: a POSITIVE offset means the reference is AHEAD, so the local clock is SLOW. This was verified independently with a raw NTP exchange. The offset formula (server transmit time minus local receive time, with the usual round trip correction) gave the same sign as `w32tm /stripchart`. A positive slope of the offset over time means the local clock is losing time relative to the reference.
+- `w32tm /stripchart` does not set the clock. The Microsoft page describes it as an offset display using an ephemeral source port. Smoke tests of a few samples showed no step. That is not proof that nothing is touched.
+- The `w32tm` switches used here are listed by `w32tm /?`. They were checked by running the commands. `w32tm /stripchart /?` is not a help request: it fails with `Required parameter 'computer' missing`.
 
-### Claims the project may make
+What may and may not be claimed from the results is in the plan, section 1.
 
-- On this host, with this Windows build, against these references, over these rounds, the service had a median absolute offset of A ms and the Windows default had B ms.
-- The same host, references and path were used for every contender. A constant path bias therefore applies to all of them. The difference between contenders is meaningful where the absolute offset is not.
-- The service did or did not make the clock worse than the free-run control.
-- The error rate of each contender and the recovery time after a disturbance.
+## 2. Safety
 
-### Claims the project may NOT make
+This is a measurement on a real Windows machine. Follow these rules.
 
-- "Accurate to within X ms of UTC". The method cannot show it.
-- "Better than Windows in general". Only the measured host, network, references and cases are covered.
-- "Better than Meinberg" unless Meinberg ran in the same way.
-- Anything about domain-joined machines, other networks, battery use, or other Windows builds that were not measured.
-- A drift figure for a disciplined clock. Only the free-run control has a drift figure. For any other contender the slope is a residual trend.
-- Any number from a run that failed the checklist in section 9.
+- The sampler, the summary, `wait-synced.ps1` and every `w32tm /query`, `/dumpreg`, `/monitor` and `/stripchart` command are read only. They need no admin and change no state.
+- Three scripts change the machine: `apply-tuned-profile.ps1`, `disturb-clock.ps1` and `restore-clock.ps1`. Each refuses unless the environment variable `MEASURE_TEST_MACHINE` is `1`, and unless the session is elevated. Each supports `-WhatIf`. Set the variable only on a throwaway VM or a test machine, and only in that session.
+- Anything that stops `w32time`, installs a service, sets the clock or changes the registry needs a throwaway VM or a test machine. Never run it on a machine that matters.
+- Do not run the load generator, a sleep test or a long run on a machine that must stay in use.
 
-## 2. Reference choice
+## 3. Reference choice
 
-The owner chooses the references and records the choice. This document does not pick one. Any server named in an example is a placeholder.
+The owner chooses the references and records the choice. This document does not pick one. Any address in an example is a placeholder.
 
 Rules:
 
-1. A reference must not be a source that any contender uses. The service defaults to `pool.ntp.org`. The Windows default on the author's machine uses one pool server (section 3).
-2. Use TWO references from different operators, sampled at the same time in every block (section 4). One is the primary reference for the comparison. The other is the check.
+1. A reference must not be a source that any contender uses.
+2. Use TWO references from different operators, sampled at the same time in every block (section 5). One is the primary reference. The other is the check.
 3. Never use a pool name. It resolves to a different server on each run. The sampler refuses `pool.ntp.org` names unless `-AllowPool` is given.
-4. Pass the sampler an IP address. Be aware that an anycast address is one address served by many machines. Pinning the IP does not pin the server or the path over 24 hours.
+4. Pass the sampler an IP address. An anycast address is one address served by many machines. Pinning the IP does not pin the server or the path over 24 hours.
 
-Best option: a server on the owner's LAN that is disciplined by GPS. It has low and steady delay, no rate limit and no anycast. Second best: a national laboratory or ISP stratum 1 source near the owner, if the owner knows one. The owner must verify that it exists, is open to the public and what its policy is. Do not rely on a public name from memory.
+Best option: a server on the owner's LAN disciplined by GPS. It has low and steady delay, no rate limit and no anycast. Second best: a national laboratory or ISP stratum 1 source near the owner, if the owner knows one. The owner must verify that it exists, is open to the public and what its policy is. Do not rely on a public name from memory.
 
 ### Measuring a candidate (read only)
 
-Stratum, root delay and root dispersion:
-
 ```powershell
 w32tm /stripchart /computer:<REF_IP> /samples:1 /packetinfo /dataonly
-```
-
-`/packetinfo` is in `w32tm /stripchart /?` on this build. Checked: it printed `Stratum`, `Root Delay`, `Root Dispersion`, `ReferenceId` and the four NTP timestamps for one public candidate. That candidate showed stratum 3, so the stratum rule below does reject some well known public servers.
-
-Alternative: `w32tm /monitor /computers:<REF_IP> /nowarn`. Checked: it printed an ICMP delay, the NTP offset, `RefID` and `Stratum`. It also sends ICMP.
-
-Delay and its spread over a minute:
-
-```powershell
+w32tm /monitor /computers:<REF_IP> /nowarn
 w32tm /stripchart /computer:<REF_IP> /samples:30 /period:2 /dataonly /rdtsc
 ```
 
-### Candidate checklist
+The first prints `Stratum`, `Root Delay`, `Root Dispersion` and `ReferenceId`. The second prints an ICMP delay, the NTP offset, `RefID` and `Stratum`. It also sends ICMP. The third gives 30 delay samples. All three ran against a public candidate while this was written. That candidate showed stratum 3, so the stratum rule below does reject some well known public servers.
 
 | Check | Accept when (proposal) | How |
 | --- | --- | --- |
 | Stratum | 1 or 2 | `/packetinfo` |
-| Median round trip delay | 20 ms or less for a public server. A LAN server is far lower | `/rdtsc` column `RoundtripDelay` |
-| Delay spread (p95 minus p5) | 2 ms or less | the same 30 samples |
-| Error rate in the probe | 0 of 30 | the same 30 samples |
-| Anycast | Known and recorded. Prefer unicast | Operator documentation. Repeat the probe hours apart. A changed `ReferenceId` or a jump in delay suggests another machine behind the address |
-| Leap second smearing | Known and recorded. A smeared server disagrees with unsmeared ones by up to a fraction of a second around a leap second | Operator documentation. Owner must verify. UNVERIFIED here |
-| Rate limits | Policy read. Interval and the two samplers fit inside it | Operator policy. Public servers may rate limit or send Kiss-of-Death to fast polling. This shows as error rows |
+| Median round trip delay | 20 ms or less for a public server. A LAN server is far lower | `RoundtripDelay` column |
+| Delay spread (p95 minus p5) | 2 ms or less | the 30 samples |
+| Error rate | 0 of 30 | the 30 samples |
+| Anycast | Known and recorded. Prefer unicast | Operator documentation. Repeat the probe hours apart. A changed `ReferenceId` or a jump in delay suggests another machine |
+| Leap second smearing | Known and recorded. A smeared server disagrees with unsmeared ones by up to a fraction of a second around a leap second | Operator documentation. The owner must verify. UNVERIFIED here |
+| Rate limits | Policy read. The interval and two samplers fit inside it | Operator policy. Fast polling may be rate limited or get Kiss-of-Death. That shows as error rows |
 | Independence | Different operator from the contenders' sources and from the other reference | Operator documentation |
 
-Reject a reference that disagrees with the other reference. The rule is per block (section 4): the signed medians of the two references in the same block must differ by 2 ms or less (proposal). A larger difference means at least one has a path bias or a fault. The block is flagged `DISAGREE` in the summary and is excluded from the primary analysis. Its data stays in the CSV.
+The agreement rule between the two references is applied per block by the summary (plan, section 3).
 
-## 3. Contenders
+## 4. Contenders
 
-| Label | What it is | Changes system state | Needs admin |
+| Label | What it is | Changes state | Admin |
 | --- | --- | --- | --- |
-| `w32time-default` | `w32time` as shipped, no changes | No | No for the sampler |
-| `w32time-default-aa` | The same as `w32time-default`, a second set of blocks. The A/A control | No | No |
-| `w32time-tuned` | `w32time` with the profile below | Yes: registry and service | Yes |
-| `meinberg` | Meinberg NTP for Windows, optional | Yes: install, stops `w32time` | Yes |
+| `w32time-default` | `w32time` as shipped | No | No for the sampler |
+| `w32time-default-aa` | Same as the default, second set of blocks. The A/A control | No | No |
+| `w32time-tuned` | `w32time` with the profile below | Yes | Yes |
+| `meinberg` | Meinberg NTP for Windows, optional | Yes | Yes |
 | `service` | ntptimeclient-winrs. `install` stops and disables `w32time` | Yes | Yes |
-| `free-run` | Service and `w32time` stopped. No sync. Throwaway VM only | Yes: stops a service | Yes |
+| `free-run` | Service and `w32time` stopped. No sync. Throwaway VM only | Yes | Yes |
 
-Anything that stops `w32time`, installs a service or sets the clock needs a throwaway VM or a test machine. Do not run `free-run`, `meinberg` or `service` on a machine that matters. The sampler changes nothing and needs no admin.
+### Sources
 
-### Sources for the contenders
+The Windows default and the service do not use the same sources. The Microsoft page gives `time.windows.com,0x1` as the stand-alone default. The service uses its tier rules and a pool expansion. So:
 
-The Windows default does not use the same sources as the service. On the author's machine `w32tm /query /peers` showed ONE peer, `1.au.pool.ntp.org,0x9`, and `/query /status` showed the same source. The registry `NtpServer` value was `1.au.pool.ntp.org,0x9`. So the default has one pool server and the service uses its own tier rules and a pool expansion.
-
-Rules:
-
-- Record the default's real source at the start of every run: `w32tm /query /status` and `w32tm /query /peers`. Both ran without admin here. Also record the service's own source list from its status output.
-- Decide, and write down in the frozen plan, whether the difference between the contenders' sources is intended. A difference is intended when the question is "which shipped behaviour is better". It is not intended when the question is "which client algorithm is better".
-- When the question is the client algorithm, `w32time-tuned`, `meinberg` and `service` must use the SAME manual peer list, as IP addresses. Give `w32time-default` the same list too if the owner wants a pure algorithm comparison, and say so, because that is no longer the default as shipped.
+- Record the default's real source at the start of every block: `w32tm /query /status` and `w32tm /query /peers`. Both run without admin. Record the service's own source list from its status output.
+- Decide, and write down in the plan before round 1, whether the difference in sources is intended. It is intended when the question is which shipped behaviour is better. It is not when the question is which client algorithm is better.
+- For the algorithm question, `w32time-tuned`, `meinberg` and `service` use the SAME manual peer list, as IP addresses. Give `w32time-default` the same list too if the owner wants a pure comparison, and say so, because that is no longer the default as shipped.
 - If the owner wants the shipped behaviour as well, report both variants as separate result sets.
 
 ### Tuned `w32time` profile
 
-WARNING. These commands change the machine. Apply them only on a test machine or a throwaway VM, as administrator. Microsoft marks these registry values as ones not to change. Back up first.
+WARNING. This changes the machine. Test machine only. Microsoft marks these registry values as ones not to change. Source for each: [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings) (the registry reference tables). The values are the author's choice for tight sync. That they give better sync is UNVERIFIED. The study tests it.
 
-Source for every setting: [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings) (the registry reference tables). The values are the author's choice for tight sync. That they give better sync is UNVERIFIED. The study tests it.
+| Setting | Value | Documented meaning | Page default (stand-alone) |
+| --- | --- | --- | --- |
+| `NtpServer` flags | `,0x8` per peer | 0x8 is Client. 0x1 is SpecialInterval | `time.windows.com,0x1` |
+| `Config\MinPollInterval` | 6 (64 s) | Log base 2 seconds | 10 |
+| `Config\MaxPollInterval` | 6 (64 s) | Log base 2 seconds | 15 |
+| `Config\UpdateInterval` | 100 | Phase correction interval, 10 ms units, so 1 s | 360000 |
+| `Config\PhaseCorrectRate` | 1 | Smaller corrects phase faster, may be unstable | 7 |
+| `Config\FrequencyCorrectRate` | 2 | Smaller corrects faster, may overcorrect | 4 |
 
-| Setting | Value | Documented meaning | Page default (stand-alone) | Author's machine |
-| --- | --- | --- | --- | --- |
-| `NtpServer` flags | `,0x8` per peer | 0x8 is Client. 0x1 is SpecialInterval | `time.windows.com,0x1` | `1.au.pool.ntp.org,0x9` |
-| `Config\MinPollInterval` | 6 (64 s) | Log base 2 seconds | 10 | 10 |
-| `Config\MaxPollInterval` | 6 (64 s) | Log base 2 seconds | 15 | 15 |
-| `Config\UpdateInterval` | 100 | Phase correction interval in 10 ms units, so 1 s | 360000 | 360000 |
-| `Config\PhaseCorrectRate` | 1 | Smaller corrects phase faster, may be unstable | 7 | 1 |
-| `Config\FrequencyCorrectRate` | 2 | Smaller corrects faster, may overcorrect | 4 | 4 |
+Values on a real machine can differ from the page defaults. Read them first (`w32tm /dumpreg /subkey:Config`, no admin needed).
 
-The page default for `PhaseCorrectRate` (7) differs from the value on the author's machine (1). Read the real values first. They were read without admin.
-
-Record the "before" state. Absent values matter, because `reg import` does not remove a value that was absent before. This part is read only:
+Apply and undo with the guarded script. Apply saves the current values, and the ones that were absent, to a JSON file and refuses to overwrite it. Undo restores recorded values and removes those that were absent. `reg import` cannot do that, because it does not remove a value that was absent before.
 
 ```powershell
-$k  = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config'
-$kp = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters'
-$names = 'MinPollInterval', 'MaxPollInterval', 'UpdateInterval', 'PhaseCorrectRate', 'FrequencyCorrectRate'
-$before = @{}
-$p = Get-ItemProperty -Path $k
-foreach ($n in $names) { $before[$n] = if ($p.PSObject.Properties.Name -contains $n) { $p.$n } else { $null } }
-$beforeParams = Get-ItemProperty -Path $kp | Select-Object NtpServer, Type
-@{ Config = $before; Parameters = $beforeParams } | ConvertTo-Json | Set-Content .\out\w32time-before.json
 reg export HKLM\SYSTEM\CurrentControlSet\Services\W32Time .\out\w32time-before.reg /y
+$env:MEASURE_TEST_MACHINE = '1'
+.\scripts\apply-tuned-profile.ps1 -Peers <IP1>,<IP2>,<IP3> -BeforeFile .\out\w32time-before.json -WhatIf
+.\scripts\apply-tuned-profile.ps1 -Peers <IP1>,<IP2>,<IP3> -BeforeFile .\out\w32time-before.json
+.\scripts\apply-tuned-profile.ps1 -Undo -BeforeFile .\out\w32time-before.json
 ```
 
-A `null` in the JSON means the value was absent. Apply (administrator, test machine only):
-
-```powershell
-w32tm /config /manualpeerlist:"IP1,0x8 IP2,0x8 IP3,0x8" /syncfromflags:manual /update
-Set-ItemProperty -Path $k -Name MinPollInterval -Value 6 -Type DWord
-Set-ItemProperty -Path $k -Name MaxPollInterval -Value 6 -Type DWord
-Set-ItemProperty -Path $k -Name UpdateInterval -Value 100 -Type DWord
-Set-ItemProperty -Path $k -Name PhaseCorrectRate -Value 1 -Type DWord
-Set-ItemProperty -Path $k -Name FrequencyCorrectRate -Value 2 -Type DWord
-Restart-Service w32time
-```
-
-Undo (administrator). Restore recorded values, and remove those that were absent:
-
-```powershell
-foreach ($n in $names) {
-    if ($null -ne $before[$n]) { Set-ItemProperty -Path $k -Name $n -Value $before[$n] -Type DWord }
-    else { Remove-ItemProperty -Path $k -Name $n -ErrorAction SilentlyContinue }
-}
-Set-ItemProperty -Path $kp -Name NtpServer -Value $beforeParams.NtpServer
-Set-ItemProperty -Path $kp -Name Type -Value $beforeParams.Type
-Restart-Service w32time
-```
-
-Then compare `w32tm /dumpreg /subkey:Config` and `/subkey:Parameters` with the "before" dumps. The `/config` switches are from `w32tm /?` on this build. The registry value names are from the Microsoft page.
+After the undo, compare `w32tm /dumpreg /subkey:Config` and `/subkey:Parameters` with the "before" dumps.
 
 ### Meinberg NTP (optional)
 
-Install it only on the test machine. Its installer stops `w32time`, which is the reason for the test machine rule. Point it at the same IPs as the other contenders. Record its version and config file. Exact install and config steps are not given here because they were not checked. Report its settings in full.
+Install it only on the test machine. Its installer stops `w32time`. Point it at the same IPs as the other contenders. Record its version and config file. Exact install and config steps are not given here because they were not checked.
 
-## 4. Design: alternating blocks on one host
+## 5. Design: alternating blocks on one host
 
-Sequential multi-hour runs per contender cannot separate a contender effect from time of day and network load. The design below interleaves short blocks of every contender on ONE host.
+Sequential multi-hour runs per contender cannot separate a contender effect from time of day and network load. This design interleaves short blocks of every contender on one host.
 
-### Blocks and rounds
-
-- A block is 30 minutes of one contender in one case. A round is one block of every contender, in a balanced order. Each case has 4 rounds (proposal).
-- Each block is sampled against TWO references at the same time, by two sampler processes. Both write the same `round` and `block` labels and different CSV files.
-- The A/A control is two blocks of the same contender in the balanced order: `w32time-default` and `w32time-default-aa`. Their per-round difference is the noise floor.
-- `free-run` is a fixed extra block at the end of every round, VM only. It is a control, not part of the balanced order.
+- A block is 30 minutes of one contender in one case (45 minutes for sleep). A round is one block of every contender in a balanced order. Each case has 4 rounds (proposal).
+- Each block is sampled against TWO references at the same time, by two sampler processes. They write the same `round` and `block` labels to different CSV files.
+- The A/A control is two blocks of the same contender in the balanced order: `w32time-default` and `w32time-default-aa`.
+- `free-run` is a fixed extra block at the end of every round, VM only. It is a control and not part of the balanced order. This is a known imbalance. The first block of the next round follows a free-run block, so its wash-out must also clear that state. Report free-run results as a control only.
 
 ### Balanced order
 
-With four contenders A = `w32time-default`, B = `w32time-default-aa`, C = `w32time-tuned`, D = `service`, use a Williams design. Every contender takes each position once, and every contender follows every other exactly once, so first-order carry-over is balanced:
+With A = `w32time-default`, B = `w32time-default-aa`, C = `w32time-tuned`, D = `service`, use a Williams design. Each contender takes each position once and follows each other contender once, so first-order carry-over is balanced. Checked by listing the twelve ordered neighbour pairs.
 
 | Round | Slot 1 | Slot 2 | Slot 3 | Slot 4 |
 | --- | --- | --- | --- | --- |
@@ -186,25 +136,20 @@ With four contenders A = `w32time-default`, B = `w32time-default-aa`, C = `w32ti
 | 3 | C | D | B | A |
 | 4 | D | A | C | B |
 
-Checked by listing the twelve ordered neighbour pairs: each appears once. Four rounds are needed to use all rows. If Meinberg is added there are five contenders and no such square. Use a fixed random order per round with a recorded seed instead, and commit the resulting schedule file before round 1. The order is then known and auditable, and it was fixed before any data. `Get-Random -SetSeed` is not guaranteed to give the same sequence on Windows PowerShell and PowerShell 7, so record the resulting order itself, not only the seed.
+With Meinberg there are five contenders. Two options:
 
-Block label: `B1` to `B4` for the slot. Switch contenders by hand or by an administrator script. Record the switch time.
+- A seeded random order per round, recorded as a schedule file committed before round 1. NO balance claim is made for it. The order is fixed and auditable and nothing more. `Get-Random -SetSeed` may differ between Windows PowerShell and PowerShell 7, so record the resulting order and not only the seed.
+- A Williams design for an odd number of contenders needs twice as many rounds: 10 rounds of 5 blocks. A 30 minute case then takes 25 hours instead of 10. That is 15 extra hours per case.
+
+Block labels are `B1` to `B4` for the slot. Switch contenders by hand or with an administrator script, and record the switch time.
 
 ### Wash-out
 
-A wash-out is the part of a block that is dropped from the primary analysis because the contender is still settling. It must achieve two things for a disciplined clock:
+A wash-out is the part of a block dropped from the primary analysis because the contender is still settling. For a disciplined clock it must achieve two things: the previous contender's state is gone, and the new contender is inside its normal band with no trend.
 
-1. The previous contender's state is gone. The service sets a clock rate, and `w32time` has its own correction state.
-2. The new contender is inside its normal operating band, and the offset is not trending.
+Proposal: the first 10 minutes of each 30 minute block, applied by the summary with `-DropSeconds 600` to the `idle`, `load` and `vm` cases. The rows stay in the CSV. `-Part washout` prints them as an appendix. The event cases (`sleep`, `disturb2s`) and the `long` case keep every row. Recovery is measured on all rows.
 
-Proposal: the first 10 minutes of each 30 minute block (`-DropSeconds 600`). The rows stay in the CSV. The summary prints the dropped part as an appendix (`-Part washout`).
-
-Check it from the data, per contender:
-
-- Compare the median absolute offset of the dropped part with the primary part. A big gap shows the wash-out was needed.
-- Compare the first and the second half of the primary part. A difference above the A/A noise floor shows the wash-out was too short.
-- `w32time-default` polls slowly (1024 s on the author's machine). It may not converge inside one block. If the check fails for the default, report that finding. Do not lengthen the wash-out for the default only.
-- A failed check is not fixed after the fact. It goes in the report. A longer wash-out is a new plan version (section 8) and a new set of rounds.
+Check it from the data, per contender: compare the median of the dropped part with the primary part, and compare the first and second half of the primary part. A difference above the A/A noise floor means the wash-out was too short. `w32time-default` polls slowly and may not converge in one block. If the check fails, report that finding. Do not lengthen the wash-out for the default only. A longer wash-out is a new plan version and a new set of rounds.
 
 ### Machine time (author's estimate, not measured)
 
@@ -215,43 +160,46 @@ Check it from the data, per contender:
 | Disturbed clock (VM) | 4 | 30 min | 4 | 8 |
 | Sleep and resume | 4 | 45 min | 4 | 12 |
 | VM idle, with `free-run` | 5 | 30 min | 4 | 10 |
-| Long run, 24 h each for default, service and free-run | 3 | 24 h | 1 | 72 |
-| Switching overhead, about 10 minutes for each of 84 blocks | | | | 14 |
+| Long run, 24 h each for default, service, free-run | 3 | 24 h | 1 | 72 |
+| Switching and checks, about 10 minutes for each of 84 blocks | | | | 14 |
 | Total | | | | about 132 |
 
-That is about 5.5 days of machine time. The minimum useful set is idle, load, disturbed clock and the long run for default, service and free-run.
+That is about 5.5 days. The minimum useful set is idle, load, disturbed clock and the long run for default, service and free-run.
 
-## 5. Cases
+## 6. Cases and sample counts
 
-All cases run on the same host, sampled against both references. Each block records the contender, case, round and block.
+Case labels are fixed: `idle`, `load`, `vm`, `sleep`, `disturb2s`, `long`. The plan's five primary comparisons use the first five.
 
-| Case label | Block | Interval | Samples per block per reference | Primary samples after wash-out |
+The sampler `-Samples` for each case is in this table. The rule is `samples x period = awake block seconds`. Check it against the schedule file for every block before starting.
+
+| Case | Block | Period | `-Samples` | Derivation |
 | --- | --- | --- | --- | --- |
-| `idle` | 30 min | 10 s | 180 | 120 |
-| `load` | 30 min | 10 s | 180 | 120 |
-| `sleep` | 45 min, 3 cycles | 5 s | about 270 awake samples | all, events are analysed |
-| `vm` | 30 min | 10 s | 180 | 120 |
-| `disturb2s` | 30 min | see below | see below | events are analysed |
-| `long` | 24 h | 30 s | 2880 | all |
+| `idle` | 30 min | 10 s | 180 | 1800 s / 10 s |
+| `load` | 30 min | 10 s | 180 | 1800 s / 10 s |
+| `vm` | 30 min | 10 s | 180 | 1800 s / 10 s |
+| `sleep` | 45 min: 3 x (5 min awake + 10 min asleep) | 5 s | 180 | Awake time only: 3 x 300 s = 900 s, 900 s / 5 s. The process does not sample while the machine sleeps |
+| `disturb2s`, LAN reference | 30 min | 1 s | 1800 | 1800 s / 1 s |
+| `disturb2s`, public reference | 30 min | 8 s | 225 | 1800 s / 8 s |
+| `long` | 24 h | 30 s | 2880 | 86400 s / 30 s |
 
-The sampler's request count is `samples`. For a 30 minute block at 10 s, use `-Samples 180 -PeriodSeconds 10`.
+A sample count that is too high makes the sampler run into the next block under the old label. A count that is too low leaves the end of the block unsampled.
 
-Sample size, honestly: 4 rounds of 120 primary samples is 480 samples per contender per case. Samples from a disciplined clock are autocorrelated. The effective number of independent samples is far lower. A p99 from 480 autocorrelated samples rests on a handful of tail samples. Treat p99 as indicative. It is reported and it vetoes a win (section 8), but it carries less weight than the median.
+Sample size, honestly: 4 rounds of 120 primary samples is 480 per contender per case. Samples from a disciplined clock are autocorrelated, so the effective number of independent samples is far lower. A p99 from 480 autocorrelated samples rests on a handful of tail samples. Treat p99 as indicative.
 
 ### Idle
 
-Nothing else running. Sleep disabled. Record the sampler CSVs, the state files (section 9) and the service status output at the start, the middle and the end of each block.
+Nothing else running. Sleep disabled. Record the CSVs, the state files (section 9) and the service status output at the start, middle and end of each block.
 
 ### CPU load
 
-Load inflates local scheduling delay. The sampler's own timestamps and the delay column are measured on the loaded machine. The Task 1 load run with 28 of 120 failures may be partly this effect. So:
+Load inflates local scheduling delay, so the sampler's own timestamps and delay column are measured on a loaded machine. The spike's load run with 28 of 120 failures may be partly this effect. So:
 
-- The sampler sets its own priority, and its `w32tm` child's priority, to AboveNormal. It touches no other process. If that fails it prints a warning.
-- Leave at least one core free. The primary load level is all logical cores but one.
-- Report delay percentiles (median and p95) for the case. They are columns in the summary.
-- Before blaming a contender for a higher error rate under load, compare the error rate of the same reference with no load. The baseline contender's rise from idle to load is the host and sampler effect. A contender is blamed only for a rise above the baseline's rise by more than 2 percentage points (proposal).
+- The sampler raises its own process and its `w32tm` child to AboveNormal priority. It touches no other process. A failure to do so is a warning.
+- Leave at least one core free. The primary level is all logical cores but one.
+- The summary reports delay median and p95 per case.
+- Before blaming a contender for a higher error rate under load, compare with no load. The verdict function does this: it compares each contender's rise from idle to load with the default's rise. Only the excess above 2 percentage points counts (plan, section 4).
 
-Test machine guard: the generator refuses to start unless the test machine flag is set. The jobs end themselves 30 minutes after the block would end, as a safety margin. They are also stopped by hand at the end of the block.
+Test machine guard: the generator refuses to start unless the test machine flag is set. The jobs end themselves 30 minutes after the block would end, as a safety margin. Stop them by hand at the end of the block.
 
 ```powershell
 if ($env:MEASURE_TEST_MACHINE -ne '1') { throw 'Set MEASURE_TEST_MACHINE=1 on a test machine to run the load generator.' }
@@ -264,57 +212,75 @@ $jobs = 1..$n | ForEach-Object {
         while ($sw.Elapsed.TotalMinutes -lt $minutes) { [void][math]::Sqrt(12345.678) }
     } -ArgumentList ($blockMinutes + 30)
 }
-# check the load, read only
-Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 5 -MaxSamples 3
-# cleanup at the end of the block
-$jobs | Stop-Job
+Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 5 -MaxSamples 3   # read only
+$jobs | Stop-Job    # at the end of the block
 $jobs | Remove-Job
 ```
-
-Record the job count and the measured load. A half-load level (`ProcessorCount / 2` jobs) is exploratory.
 
 ### Sleep and resume
 
 - Sleep by hand from the Start menu. Do not script hibernation.
-- Per block: 3 cycles of 5 minutes awake and 10 minutes asleep.
+- Per block, 3 cycles of 5 minutes awake and 10 minutes asleep.
 - Start both samplers once per block. They continue after resume. A gap in `utc_iso` marks each sleep.
-- Recovery is computed by the summary: the first row after a gap longer than `-GapSeconds` (default 120) is the wake row. Recovery time is the time from that row to the first row that starts `-Consecutive` rows (default 3) all below `-LimitMs` (default 10 ms). An error row breaks a run. No hand-typed wake time is used.
+- The summary finds each wake: the first row after a gap longer than 120 s. Recovery time is from that row to the first row that starts 3 consecutive good rows below 10 ms. An error row breaks the run. No hand-typed wake time is used.
 
 ### Virtual machine
 
-- Hypervisor time sync must be off, or documented. The spec says VM detection is out of scope and asks for measurement on a VM with it off.
-- Hyper-V host: `Get-VMIntegrationService -VMName NAME` shows the state (the cmdlet exists on this machine). To switch it off: `Disable-VMIntegrationService -VMName NAME -Name 'Time Synchronization'` on the host as administrator. Not run here because this machine has no VM.
+- Hypervisor time sync must be off, or documented. The spec asks for measurement on a VM with it off.
+- Hyper-V host: `Get-VMIntegrationService -VMName NAME` shows the state (the cmdlet exists here). To switch it off, on the host as administrator: `Disable-VMIntegrationService -VMName NAME -Name 'Time Synchronization'`. Not run here because there was no VM.
 - Other hypervisors: look up the vendor setting. UNVERIFIED.
-- In the guest, if `w32tm /query /status` shows `Source: VM IC Time Synchronization Provider`, the hypervisor is still setting the clock. The run is invalid.
+- In the guest, `Source: VM IC Time Synchronization Provider` in `w32tm /query /status` means the hypervisor still sets the clock. The block is invalid.
 - The `free-run` block runs only here.
 
 ### Disturbed clock (throwaway VM only)
 
-This sets the clock wrong on purpose. Never do it on a machine that matters. A step changes timestamps, tickets and logs.
+This sets the clock wrong on purpose. A step changes timestamps, tickets and logs. Never on a machine that matters.
 
-1. Block of 30 minutes. The contender runs for 10 minutes (the wash-out).
-2. At minute 10, set the clock 2 s back as administrator:
+1. Block of 30 minutes. The contender runs 10 minutes first. Samples: see the table. Public servers may rate limit or send Kiss-of-Death to polls every second, and that shows as error rows. Use a LAN reference at 1 s, or a public one at 8 s with coarser recovery resolution. UNVERIFIED for any given server.
+2. At minute 10 disturb the clock by 2 s with the guarded script. Note the printed UTC time.
 
 ```powershell
-Set-Date -Adjust (New-TimeSpan -Seconds -2)
+$env:MEASURE_TEST_MACHINE = '1'
+.\scripts\disturb-clock.ps1 -Milliseconds -2000 -WhatIf
+.\scripts\disturb-clock.ps1 -Milliseconds -2000
 ```
 
-3. Watch for the other 20 minutes. The summary finds the step by itself: the first row whose offset exceeds `-StepMs` (default 100) after a row below the limit. Recovery time is measured from that row. Sample timestamps come from the clock under test, so a second step by the contender moves them by up to the step size. Read recovery times with that error in mind.
-4. A 2 s error is above the service step threshold of 128 ms (spec). `w32time` steps above its `MaxAllowedPhaseOffset` (the Microsoft page gives 1 s for stand-alone). Both should step. The test shows how fast and how clean.
-5. Interval: public servers may rate limit or send Kiss-of-Death to polls every second. That shows as error rows. Use a LAN reference at 1 s. With public references use 8 s or longer and accept the coarser recovery resolution. UNVERIFIED for any given server.
-6. A 50 ms disturbance (`-Milliseconds -50`) is exploratory. It tests slewing.
+3. Watch for the other 20 minutes. The summary finds the step by itself: the first good row above 100 ms after a good row at or below 10 ms. Error rows in between are skipped. Recovery is measured from that row. Sample timestamps come from the clock under test, so a second step by the contender moves them by up to the step size.
+4. A 2 s error is above the service step threshold of 128 ms (spec). `w32time` steps above its `MaxAllowedPhaseOffset` (the Microsoft page gives 1 s for stand-alone).
+5. A 50 ms disturbance is exploratory. It tests slewing.
+
+#### Reset after every disturbance block (mandatory)
+
+A contender that has not recovered in the 20 minutes would leave the clock about 2 s off for the next block. After EVERY disturbance block:
+
+1. Stop the contender, so it does not fight the reset.
+2. Step the clock back to the first reference. The script reads 5 samples (read only), takes the median offset, refuses a step above 10 s, and steps by it. A positive offset moves the clock forward.
+
+```powershell
+$env:MEASURE_TEST_MACHINE = '1'
+.\scripts\restore-clock.ps1 -Reference <REF_A_IP> -WhatIf
+.\scripts\restore-clock.ps1 -Reference <REF_A_IP>
+```
+
+3. Confirm the clock is synced again. This is read only. It needs 3 consecutive rounds with BOTH references below 10 ms, and gives up after 600 s.
+
+```powershell
+.\scripts\wait-synced.ps1 -ReferenceA <REF_A_IP> -ReferenceB <REF_B_IP>
+```
+
+Exit 0 means synced. Exit 3 means the start is not clean. The next block must then carry the suffix `-unclean` on its `-Block` label, for example `B2-unclean`. The summary flags it and excludes its round like a block whose references disagree. Start the next block only after exit 0, or after exit 3 with the label set.
 
 ### Long run
 
-24 hours, idle, at 30 s, one contender at a time, for `w32time-default`, `service` and `free-run`. Two samplers, one per reference. Reason: the day and night cycle of the path and the host. Only `free-run` gives a drift figure in ppm. For the other contenders the slope is a residual trend, reported as exploratory. The slope also includes any drift of the path to the reference. The summary reports `slope_vs_freerun_ppm` for each contender.
+24 hours, idle, 30 s, one contender at a time, for `w32time-default`, `service` and `free-run`. Two samplers, one per reference. Only `free-run` gives a drift figure in ppm. For the other contenders the slope is a residual trend and is exploratory. The slope also includes any drift of the path to the reference.
 
-## 6. The sampler and the summary
+## 7. The sampler and the summary
 
-Files: `scripts/measure-offset.ps1`, `scripts/summarise-offset.ps1`, `scripts/test-measure.ps1`.
+Files: `scripts/measure-offset.ps1`, `scripts/summarise-offset.ps1`, `scripts/wait-synced.ps1`, `scripts/offset-lib.ps1` (shared functions), the three guarded helpers above, and `scripts/test-measure.ps1`.
 
 ### Sampler
 
-Wraps `w32tm /stripchart /computer:<ref> /samples:N /period:S /dataonly /rdtsc`. The switches are in `w32tm /stripchart /?`. Read only. No admin. No state change. Run both samplers of a block at the same time:
+Wraps `w32tm /stripchart /computer:<ref> /samples:N /period:S /dataonly /rdtsc`. Read only. Run both samplers of a block at the same time:
 
 ```powershell
 $common = @('-NoProfile', '-File', '.\scripts\measure-offset.ps1', '-Contender', 'w32time-default', '-Case', 'idle',
@@ -330,153 +296,40 @@ $a, $b | Wait-Process
 | `-Contender`, `-Case` | Label, 1 to 64 characters of letters, digits, dot, underscore, hyphen |
 | `-Round` | 1 to 999 |
 | `-Block` | Empty, or a label as above |
-| `-Samples` | 1 to 1000000 |
+| `-Samples` | 1 to 1000000. See the table in section 6 |
 | `-PeriodSeconds` | 1 to 3600 |
 | `-OutPath` | Must not exist. Folder must exist |
-| `-Plain` | Plain format instead of `/rdtsc`. Timestamps then come from the receipt time and there is no delay column |
+| `-Plain` | Plain format instead of `/rdtsc`. No delay column. Timestamps are receipt times |
 
 Exit codes: 0 finished, 1 run failed or every sample failed, 2 bad input. Nothing is overwritten.
 
 CSV columns: `utc_iso, contender, case, reference, offset_s, delay_s, error, round, block`.
 
-- The timestamp is the `FileTime` that `w32tm` prints, as UTC. It is the local clock at the request. The clock under test therefore supplies the timestamp. A step shows as a jump.
-- A failed sample is a row with an error text and an empty offset. Examples: `w32tm error 0x800705B4` (timeout) and `w32tm error 0x80072733`. Errors count toward the error rate.
-- Never dropped: a line the parser does not understand after the first data row becomes an `unparsed line` row. A shortfall in rows becomes `missing sample` rows. If `w32tm` exits non-zero, the shortfall rows carry its message.
-- Unrecognised lines before the first data row are ignored and counted. The count is printed on stderr as `preamble_lines`. The parser knows the English preamble and fatal text only. On another language `w32tm` prints different text, so those lines are ignored and counted, and the first unrecognised lines are copied into the shortfall error text when no data arrives. This is a documented limitation. It is tested.
-- The parser accepts a decimal comma, a Unicode minus, a 12 hour time with PM, and the `s` suffix. The `d` suffix is read as days and flagged as an error row because its meaning is UNVERIFIED. No real `d` line has been seen.
-- The reference is resolved once per run by `w32tm`. Pass an IP. The resolved address is printed on stderr.
-- Priority: the sampler raises its own process and its `w32tm` child to AboveNormal. No other process is touched.
+- The timestamp is the `FileTime` that `w32tm` prints, as UTC. It is the local clock at the request. The clock under test supplies it, so a step shows as a jump.
+- A failed sample is a row with an error text and an empty offset, for example `w32tm error 0x800705B4` (timeout). Errors count toward the error rate.
+- Never dropped: after the first data row, an unrecognised line becomes an `unparsed line` row. A shortfall in rows becomes `missing sample` rows. If `w32tm` exits non-zero the shortfall rows carry its message.
+- Unrecognised lines before the first data row are ignored and counted. The count is printed on stderr as `preamble_lines`. The parser knows the English preamble and fatal text only. On another language those lines are ignored and counted, and the first ones are copied into the shortfall error text when no data arrives. This limitation is documented and tested.
+- The parser accepts a decimal comma, a Unicode minus, a 12 hour time with PM, and the `s` suffix. The `d` suffix is read as days and flagged as an error row because its meaning is UNVERIFIED.
+- The reference is resolved once per run by `w32tm`. Pass an IP.
 - A crash leaves the rows written so far, flushed one by one.
 
 ### Summary
 
 ```powershell
 .\scripts\summarise-offset.ps1 .\out\*.csv -DropSeconds 600 -Primary <REF_A_IP>
-.\scripts\summarise-offset.ps1 .\out\*.csv -DropSeconds 600 -Part washout   # the appendix
+.\scripts\summarise-offset.ps1 .\out\*.csv -DropSeconds 600 -Part washout
+.\scripts\summarise-offset.ps1 .\out\*.csv -DropSeconds 600 -Primary <REF_A_IP> -IncludeFlagged
 ```
 
-Tables:
-
-1. Blocks: one row per contender, case, reference, round and block. Samples, dropped, errors, error rate, median, p5, p95, p99, mean, max of the absolute offset in ms, delay median and p95 in ms, and the least squares slope in ppm WITHIN the block. The slope is never computed across rounds.
-2. Pooled: one row per contender, case and reference. All rounds pooled. The range of per-round medians. The slope median over blocks and its difference from the free-run slope.
-3. Comparison: per case, each contender against `-Baseline` (default `w32time-default`) on the primary reference. Pooled difference of medians and p99, per-round differences, same-sign count, threshold, A/A noise floor, verdict `better`, `worse` or `no meaningful difference`.
-4. Agreement: per block sampled against two references. Signed median difference and `DISAGREE` above `-AgreeMs` (default 2).
-5. Recovery: per event, and per contender (median, worst, not recovered count).
-
-Statistics: the median is the interpolated median (the mean of the two middle values for an even count). Nearest rank would bias it low. p5, p95 and p99 use nearest rank. A CSV without a `round` column is read as round 0 with a warning, and per-round figures are then not meaningful.
+It prints, in order: the flagged blocks and the excluded rounds, the five PRIMARY verdict lines, and then the exploratory tables (blocks, pooled, comparison, agreement, recovery). The meaning of each is in the plan. Slope is not printed for event cases, because a per-block slope there is dominated by the disturbance. Medians are interpolated. p5, p95 and p99 use nearest rank. A CSV without a `round` column is read as round 0 with a warning.
 
 ### Tests
 
-`powershell -NoProfile -File scripts\test-measure.ps1` runs checks with no network. It covers the parser (21 canned lines), the CSV rows, validation, refusal to overwrite, exit codes, `Invoke-Measure` against a stand-in for `w32tm` (good, shortfall, fatal, a German preamble, garbage after data), and every summary statistic against hand-computed values. This includes the two-flat-rounds case that must give 0 ppm per round. Pester 3.4.0 is the only version installed here, so plain checks are used. It passes on Windows PowerShell 5.1 and PowerShell 7.
+`powershell -NoProfile -File scripts\test-measure.ps1` runs with no network. It covers the parser, the CSV rows, validation, `Invoke-Measure` against a stand-in for `w32tm`, every summary statistic against hand-computed values, the verdict rules, the exclusion of flagged blocks, recovery with unrecovered events, `wait-synced.ps1`, the restore arithmetic, and that each dangerous helper refuses without `MEASURE_TEST_MACHINE`. Pester 3.4.0 is the only version installed here, so plain checks are used.
 
-## 7. Comparison table and the report
+## 8. Reporting
 
-### Table format
-
-One row per case and contender, from Pooled and Comparison. Rounding: milliseconds to 2 decimals below 10 and 1 decimal from 10. Percentages to 1 decimal. ppm to 1 decimal. Recovery to whole seconds.
-
-| Case | Contender | Good samples | Error rate | Median abs ms | p99 abs ms | Max abs ms | Median delay ms | p95 delay ms | Round medians, range | Verdict vs default |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Idle | w32time-default | N | N.N % | N.NN | N.NN | N.NN | N.NN | N.NN | N.NN to N.NN | baseline |
-| Idle | service | N | N.N % | N.NN | N.NN | N.NN | N.NN | N.NN | N.NN to N.NN | EXAMPLE |
-
-EXAMPLE, NOT A RESULT. The values above are placeholders.
-
-Further tables: recovery per contender (median, worst, not recovered), the A/A noise floor per case, the agreement table, the free-run slope and the slope difference, and the wash-out appendix.
-
-Every row links to its CSV files. The report folder holds the CSVs, the schedule file, the reference IPs and their probe results, the Windows build, the service commit and config, and the `w32time` dumps.
-
-### One paragraph
-
-> On HOST (Windows BUILD), against references A and B (median delay D ms, so path bias is at most D/2 ms), over R rounds of 30 minute blocks, the service had a median absolute offset of X ms and the Windows default had Y ms in the idle case (difference Z ms, A/A noise floor F ms). Under load the figures were X2 and Y2. After a 2 s step the service recovered in S s and the Windows default in T s. The service lost in CASE by W. Error rates were E1 and E2. The free-run clock drifted at P ppm. Tuned `w32time` had X3.
-
-EXAMPLE ONLY. The letters stand for numbers that do not exist yet.
-
-### When the service loses
-
-It must be reported, with numbers, in the same table and the same paragraph.
-
-- Name the case, the contender it lost to and the size of the loss. Give median, p99 and error rate.
-- Do not average a loss away across cases.
-- State what was checked: run validity, reference agreement, the A/A noise floor, the wash-out check.
-- Give candidate causes as hypotheses and label them unverified. Do not change the service and re-run to remove the loss. Section 8 says how a change is handled.
-- A loss against `w32time-default` and a loss against `w32time-tuned` are separate findings.
-
-## 8. Pre-registered analysis plan
-
-This section is written before any result exists. The owner confirms the numbers and freezes them.
-
-### Freeze step
-
-1. The owner confirms or edits every proposal in this document.
-2. Commit this file, the scripts, the schedule file (order and seed) and the service commit id.
-3. Tag that commit before round 1: `git tag -a measuring-plan-v1 -m "measuring plan v1, frozen before round 1"`.
-4. After that, any change is a new version (`measuring-plan-v2`). The report lists every version, what changed, the date and why. Data collected under an earlier version is reported under that version. It is not mixed in.
-5. Freeze the service version and config before round 1. Tune `w32time-tuned` once, before round 1. The profile in section 3 is the whole profile.
-6. No tuning of the service after seeing results and re-using the same data. A tuned service is a new version and a full new set of rounds. Report both.
-
-### Primary comparisons
-
-There are exactly five primary comparisons. Each is the service against `w32time-default`, on the primary reference, pooled over the 4 rounds.
-
-| ID | Case | Primary metric |
-| --- | --- | --- |
-| P1 | `idle` | Median absolute offset |
-| P2 | `load` | Median absolute offset |
-| P3 | `vm` | Median absolute offset |
-| P4 | `sleep` | Median recovery time after a wake |
-| P5 | `disturb2s` | Median recovery time after the step |
-
-Everything else is exploratory: p99, the tuned and Meinberg comparisons, drift and slope, the 50 ms disturbance, the half-load level, the long run. Exploratory results are reported and labelled as such. No p-value is computed and none is hunted. With 4 rounds, four of four rounds having the same sign has a chance of 12.5 percent under no difference. That is why the threshold and the A/A conditions below also apply. It is not a significance test.
-
-### Minimum difference that matters (proposal, author's call)
-
-A difference in a median offset is meaningful only when all of these hold:
-
-1. It is at least `max(1 ms, 20 percent of the default's pooled median)`. Reason: the spike median was 4.9 ms idle, so 20 percent is about 1 ms. Below 1 ms the path bias bound (half the delay) is of the same order.
-2. It is larger than the A/A noise floor of that case. That is the largest per-round gap between `w32time-default` and `w32time-default-aa`.
-3. It has the same sign in all 4 rounds. If one round is lost, in all remaining rounds, and at least 3.
-
-For a recovery time the difference is meaningful when it is at least 20 percent and at least two sampling periods.
-
-Anything smaller is "no meaningful difference". It is neither a win nor a loss.
-
-### Definitions
-
-- A win in a case: the primary metric is `better` (above), AND the p99 is not worse than the default by the same threshold rule applied to p99, AND the error rate is not more than 2 percentage points above the default's. If the first holds and one of the others fails the case is "mixed". It is reported and is not a win.
-- A loss in a case: the primary metric is `worse`.
-- "Repeated": all 4 rounds. For P4, all wake events of all 4 rounds (12 per contender). For P5, the 4 steps.
-- "Two or more cases": two or more of P1 to P5.
-- The claim "beats the Windows default" needs wins in all five primary comparisons and no loss. Fewer wins limit the claim to the cases won, stated by name. This is the spec's success definition applied literally.
-
-### What would make the owner conclude the project is NOT worth shipping (proposal)
-
-Any one of these:
-
-1. Against `w32time-tuned` the service is not `better` in the idle median (P1 case) and not `better` in the load median (P2 case). Then accuracy is not a reason to ship. Other reasons (safety, readable code, a status log) have to carry the project alone.
-2. In the VM case the service's median is not lower than `free-run` by the threshold (run the summary with `-Baseline free-run`). The service is then not improving on no sync.
-3. The service has a loss in two or more of P1 to P5.
-4. The service error rate is more than 2 percentage points above the default's in any case, after the load rule in section 5.
-5. In P4 or P5 the service's median recovery is more than twice the default's and more than two sampling periods slower.
-6. More than one of the 4 blocks flagged `DISAGREE` in three or more cases. No claim can be made then.
-
-The owner decides. This list only fixes the question before the answer exists.
-
-### Proposal numbers to confirm
-
-| Item | Proposal |
-| --- | --- |
-| Block length, interval, wash-out | 30 min, 10 s, 10 min |
-| Rounds, balanced order | 4, Williams design |
-| Reference limits | stratum 1 or 2, delay 20 ms, spread 2 ms |
-| Reference agreement per block | 2 ms |
-| Minimum meaningful difference | max(1 ms, 20 percent) and above the A/A noise floor |
-| Sign rule | same sign in all rounds, at least 3 |
-| Recovery limit | 10 ms for 3 consecutive rows |
-| Error rate that matters | 2 percentage points |
-| Step threshold for event detection | 100 ms |
-| Gap for a wake event | 120 s |
-| Load level | all cores but one |
+The report format, the table and the rules for reporting losses are in the plan, sections 6 and 7.
 
 ## 9. Checklist for the person running it
 
@@ -484,28 +337,26 @@ Machine and system:
 
 - [ ] Throwaway VM or a test machine for everything that stops `w32time`, installs a service or sets the clock.
 - [ ] Not domain-joined. Group Policy may restart `w32time` and change its settings.
-- [ ] Windows build: `(Get-CimInstance Win32_OperatingSystem).Version`.
-- [ ] CPU, core count, RAM, and whether it is a VM.
-- [ ] Power plan fixed: `powercfg /getactivescheme`. Same plan for every run. No sleep or hibernate during blocks that should not sleep. Time zone is irrelevant because everything is UTC.
+- [ ] Windows build: `(Get-CimInstance Win32_OperatingSystem).Version`. CPU, cores, RAM, VM or not.
+- [ ] Power plan fixed: `powercfg /getactivescheme`. Same for every run. No sleep or hibernate in blocks that should not sleep. Time zone is irrelevant because everything is UTC.
 - [ ] Antivirus and updates: no scan or Windows Update during a block. Record the policy.
 - [ ] No other time tool installed. No VPN that moves the route during a block.
 
 Network:
 
-- [ ] Wired if possible. No Wi-Fi roaming.
-- [ ] No large transfers on the link during blocks.
+- [ ] Wired if possible. No Wi-Fi roaming. No large transfers during blocks.
 - [ ] UDP 123 outbound open. The sampler uses an ephemeral source port. `w32time` uses 123 (Microsoft page).
-- [ ] Both reference IPs, their probe results (section 2) and their operator facts (anycast, smearing, rate limits) are recorded.
+- [ ] Both reference IPs, probe results and operator facts (anycast, smearing, rate limits) recorded.
 
 VM:
 
-- [ ] Hypervisor time sync off, or documented. `w32tm /query /status` `Source` is not the VM provider.
+- [ ] Hypervisor time sync off, or documented. `Source` in `w32tm /query /status` is not the VM provider.
 - [ ] Host load and hypervisor version recorded.
 
 Software under test:
 
 - [ ] Service version: git commit, config file, build type, how it was installed.
-- [ ] At the start of every block, save the state. All of these ran without admin on the author's machine:
+- [ ] At the start of every block, save the state. All of these run without admin:
 
 ```powershell
 w32tm /query /status   | Out-File .\out\r1-B1-state.txt
@@ -514,21 +365,23 @@ w32tm /dumpreg /subkey:Config     | Out-File .\out\r1-B1-state.txt -Append
 w32tm /dumpreg /subkey:Parameters | Out-File .\out\r1-B1-state.txt -Append
 ```
 
-- [ ] The `w32time` registry before and after each tuned change (section 3). `w32tm /query /configuration` needs admin (observed Access denied unelevated).
-- [ ] The service's own view of its offset and its source list, copied at the start, middle and end of each block. The design leaves the status command and log format open (spec: "Log format and status command design"). Record whatever it prints with the time. Compare its offset with the external reference columns. They should be close.
-- [ ] Wash-out recorded, and the wash-out check run (section 4).
+- [ ] `w32tm /query /configuration` needs admin (Access denied unelevated).
+- [ ] The service's own view of its offset and source list, copied at the start, middle and end of each block. The design leaves the status command and log format open (spec). Record whatever it prints with the time and compare its offset with the external reference columns.
+- [ ] Wash-out recorded and checked (section 5).
 - [ ] The service log shows no panic, no refused step and no `w32time` conflict during the block. A conflict makes the block invalid.
+- [ ] `-Samples` matches the table in section 6 for every block.
 
 During a block:
 
-- [ ] Both samplers started from an unelevated prompt, new output paths.
-- [ ] Event times (load start, sleep, wake, step) noted in UTC in a text file: `(Get-Date).ToUniversalTime().ToString('o')`.
+- [ ] Both samplers started from an unelevated prompt with new output paths.
+- [ ] Event times (load start, sleep, wake, step) noted in UTC: `(Get-Date).ToUniversalTime().ToString('o')`.
 - [ ] Do not use the machine for anything else.
-- [ ] After the block: run the summary, check the error rate and the agreement flag, keep the CSVs.
+- [ ] After the block, run the summary, check the error rate and the flagged blocks, keep the CSVs.
+- [ ] After a disturbance block, do the reset in section 6 before the next block.
 
-Invalid block (exclude and say so in the report, never because it is an outlier):
+Invalid block (exclude, say so in the report, never because it is an outlier):
 
-- A reference changed address or went down for more than 5 percent of samples.
+- A reference changed address or was down for more than 5 percent of samples.
 - Another time tool or Group Policy changed the clock.
 - The machine slept when it should not have.
 - A hypervisor set the clock.
@@ -536,17 +389,9 @@ Invalid block (exclude and say so in the report, never because it is an outlier)
 
 ## Sources and unverified items
 
-- `w32tm /?` and `w32tm /stripchart /?` on Windows 11 build 26300: `/stripchart`, `/rdtsc`, `/packetinfo`, `/config`, `/dumpreg`, `/query`, `/monitor`.
-- [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings): `/stripchart` and `/rdtsc` columns, the registry settings and defaults, the 0x1 and 0x8 `NtpServer` flags, UDP 123.
-- Observed by running read-only commands on the author's machine: the `/rdtsc` row format, the `error: 0x800705B4` timeout form, the plain `HH:MM:SS, error: 0x...` form, the `/packetinfo` and `/monitor` output, `w32tm /dumpreg`, `/query /status`, `/query /peers` and `reg export` without admin, `w32tm /query /configuration` denied without admin.
-- Offset sign: verified by the reviewer with a raw NTP exchange.
+- `w32tm /?` on Windows 11: `/stripchart`, `/rdtsc`, `/packetinfo`, `/config`, `/dumpreg`, `/query`, `/monitor`, checked by running them.
+- [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings): `/stripchart` and `/rdtsc` columns, the registry settings and defaults, the `NtpServer` flags, UDP 123.
+- Observed by running read-only commands: the `/rdtsc` row format, the `error: 0x800705B4` timeout form, the plain `HH:MM:SS, error: 0x...` form, the `/packetinfo` and `/monitor` output, `w32tm /dumpreg`, `/query /status`, `/query /peers` and `reg export` without admin, `/query /configuration` denied without admin.
+- Offset sign: verified independently with a raw NTP exchange.
 
-Unverified:
-
-- That the tuned profile improves sync. The study tests it.
-- The meaning of a `d` suffix in stripchart output.
-- Meinberg install and config steps, and hypervisor settings other than Hyper-V (the cmdlet exists, it was not run).
-- That the half-delay bound applies as stated to `w32tm` offsets. It is the NTP design bound.
-- Leap second smearing and rate limits for any given server.
-- That `w32time-default` can converge inside a 30 minute block.
-- All proposal numbers, listed at the end of section 8.
+Unverified: that the tuned profile improves sync, the meaning of a `d` suffix, Meinberg steps, hypervisor settings other than Hyper-V, that the half-delay bound applies as stated to `w32tm` offsets, leap second smearing and rate limits for any given server, that `w32time-default` can converge inside a 30 minute block.
