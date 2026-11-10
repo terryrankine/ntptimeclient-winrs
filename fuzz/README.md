@@ -1,7 +1,11 @@
 # Fuzz targets
 
-This directory holds `cargo-fuzz` targets. Later tasks add them under
-`fuzz/fuzz_targets/`, starting with `parse_response`.
+This directory holds `cargo-fuzz` targets under `fuzz/fuzz_targets/`. It is
+its own Cargo workspace, so the root workspace never builds it.
+
+| Target | What it feeds |
+|---|---|
+| `parse_response` | arbitrary bytes to the NTP reply parser, raw and with our origin spliced in |
 
 Run one target with the nightly toolchain:
 
