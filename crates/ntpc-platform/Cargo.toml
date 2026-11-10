@@ -10,6 +10,22 @@ publish.workspace = true
 [dependencies]
 ntpc-core.workspace = true
 
+# Microsoft's raw Win32 bindings (MIT OR Apache-2.0). It adds only
+# `windows-link`. Hand-written declarations for the ACL and token structs
+# would be easy to get wrong. Windows only, so the crate still builds on the
+# Linux fuzz job.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+] }
+
 # Cargo cannot combine `workspace = true` with overrides in one crate.
 # So this table repeats the workspace lints and changes only `unsafe_code`.
 # `deny` (not `forbid`) lets the `win32` module opt in. See src/lib.rs.

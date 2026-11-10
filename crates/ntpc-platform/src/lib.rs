@@ -2,12 +2,16 @@
 
 /// Raw Win32 calls. This is the only module allowed to use `unsafe`.
 /// Every `unsafe` block needs a `// SAFETY:` comment.
+/// Windows only, so the crate still builds where the fuzz job runs.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 pub mod win32;
 
 pub mod clock;
 
-pub use clock::{MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise};
+#[cfg(windows)]
+pub use clock::WindowsClock;
+pub use clock::{AdjustmentState, MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise};
 
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";

@@ -10,7 +10,7 @@
 ## Dependency rule
 
 - `ntpc-core` depends on `thiserror` only.
-- `ntpc-platform` depends on `ntpc-core`.
+- `ntpc-platform` depends on `ntpc-core`, and on Windows on `windows-sys` (which brings only `windows-link`).
 - `ntpc-service` depends on `ntpc-core` and `ntpc-platform`.
 
 `scripts/check-deps.ps1` fails if `ntpc-core` gains any other dependency. CI also builds and tests `ntpc-core` alone on Linux. That proves it has no OS dependency.
