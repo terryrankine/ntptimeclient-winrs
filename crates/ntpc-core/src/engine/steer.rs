@@ -198,6 +198,29 @@ mod tests {
         assert!((old - 0.495).abs() < 1e-12, "{old}");
     }
 
+    #[test]
+    fn clock_failure_keeps_the_last_slew() {
+        // Ruling R52: after a failed command the OS keeps its last rate,
+        // so the clock goes on slewing and stored readings still move.
+        let mut e = engine();
+        e.change_frequency(Ppm::new(120.0));
+        let s = sample(0.5, at(0));
+        e.now = at(50);
+        let _ = e.handle(Event::ClockResult(Err(crate::ClockError::Unavailable)));
+        assert!(!e.status().adjustment_allowed);
+        assert!((e.steer.ppm() - 100.0).abs() < 1e-12);
+        e.now = at(100);
+        // 100 ppm for 100 s, the failure did not stop it.
+        let c = e.corrected(s).offset.as_secs();
+        assert!((c - 0.490).abs() < 1e-12, "{c}");
+        // The re-arm sets the learned drift, so the slew is zero again. A
+        // host close records zero (`no_correction_while_the_gate_is_closed`).
+        let _ = e.handle(Event::AdjustmentAllowed(false));
+        let _ = e.handle(Event::AdjustmentAllowed(true));
+        assert!(e.status().adjustment_allowed);
+        assert!(e.steer.ppm().abs() < 1e-12);
+    }
+
     /// 100 ppm for 10 000 s (1 s of phase), then no slew, re-marked every
     /// 2000 s so the early marks are pruned.
     fn long_history() -> Steer {
