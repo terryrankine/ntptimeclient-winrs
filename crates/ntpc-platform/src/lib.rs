@@ -9,6 +9,12 @@ pub mod win32;
 
 pub mod clock;
 
+/// State directory security. Windows only.
+#[cfg(windows)]
+pub mod acl;
+
+#[cfg(windows)]
+pub use acl::{AclError, secure_state_dir};
 #[cfg(windows)]
 pub use clock::WindowsClock;
 pub use clock::{AdjustmentState, MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise};
