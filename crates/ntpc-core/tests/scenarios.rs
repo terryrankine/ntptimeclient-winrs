@@ -433,9 +433,8 @@ fn adjustment_disabled_by_w32time_then_reenabled_does_not_jump() {
     // The sim's w32time runs the clock at nominal for 4 hours. At 20 ppm
     // that is 288 ms behind, above the step threshold.
     w.schedule(6 * HOUR, SimEvent::W32TimeStarted);
-    // One second after the segment ends, so the re-enable falls in `back`.
-    // An event at a run's last instant belongs to that run.
-    w.schedule(10 * HOUR + 1, SimEvent::W32TimeStopped);
+    // Runs are half open, so the re-enable at 10 h falls in `back`.
+    w.schedule(10 * HOUR, SimEvent::W32TimeStopped);
     let off = w.run(&mut e, 4 * HOUR);
     within(
         "|off.final_error + 0.288|",

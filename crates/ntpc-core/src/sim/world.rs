@@ -218,9 +218,11 @@ impl SimWorld {
         }
     }
 
-    /// Schedules an event at `at_secs` of virtual time. Events at the same
-    /// time happen in the order scheduled. A time already past happens at
-    /// the start of the next run.
+    /// Schedules an event at `at_secs` of virtual time. The time is
+    /// absolute, counted from the start of the world, while
+    /// [`SimWorld::run`] takes a length. Events at the same time happen in
+    /// the order scheduled. A time already past happens at the start of the
+    /// next run.
     pub fn schedule(&mut self, at_secs: u64, ev: SimEvent) {
         let at = later(Mono::from_nanos(0), Duration::from_secs(at_secs));
         self.seq += 1;
@@ -228,11 +230,14 @@ impl SimWorld {
     }
 
     /// Runs the world for `secs` more seconds of virtual time and reports
-    /// on that stretch. The first run turns adjustment on and lists the
+    /// on that stretch. The stretch is half open: an event or wake at its
+    /// last instant belongs to the next run, so an event scheduled at a
+    /// segment boundary shows in the segment that starts there. The first run turns adjustment on and lists the
     /// servers, as a host does at start.
     ///
     /// # Panics
-    /// If a [`SimEvent::SourcesChanged`] names an unknown server.
+    /// If a [`SimEvent::SourcesChanged`] or [`SimEvent::SetFault`] names an
+    /// unknown server.
     pub fn run(&mut self, engine: &mut Engine, secs: u64) -> SimReport {
         let end = later(self.now, Duration::from_secs(secs));
         self.report = SimReport::default();
@@ -256,7 +261,7 @@ impl SimWorld {
             else {
                 break;
             };
-            if t > end {
+            if t >= end {
                 break;
             }
             self.advance(t);
@@ -430,8 +435,12 @@ impl SimWorld {
             self.push(timeout, Reply::Failed(id, QueryFailure::Timeout));
             return;
         }
-        let out = f64::midpoint(spec.delay, spec.asymmetry) + spec.jitter * self.rng.unit();
+        let mut out = f64::midpoint(spec.delay, spec.asymmetry) + spec.jitter * self.rng.unit();
         let back = (spec.delay - spec.asymmetry) / 2.0 + spec.jitter * self.rng.unit();
+        // Drawn only for a spiky server, so other runs keep their noise.
+        if spec.spike_rate > 0.0 && self.rng.unit() < spec.spike_rate {
+            out += spec.spike;
+        }
         let (out, back) = (out.max(0.0), back.max(0.0));
         let at = later_secs(self.now, out + back);
         let sent_err = self.clock.err;
@@ -545,6 +554,14 @@ impl SimWorld {
                 self.feed(engine, Event::AdjustmentAllowed(true));
             }
             SimEvent::SetDrift(p) => self.clock.need = p.value(),
+            SimEvent::SetFault(label, fault) => {
+                let s = self
+                    .servers
+                    .iter_mut()
+                    .find(|s| s.label == label)
+                    .unwrap_or_else(|| panic!("unknown server {label}"));
+                s.spec.fault = fault;
+            }
             SimEvent::ClockFails(yes) => self.clock.broken = yes,
             SimEvent::HostRearm => {
                 self.host.latched = false;
@@ -628,6 +645,33 @@ mod tests {
         // Anything still pending is due within the timeout.
         let limit = later(w.now(), QUERY_TIMEOUT);
         assert!(w.pending.iter().all(|p| p.at <= limit));
+    }
+
+    #[test]
+    fn spike_on_every_reply_reads_as_half_the_spike() {
+        // Every reply spikes, so the path is simply slow and the engine
+        // follows it. That shows a spike adds to the outbound leg only.
+        let mut w = SimWorld::new(5, 0.0);
+        let spec = ServerSpec {
+            spike_rate: 1.0,
+            spike: 0.2,
+            jitter: 0.0,
+            ..ServerSpec::default()
+        };
+        w.add_server("s", spec);
+        let mut e = Engine::new(EngineConfig::default(), None);
+        let _ = w.run(&mut e, 200);
+        let o = e.status().last_offset.expect("fed").as_secs();
+        assert!((o - 0.1).abs() < 0.005, "{o}");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown server")]
+    fn set_fault_on_unknown_label_panics() {
+        let mut w = SimWorld::new(1, 0.0);
+        w.schedule(0, SimEvent::SetFault("nope".into(), Fault::None));
+        let mut e = Engine::new(EngineConfig::default(), None);
+        let _ = w.run(&mut e, 10);
     }
 
     #[test]

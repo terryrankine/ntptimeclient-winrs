@@ -14,7 +14,8 @@
 //! - The local clock has a true drift. Each applied frequency is rounded to
 //!   a whole number of `tick_granularity_ppm`, as Windows applies it.
 //! - Each path leg takes half the base delay, plus or minus half the
-//!   asymmetry, plus queuing drawn uniformly from `[0, jitter]`.
+//!   asymmetry, plus queuing drawn uniformly from `[0, jitter]`. A rare
+//!   spike adds queuing to the outbound leg only.
 //! - Monotonic time runs at the true rate and stands still in sleep.
 //! - A started `w32time` takes the clock and runs it at the nominal rate.
 //!   Its own discipline is not modelled.
@@ -47,6 +48,11 @@ pub struct ServerSpec {
     pub asymmetry: f64,
     /// Chance that a query gets no reply, from 0 to 1.
     pub loss_rate: f64,
+    /// Chance that a reply's outbound leg queues for `spike` more. A rare
+    /// one-sided spike reads as an offset error of `spike / 2`.
+    pub spike_rate: f64,
+    /// Extra outbound queuing of a spike.
+    pub spike: f64,
     /// A fault the server shows on every query.
     pub fault: Fault,
 }
@@ -61,6 +67,8 @@ impl Default for ServerSpec {
             jitter: 0.002,
             asymmetry: 0.0,
             loss_rate: 0.0,
+            spike_rate: 0.0,
+            spike: 0.0,
             fault: Fault::None,
         }
     }
@@ -104,6 +112,8 @@ pub enum SimEvent {
     W32TimeStopped,
     /// The clock's true drift changes, as on a machine that warms up.
     SetDrift(Ppm),
+    /// The server with this label shows this fault from now on.
+    SetFault(String, Fault),
     /// While true, every clock command fails. The host stops the rest of
     /// that batch's clock actions.
     ClockFails(bool),
