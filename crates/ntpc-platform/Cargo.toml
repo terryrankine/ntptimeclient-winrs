@@ -22,7 +22,11 @@ thiserror.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_Dhcp",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_NetManagement",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
@@ -32,6 +36,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Time",
     "Win32_System_WindowsProgramming",
 ] }
+
+# Tests only: `DeviceIoControl` to turn a test directory into a junction.
+# Same crate, one more feature, so no new dependency.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_IO"] }
 
 # Cargo cannot combine `workspace = true` with overrides in one crate.
 # So this table repeats the workspace lints and changes only `unsafe_code`.
