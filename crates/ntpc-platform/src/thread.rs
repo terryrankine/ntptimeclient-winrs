@@ -18,8 +18,6 @@ pub enum Priority {
     Normal,
     /// `THREAD_PRIORITY_ABOVE_NORMAL`, what the query workers use.
     AboveNormal,
-    /// `THREAD_PRIORITY_HIGHEST`.
-    Highest,
 }
 
 impl Priority {
@@ -29,7 +27,6 @@ impl Priority {
         match self {
             Self::Normal => 0,
             Self::AboveNormal => 1,
-            Self::Highest => 2,
         }
     }
 
@@ -39,7 +36,6 @@ impl Priority {
         match raw {
             0 => Some(Self::Normal),
             1 => Some(Self::AboveNormal),
-            2 => Some(Self::Highest),
             _ => None,
         }
     }
@@ -115,11 +111,10 @@ mod tests {
     fn levels_match_learn_and_round_trip() {
         assert_eq!(Priority::Normal.to_raw(), 0);
         assert_eq!(Priority::AboveNormal.to_raw(), 1);
-        assert_eq!(Priority::Highest.to_raw(), 2);
-        for p in [Priority::Normal, Priority::AboveNormal, Priority::Highest] {
+        for p in [Priority::Normal, Priority::AboveNormal] {
             assert_eq!(Priority::from_raw(p.to_raw()), Some(p));
         }
-        for raw in [-15, -2, -1, 3, 15, i32::MAX, i32::MIN] {
+        for raw in [-15, -2, -1, 2, 3, 15, i32::MAX, i32::MIN] {
             assert_eq!(Priority::from_raw(raw), None, "{raw}");
         }
     }

@@ -22,10 +22,10 @@
 //! once per loop turn. The address watcher thread wakes it itself. For
 //! resume, the service control handler (14c-B) calls
 //! [`ResumeNotifier::notify_resumed`] from [`WindowsDeps::resume`] on
-//! `SERVICE_CONTROL_POWEREVENT` with `PBT_APMRESUMEAUTOMATIC` (and
-//! `PBT_APMRESUMESUSPEND`, which may follow it). That sets the flag the
-//! host reads and wakes the loop. A second notify before the loop runs
-//! gives one resume, which is what the engine wants.
+//! `SERVICE_CONTROL_POWEREVENT` with BOTH `PBT_APMRESUMEAUTOMATIC` and
+//! `PBT_APMRESUMESUSPEND`. That sets the flag the host reads and wakes the
+//! loop. Notifications within [`RESUME_DEBOUNCE`] (5 s) count as one
+//! resume (R107).
 
 // Windows only. Declared here so `lib.rs` keeps one plain `mod` line.
 #![cfg(windows)]
@@ -41,12 +41,16 @@ mod tests;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ntpc_core::ClockError;
 use thiserror::Error;
 
 pub use clock::{PlatformClock, WinClockControl, WinTimeSource};
-pub use events::{NoNetworkEvents, ResumeNotifier, WinNetworkEvents, WinPowerEvents, power_events};
+pub use events::{
+    NoNetworkEvents, RESUME_DEBOUNCE, ResumeNotifier, WinNetworkEvents, WinPowerEvents,
+    power_events,
+};
 pub use monitor::{W32TimeMonitor, WinJoinState, join_class};
 pub use net::{WinDhcpSource, WinOwnAddresses, WinThreadTuning, dhcp_read};
 pub use state_dir::{WinStateDir, refusal_reason, secure_outcome};
@@ -57,7 +61,9 @@ use crate::host::{
     HostControl, HostDeps, Inbox, NetworkEvents, RealWaiter, SecureOutcome, StateDir, ThreadSpawn,
     channel,
 };
-use crate::logging::{DEFAULT_MAX_FILE_BYTES, FileSink, Level, LineLogger, LogSink, Logger};
+use crate::logging::{
+    DEFAULT_MAX_FILE_BYTES, FileSink, Level, LineLogger, LogSink, Logger, format_utc,
+};
 use crate::resolver::SystemLookup;
 use crate::status::FileStatusWriter;
 use crate::transport::{TimeSource, UdpTransport};
@@ -138,22 +144,56 @@ impl LogSink for TeeSink {
     }
 }
 
+/// The text of the one line the other sinks get when the log file first
+/// fails.
+pub const FILE_FAILED_LINE: &str =
+    "the log file could not be written. Its lines go to the other log sinks only";
+
+/// The other sinks plus the log file. The first time the file fails, the
+/// other sinks get one line saying so, in the logger's line format. Later
+/// failures only count in the file sink, so a broken disk cannot flood the
+/// Event Log.
+struct WithFile {
+    others: TeeSink,
+    file: FileSink,
+    time: Arc<dyn TimeSource>,
+    told: AtomicBool,
+}
+
+impl LogSink for WithFile {
+    fn write_line(&self, line: &str) {
+        self.others.write_line(line);
+        self.file.write_line(line);
+        if self.file.write_errors() > 0 && !self.told.swap(true, Ordering::SeqCst) {
+            self.others.write_line(&format!(
+                "{} ERROR {FILE_FAILED_LINE}",
+                format_utc(self.time.wall_ns())
+            ));
+        }
+    }
+}
+
 /// The logger: `sinks` plus the file sink in `state_dir` when the
 /// directory is secured.
 #[must_use]
 pub fn build_logger(
     outcome: SecureOutcome,
     state_dir: &Path,
-    mut sinks: Vec<Box<dyn LogSink>>,
+    sinks: Vec<Box<dyn LogSink>>,
     time: Arc<dyn TimeSource>,
 ) -> Arc<dyn Logger> {
-    if !matches!(outcome, SecureOutcome::Refused { .. }) {
-        sinks.push(Box::new(FileSink::new(
-            state_dir.join(LOG_FILE_NAME),
-            DEFAULT_MAX_FILE_BYTES,
-        )));
-    }
-    Arc::new(LineLogger::new(Box::new(TeeSink::new(sinks)), time))
+    let others = TeeSink::new(sinks);
+    let sink: Box<dyn LogSink> = if matches!(outcome, SecureOutcome::Refused { .. }) {
+        Box::new(others)
+    } else {
+        Box::new(WithFile {
+            others,
+            file: FileSink::new(state_dir.join(LOG_FILE_NAME), DEFAULT_MAX_FILE_BYTES),
+            time: Arc::clone(&time),
+            told: AtomicBool::new(false),
+        })
+    };
+    Arc::new(LineLogger::new(sink, time))
 }
 
 /// Builds the host's dependencies on Windows. `sinks` are the log sinks
@@ -195,7 +235,7 @@ pub fn windows_deps(
             Box::new(NoNetworkEvents)
         }
     };
-    let (power, resume) = power_events(control.clone());
+    let (power, resume) = power_events(control.clone(), Arc::clone(&time));
     let tuning = Arc::new(WinThreadTuning::new(Arc::clone(&logger)));
     let deps = HostDeps {
         clock: Box::new(clock),
