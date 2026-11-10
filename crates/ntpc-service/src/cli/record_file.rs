@@ -156,6 +156,10 @@ impl RecordStore for FileRecordStore {
         let file = match safe_open::open_read(&self.path()) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            // R105 refuses at the open. Same class as the provenance check.
+            Err(e) if safe_open::is_extra_links(&e) => {
+                return Err(LoadError::NotTrusted(TrustFailure::Links));
+            }
             Err(e) => return Err(LoadError::Io(e.kind())),
         };
         check_provenance(&file, self.check_owner)?;
