@@ -896,6 +896,8 @@ pub struct LinkInfo {
     pub volume_serial: u32,
     /// File index, unique on its volume while the file is open.
     pub file_index: u64,
+    /// File size in bytes.
+    pub size: u64,
 }
 
 impl LinkInfo {
@@ -922,6 +924,7 @@ pub fn link_info(handle: &OwnedHandle) -> io::Result<LinkInfo> {
         links: info.nNumberOfLinks,
         volume_serial: info.dwVolumeSerialNumber,
         file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
     })
 }
 
