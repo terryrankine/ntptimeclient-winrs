@@ -6,6 +6,7 @@ pub mod logging;
 pub mod proto;
 pub mod resolver;
 mod safe_open;
+pub mod status;
 pub mod transport;
 
 /// Crate name, used by the smoke test.
