@@ -27,8 +27,8 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_SYSTEMTIME_NAME, SECURITY_ATTRIBUTES,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation,
-    TokenPrivileges, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_OWNER, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TokenElevation, TokenOwner, TokenPrivileges, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -200,21 +200,17 @@ fn systemtime_luid() -> io::Result<LUID> {
     Ok(luid)
 }
 
-/// Whether the process token holds `SeSystemtimePrivilege` at all, enabled
-/// or not. Read only.
-///
-/// # Errors
-/// The OS error if the token cannot be read.
-pub fn token_has_systemtime_privilege() -> io::Result<bool> {
-    let luid = systemtime_luid()?;
-    let token = process_token(TOKEN_QUERY)?;
+/// Reads one variable-size token information class. Returns the buffer and
+/// the number of bytes the OS wrote. The u64 elements give the alignment
+/// every token structure needs.
+fn token_info(token: &OwnedHandle, class: i32) -> io::Result<(Vec<u64>, usize)> {
     let mut needed = 0u32;
-    // SAFETY: a null buffer of length 0 asks only for the size. It fails
-    // with ERROR_INSUFFICIENT_BUFFER and sets `needed`.
+    // SAFETY: a null buffer of length 0 asks only for the size. The call
+    // fails with ERROR_INSUFFICIENT_BUFFER and sets `needed`.
     unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            TokenPrivileges,
+            class,
             ptr::null_mut(),
             0,
             &raw mut needed,
@@ -223,30 +219,61 @@ pub fn token_has_systemtime_privilege() -> io::Result<bool> {
     if needed == 0 {
         return Err(io::Error::last_os_error());
     }
-    // u64 elements give the 4-byte alignment TOKEN_PRIVILEGES needs.
     let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
-    // SAFETY: `buf` is at least `needed` bytes, writable and aligned.
+    let mut written = 0u32;
+    // SAFETY: `buf` holds at least `needed` writable, aligned bytes.
     let ok = unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            TokenPrivileges,
+            class,
             buf.as_mut_ptr().cast::<c_void>(),
             needed,
-            &raw mut needed,
+            &raw mut written,
         )
     };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let base = buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
-    // SAFETY: the OS filled `buf` with a TOKEN_PRIVILEGES. Reading the count
-    // stays inside the buffer, which holds at least the header.
-    let count = unsafe { (*base).PrivilegeCount } as usize;
+    Ok((buf, (written as usize).min(needed as usize)))
+}
+
+/// The default owner the process token gives to new objects. Read only.
+///
+/// # Errors
+/// The OS error if the token cannot be read.
+pub fn token_default_owner() -> io::Result<Principal> {
+    let token = process_token(TOKEN_QUERY)?;
+    let (buf, len) = token_info(&token, TokenOwner)?;
+    if len < size_of::<TOKEN_OWNER>() {
+        return Err(io::Error::other("token owner is truncated"));
+    }
+    // SAFETY: the OS filled `buf` with a TOKEN_OWNER, checked to fit. Its
+    // SID pointer points into `buf`, which lives across `classify`.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    Ok(classify(sid))
+}
+
+/// Whether the process token holds `SeSystemtimePrivilege` at all, enabled
+/// or not. Read only.
+///
+/// # Errors
+/// The OS error if the token cannot be read.
+pub fn token_has_systemtime_privilege() -> io::Result<bool> {
+    let luid = systemtime_luid()?;
+    let token = process_token(TOKEN_QUERY)?;
+    let (buf, len) = token_info(&token, TokenPrivileges)?;
     let header = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
+    if len < header {
+        return Err(io::Error::other("token privilege list is truncated"));
+    }
+    let base = buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
+    // SAFETY: the OS filled `buf` with a TOKEN_PRIVILEGES and the check
+    // above proves the count field lies inside it.
+    let count = unsafe { (*base).PrivilegeCount } as usize;
     let fits = count
         .checked_mul(size_of::<LUID_AND_ATTRIBUTES>())
         .and_then(|n| n.checked_add(header))
-        .is_some_and(|n| n <= needed as usize);
+        .is_some_and(|n| n <= len);
     if !fits {
         return Err(io::Error::other("token privilege list is truncated"));
     }

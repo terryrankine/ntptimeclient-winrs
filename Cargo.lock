@@ -59,6 +59,7 @@ name = "ntpc-platform"
 version = "0.0.0"
 dependencies = [
  "ntpc-core",
+ "thiserror",
  "windows-sys",
 ]
 

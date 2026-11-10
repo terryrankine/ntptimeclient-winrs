@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 ntpc-core.workspace = true
+thiserror.workspace = true
 
 # Microsoft's raw Win32 bindings (MIT OR Apache-2.0). It adds only
 # `windows-link`. Hand-written declarations for the ACL and token structs
