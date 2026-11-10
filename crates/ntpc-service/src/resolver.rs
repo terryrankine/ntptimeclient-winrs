@@ -46,8 +46,12 @@ pub const MAX_PER_TIER: usize = 8;
 /// the spec has no such setting. One hour is slow enough to be polite to
 /// the pool and fast enough to follow a changed address.
 pub const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(3600);
-/// How soon to try again when the last resolution gave no sources.
+/// How soon to try again when the last resolution gave no sources, or any
+/// name failed or gave no usable address.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a name keeps its previous addresses after lookups start to fail.
+pub const MAX_KEEP_PREVIOUS: Duration = Duration::from_secs(24 * 3600);
 
 /// Looks a name up. Blocking.
 pub trait NameLookup {
@@ -127,6 +131,12 @@ pub enum ResolveNote {
         /// How many were dropped.
         dropped: usize,
     },
+    /// The lookup kept failing for longer than [`MAX_KEEP_PREVIOUS`]. The old
+    /// addresses were dropped.
+    PreviousExpired {
+        /// The name.
+        name: String,
+    },
     /// The id counter ran out. Addresses after this point were skipped.
     IdsExhausted,
 }
@@ -155,17 +165,18 @@ pub fn is_usable_address(ip: IpAddr) -> bool {
 
 /// Expands names into sources with stable ids.
 #[derive(Debug)]
-pub struct Resolver<L = SystemLookup, O = NoOwnAddresses> {
+pub struct Resolver<L, O> {
     lookup: L,
     own: O,
     /// Ids of the addresses in the latest result only.
     ids: BTreeMap<IpAddr, SourceId>,
     next_id: Option<u32>,
     /// Latest good answer per name and tier, kept for a failed lookup.
-    previous: BTreeMap<(Tier, String), Vec<IpAddr>>,
+    /// The `Mono` is when the answer was last good.
+    previous: BTreeMap<(Tier, String), (Vec<IpAddr>, Mono)>,
     notes: Vec<ResolveNote>,
     resolved_at: Option<Mono>,
-    last_was_empty: bool,
+    retry_soon: bool,
 }
 
 impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
@@ -179,7 +190,7 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
             previous: BTreeMap::new(),
             notes: Vec::new(),
             resolved_at: None,
-            last_was_empty: false,
+            retry_soon: false,
         }
     }
 
@@ -191,9 +202,10 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
     /// Resolves every name and returns the sources, sorted by tier then
     /// address. Blocks. See the module note on timeouts.
     ///
-    /// A failed lookup keeps that name's previous addresses. The call never
-    /// fails as a whole. Look at [`Resolver::take_notes`] for what happened.
-    pub fn expand(&mut self, names: &[(String, Tier)]) -> Vec<SourceSpec> {
+    /// `now` dates the answers, so a failed lookup can keep a name's previous
+    /// addresses for at most [`MAX_KEEP_PREVIOUS`]. A name that is not found
+    /// loses them at once. The call never fails as a whole. Look at [`Resolver::take_notes`] for what happened.
+    pub fn expand(&mut self, now: Mono, names: &[(String, Tier)]) -> Vec<SourceSpec> {
         self.notes.clear();
         let own: BTreeSet<IpAddr> = self
             .own
@@ -210,11 +222,14 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
         let mut per_tier: BTreeMap<Tier, usize> = BTreeMap::new();
         let mut tier_dropped: BTreeMap<Tier, usize> = BTreeMap::new();
         let mut next_previous = BTreeMap::new();
+        let mut retry = false;
         // (tier, address, label) in assignment order.
         let mut chosen: Vec<(Tier, IpAddr, &str)> = Vec::new();
 
         for (name, tier) in ordered {
-            let candidates = self.candidates(name, *tier, &own, &claimed);
+            let found = self.candidates(now, name, *tier, &own, &claimed);
+            retry |= found.retry;
+            let candidates = found.list;
             let room = MAX_PER_TIER - per_tier.get(tier).copied().unwrap_or(0);
             let mut keep = candidates.len();
             if keep > MAX_PER_NAME {
@@ -232,7 +247,7 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
             *per_tier.entry(*tier).or_default() += kept.len();
             claimed.extend(kept.iter().copied());
             chosen.extend(kept.iter().map(|ip| (*tier, *ip, name.as_str())));
-            next_previous.insert((*tier, name.clone()), kept.to_vec());
+            next_previous.insert((*tier, name.clone()), (kept.to_vec(), found.good_at));
         }
         for (tier, dropped) in tier_dropped {
             self.notes.push(ResolveNote::TierCapped { tier, dropped });
@@ -258,30 +273,33 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
         // freed ids.
         self.ids = ids;
         out.sort_by_key(|s| (s.tier, s.addr.ip()));
-        self.last_was_empty = out.is_empty();
+        self.retry_soon = retry || out.is_empty();
         out
     }
 
     /// Usable, unclaimed addresses for one name. Known addresses first.
     fn candidates(
         &mut self,
+        now: Mono,
         name: &str,
         tier: Tier,
         own: &BTreeSet<IpAddr>,
         claimed: &BTreeSet<IpAddr>,
-    ) -> Vec<IpAddr> {
+    ) -> Candidates {
+        let mut good_at = now;
+        let mut retry = false;
         let raw: Vec<IpAddr> = if let Ok(literal) = name.parse::<IpAddr>() {
             vec![literal]
         } else {
             match self.lookup.lookup(name) {
                 Ok(list) => {
-                    if !list
-                        .iter()
-                        .any(|a| usable(*a, own) && !claimed.contains(&a.to_canonical()))
-                    {
+                    // An address claimed by an earlier name does not count
+                    // here. A pool that repeats a config server is not a fault.
+                    if !list.iter().any(|a| usable(*a, own)) {
                         self.notes.push(ResolveNote::NoUsableAddresses {
                             name: name.to_owned(),
                         });
+                        retry = true;
                     }
                     list
                 }
@@ -290,17 +308,29 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
                         name: name.to_owned(),
                         kind: e.kind(),
                     });
-                    let old = self
-                        .previous
-                        .get(&(tier, name.to_owned()))
-                        .cloned()
-                        .unwrap_or_default();
-                    if !old.is_empty() {
+                    let old = self.previous.get(&(tier, name.to_owned()));
+                    // NotFound means the name does not exist. Old addresses
+                    // would be wrong, so they go at once. Any other failure
+                    // may be a blip, so they stay for a bounded time.
+                    let keep = old.filter(|(_, at)| {
+                        e.kind() != io::ErrorKind::NotFound
+                            && now.saturating_duration_since(*at) <= MAX_KEEP_PREVIOUS
+                    });
+                    if let Some((addrs, at)) = keep {
+                        good_at = *at;
                         self.notes.push(ResolveNote::KeptPrevious {
                             name: name.to_owned(),
                         });
+                        addrs.clone()
+                    } else {
+                        if old.is_some() && e.kind() != io::ErrorKind::NotFound {
+                            self.notes.push(ResolveNote::PreviousExpired {
+                                name: name.to_owned(),
+                            });
+                        }
+                        retry = true;
+                        Vec::new()
                     }
-                    old
                 }
             }
         };
@@ -312,7 +342,11 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
             .collect();
         // Stable sort, so lookup order survives inside each group.
         list.sort_by_key(|a| !self.ids.contains_key(a));
-        list
+        Candidates {
+            list,
+            good_at,
+            retry,
+        }
     }
 
     fn id_for(&mut self, ip: IpAddr) -> Option<SourceId> {
@@ -328,7 +362,7 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
     /// before the first [`Resolver::mark_resolved`].
     #[must_use]
     pub fn due(&self, now: Mono) -> bool {
-        let interval = if self.last_was_empty {
+        let interval = if self.retry_soon {
             RETRY_INTERVAL
         } else {
             RE_RESOLVE_INTERVAL
@@ -347,6 +381,15 @@ impl<L: NameLookup, O: OwnAddresses> Resolver<L, O> {
     pub fn take_notes(&mut self) -> Vec<ResolveNote> {
         std::mem::take(&mut self.notes)
     }
+}
+
+/// Result of looking one name up.
+struct Candidates {
+    list: Vec<IpAddr>,
+    /// When the answer behind `list` was last good.
+    good_at: Mono,
+    /// The name failed or gave nothing usable, so ask again soon.
+    retry: bool,
 }
 
 fn usable(ip: IpAddr, own: &BTreeSet<IpAddr>) -> bool {

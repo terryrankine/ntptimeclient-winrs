@@ -43,6 +43,10 @@ impl OwnAddresses for Own {
     }
 }
 
+fn t(secs: u64) -> Mono {
+    Mono::from_nanos(secs * 1_000_000_000)
+}
+
 fn ip(s: &str) -> IpAddr {
     s.parse()
         .unwrap_or_else(|e| panic!("bad test address {s}: {e}"))
@@ -75,7 +79,7 @@ fn resolver_caps_addresses_per_name() {
     let mut f = Fake::default();
     set_many(&mut f, "pool.example", "203.0.113.", 20);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[("pool.example", Tier::Pool)]));
+    let out = r.expand(t(0), &names(&[("pool.example", Tier::Pool)]));
     assert_eq!(out.len(), MAX_PER_NAME);
     assert_eq!(MAX_PER_NAME, 4);
     let notes = r.take_notes();
@@ -102,7 +106,7 @@ fn resolver_drops_loopback_and_own_addresses() {
         ],
     );
     let mut r = Resolver::new(f, Own(vec![ip("192.0.2.10")]));
-    let out = r.expand(&names(&[("h", Tier::Config)]));
+    let out = r.expand(t(0), &names(&[("h", Tier::Config)]));
     assert_eq!(addrs(&out), [ip("198.51.100.5")]);
 }
 
@@ -111,8 +115,8 @@ fn resolver_gives_stable_ids_for_same_address() {
     let f = Fake::default().with("a", &["192.0.2.1", "192.0.2.2"]);
     let mut r = resolver(f);
     let n = names(&[("a", Tier::Config)]);
-    let first = r.expand(&n);
-    let second = r.expand(&n);
+    let first = r.expand(t(0), &n);
+    let second = r.expand(t(0), &n);
     assert_eq!(first, second);
     assert_ne!(first[0].id, first[1].id);
 }
@@ -124,7 +128,7 @@ fn pool_name_expands_to_several_sources() {
         &["203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"],
     );
     let mut r = resolver(f);
-    let out = r.expand(&names(&[("pool.ntp.org", Tier::Pool)]));
+    let out = r.expand(t(0), &names(&[("pool.ntp.org", Tier::Pool)]));
     assert_eq!(out.len(), 4);
     for s in &out {
         assert_eq!(s.tier, Tier::Pool);
@@ -139,7 +143,7 @@ fn pool_name_expands_to_several_sources() {
 fn port_is_123() {
     let f = Fake::default().with("a", &["192.0.2.1", "2001:db8::1"]);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[("a", Tier::Config)]));
+    let out = r.expand(t(0), &names(&[("a", Tier::Config)]));
     assert!(out.iter().all(|s| s.addr.port() == PORT && PORT == 123));
 }
 
@@ -149,7 +153,7 @@ fn duplicate_addresses_across_names_are_one_source() {
         .with("a", &["192.0.2.1", "192.0.2.2"])
         .with("b", &["192.0.2.2", "192.0.2.3"]);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[("a", Tier::Config), ("b", Tier::Config)]));
+    let out = r.expand(t(0), &names(&[("a", Tier::Config), ("b", Tier::Config)]));
     assert_eq!(
         addrs(&out),
         [ip("192.0.2.1"), ip("192.0.2.2"), ip("192.0.2.3")]
@@ -166,7 +170,10 @@ fn duplicate_across_tiers_keeps_the_higher_tier() {
         .with("mine", &["192.0.2.9"]);
     let mut r = resolver(f);
     // Pool listed first on purpose. Priority order must not depend on input order.
-    let out = r.expand(&names(&[("pool", Tier::Pool), ("mine", Tier::Config)]));
+    let out = r.expand(
+        t(0),
+        &names(&[("pool", Tier::Pool), ("mine", Tier::Config)]),
+    );
     let nine = out
         .iter()
         .find(|s| s.addr.ip() == ip("192.0.2.9"))
@@ -184,10 +191,10 @@ fn duplicate_across_tiers_keeps_the_higher_tier() {
 #[test]
 fn ip_literals_skip_the_lookup() {
     let mut r = resolver(Fake::default());
-    let out = r.expand(&names(&[
-        ("192.0.2.5", Tier::Config),
-        ("2001:db8::5", Tier::Config),
-    ]));
+    let out = r.expand(
+        t(0),
+        &names(&[("192.0.2.5", Tier::Config), ("2001:db8::5", Tier::Config)]),
+    );
     assert_eq!(addrs(&out), [ip("192.0.2.5"), ip("2001:db8::5")]);
     assert!(
         r.lookup_mut().calls.borrow().is_empty(),
@@ -200,15 +207,18 @@ fn ip_literals_skip_the_lookup() {
 #[test]
 fn loopback_literal_is_dropped() {
     let mut r = resolver(Fake::default());
-    assert_eq!(r.expand(&names(&[("127.0.0.1", Tier::Config)])).len(), 0);
-    assert_eq!(r.expand(&names(&[("::1", Tier::Config)])).len(), 0);
+    assert_eq!(
+        r.expand(t(0), &names(&[("127.0.0.1", Tier::Config)])).len(),
+        0
+    );
+    assert_eq!(r.expand(t(0), &names(&[("::1", Tier::Config)])).len(), 0);
 }
 
 #[test]
 fn name_with_zero_usable_addresses_gives_nothing_and_a_note() {
     let f = Fake::default().with("h", &["127.0.0.1", "169.254.1.1", "224.0.0.1"]);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[("h", Tier::Config)]));
+    let out = r.expand(t(0), &names(&[("h", Tier::Config)]));
     assert_eq!(out.len(), 0);
     assert_eq!(
         r.take_notes(),
@@ -221,7 +231,7 @@ fn name_with_zero_usable_addresses_gives_nothing_and_a_note() {
 fn empty_answer_gives_nothing() {
     let f = Fake::default().with("h", &[]);
     let mut r = resolver(f);
-    assert_eq!(r.expand(&names(&[("h", Tier::Pool)])).len(), 0);
+    assert_eq!(r.expand(t(0), &names(&[("h", Tier::Pool)])).len(), 0);
 }
 
 #[test]
@@ -231,11 +241,14 @@ fn tier_cap_is_eight_across_names() {
     set_many(&mut f, "b", "198.51.100.", 4);
     set_many(&mut f, "c", "203.0.113.", 4);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[
-        ("a", Tier::Config),
-        ("b", Tier::Config),
-        ("c", Tier::Config),
-    ]));
+    let out = r.expand(
+        t(0),
+        &names(&[
+            ("a", Tier::Config),
+            ("b", Tier::Config),
+            ("c", Tier::Config),
+        ]),
+    );
     assert_eq!(out.len(), MAX_PER_TIER);
     assert_eq!(MAX_PER_TIER, 8);
     // Earlier names win. The operator listed them in that order.
@@ -253,11 +266,10 @@ fn tier_cap_is_per_tier() {
     set_many(&mut f, "b", "198.51.100.", 4);
     set_many(&mut f, "c", "203.0.113.", 4);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[
-        ("a", Tier::Config),
-        ("b", Tier::Config),
-        ("c", Tier::Pool),
-    ]));
+    let out = r.expand(
+        t(0),
+        &names(&[("a", Tier::Config), ("b", Tier::Config), ("c", Tier::Pool)]),
+    );
     assert_eq!(out.len(), 12);
 }
 
@@ -268,11 +280,14 @@ fn result_is_sorted_by_tier_then_address() {
         .with("mine", &["198.51.100.7", "192.0.2.200", "2001:db8::1"])
         .with("dhcp", &["10.0.0.5"]);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[
-        ("pool", Tier::Pool),
-        ("dhcp", Tier::Dhcp),
-        ("mine", Tier::Config),
-    ]));
+    let out = r.expand(
+        t(0),
+        &names(&[
+            ("pool", Tier::Pool),
+            ("dhcp", Tier::Dhcp),
+            ("mine", Tier::Config),
+        ]),
+    );
     let keys: Vec<(Tier, IpAddr)> = out.iter().map(|s| (s.tier, s.addr.ip())).collect();
     let mut sorted = keys.clone();
     sorted.sort();
@@ -290,14 +305,14 @@ fn same_input_gives_same_output_every_time() {
         resolver(f)
     };
     let n = names(&[("p", Tier::Pool), ("q", Tier::Config)]);
-    assert_eq!(mk().expand(&n), mk().expand(&n));
+    assert_eq!(mk().expand(t(0), &n), mk().expand(t(0), &n));
 }
 
 #[test]
 fn ids_stay_stable_when_one_address_goes_and_a_new_one_arrives() {
     let mut r = resolver(Fake::default().with("a", &["192.0.2.1", "192.0.2.2", "192.0.2.3"]));
     let n = names(&[("a", Tier::Config)]);
-    let first = r.expand(&n);
+    let first = r.expand(t(0), &n);
     let id_of =
         |specs: &[SourceSpec], a: &str| specs.iter().find(|s| s.addr.ip() == ip(a)).map(|s| s.id);
     let id1 = id_of(&first, "192.0.2.1").expect("id1");
@@ -307,7 +322,7 @@ fn ids_stay_stable_when_one_address_goes_and_a_new_one_arrives() {
     // .2 disappears and .4 appears.
     r.lookup_mut()
         .set("a", &["192.0.2.1", "192.0.2.3", "192.0.2.4"]);
-    let second = r.expand(&n);
+    let second = r.expand(t(0), &n);
     assert_eq!(id_of(&second, "192.0.2.1"), Some(id1));
     assert_eq!(id_of(&second, "192.0.2.3"), Some(id3));
     assert_eq!(id_of(&second, "192.0.2.2"), None);
@@ -319,7 +334,7 @@ fn ids_stay_stable_when_one_address_goes_and_a_new_one_arrives() {
     // engine may still hold state under the old id.
     r.lookup_mut()
         .set("a", &["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]);
-    let third = r.expand(&n);
+    let third = r.expand(t(0), &n);
     let id2b = id_of(&third, "192.0.2.2").expect("id2b");
     assert!(![id1, id2, id3, id4].contains(&id2b));
     assert_eq!(id_of(&third, "192.0.2.4"), Some(id4));
@@ -331,8 +346,8 @@ fn ids_are_stable_across_tiers_and_names() {
         .with("a", &["192.0.2.1"])
         .with("b", &["192.0.2.1", "192.0.2.2"]);
     let mut r = resolver(f);
-    let one = r.expand(&names(&[("a", Tier::Config)]));
-    let two = r.expand(&names(&[("b", Tier::Pool)]));
+    let one = r.expand(t(0), &names(&[("a", Tier::Config)]));
+    let two = r.expand(t(0), &names(&[("b", Tier::Pool)]));
     let id_a = one[0].id;
     let id_b = two
         .iter()
@@ -351,7 +366,7 @@ fn known_addresses_are_kept_when_the_cap_bites() {
     );
     let mut r = resolver(f);
     let n = names(&[("p", Tier::Pool)]);
-    let first = r.expand(&n);
+    let first = r.expand(t(0), &n);
     r.lookup_mut().set(
         "p",
         &[
@@ -362,7 +377,7 @@ fn known_addresses_are_kept_when_the_cap_bites() {
             "203.0.113.52",
         ],
     );
-    let second = r.expand(&n);
+    let second = r.expand(t(0), &n);
     let known: Vec<IpAddr> = vec![ip("203.0.113.3"), ip("203.0.113.4")];
     for k in &known {
         assert!(addrs(&second).contains(k), "{k} kept");
@@ -382,10 +397,10 @@ fn known_addresses_are_kept_when_the_cap_bites() {
 fn failed_lookup_keeps_the_previous_addresses_and_ids() {
     let mut r = resolver(Fake::default().with("a", &["192.0.2.1", "192.0.2.2"]));
     let n = names(&[("a", Tier::Config)]);
-    let first = r.expand(&n);
+    let first = r.expand(t(0), &n);
     r.take_notes();
     r.lookup_mut().fail("a");
-    let second = r.expand(&n);
+    let second = r.expand(t(0), &n);
     assert_eq!(first, second);
     let notes = r.take_notes();
     assert!(
@@ -403,7 +418,7 @@ fn failed_first_lookup_gives_nothing() {
     let mut f = Fake::default();
     f.fail("a");
     let mut r = resolver(f);
-    assert_eq!(r.expand(&names(&[("a", Tier::Config)])).len(), 0);
+    assert_eq!(r.expand(t(0), &names(&[("a", Tier::Config)])).len(), 0);
     let notes = r.take_notes();
     assert!(
         matches!(notes[0], ResolveNote::LookupFailed { .. }),
@@ -421,7 +436,7 @@ fn own_address_filter_v4() {
     let f = Fake::default().with("h", &["192.0.2.1", "192.0.2.2"]);
     let mut r = Resolver::new(f, Own(vec![ip("192.0.2.2")]));
     assert_eq!(
-        addrs(&r.expand(&names(&[("h", Tier::Config)]))),
+        addrs(&r.expand(t(0), &names(&[("h", Tier::Config)]))),
         [ip("192.0.2.1")]
     );
 }
@@ -431,7 +446,7 @@ fn own_address_filter_v6() {
     let f = Fake::default().with("h", &["2001:db8::1", "2001:db8::2"]);
     let mut r = Resolver::new(f, Own(vec![ip("2001:db8::2")]));
     assert_eq!(
-        addrs(&r.expand(&names(&[("h", Tier::Config)]))),
+        addrs(&r.expand(t(0), &names(&[("h", Tier::Config)]))),
         [ip("2001:db8::1")]
     );
 }
@@ -442,14 +457,14 @@ fn own_address_filter_sees_through_mapped_addresses() {
     let f = Fake::default().with("h", &["::ffff:192.0.2.2", "192.0.2.3"]);
     let mut r = Resolver::new(f, Own(vec![ip("192.0.2.2")]));
     assert_eq!(
-        addrs(&r.expand(&names(&[("h", Tier::Config)]))),
+        addrs(&r.expand(t(0), &names(&[("h", Tier::Config)]))),
         [ip("192.0.2.3")]
     );
     // And the other way round.
     let f = Fake::default().with("h", &["192.0.2.2", "192.0.2.3"]);
     let mut r = Resolver::new(f, Own(vec![ip("::ffff:192.0.2.2")]));
     assert_eq!(
-        addrs(&r.expand(&names(&[("h", Tier::Config)]))),
+        addrs(&r.expand(t(0), &names(&[("h", Tier::Config)]))),
         [ip("192.0.2.3")]
     );
 }
@@ -458,7 +473,7 @@ fn own_address_filter_sees_through_mapped_addresses() {
 fn mapped_address_becomes_plain_v4_source() {
     let f = Fake::default().with("h", &["::ffff:198.51.100.7"]);
     let mut r = resolver(f);
-    let out = r.expand(&names(&[("h", Tier::Config)]));
+    let out = r.expand(t(0), &names(&[("h", Tier::Config)]));
     assert_eq!(out[0].addr.ip(), ip("198.51.100.7"));
     assert!(out[0].addr.is_ipv4());
 }
@@ -527,7 +542,7 @@ fn due_is_true_before_the_first_resolve() {
 #[test]
 fn due_follows_the_interval() {
     let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
-    r.expand(&names(&[("a", Tier::Config)]));
+    r.expand(t(0), &names(&[("a", Tier::Config)]));
     let t0 = Mono::from_nanos(5_000_000_000);
     r.mark_resolved(t0);
     assert!(!r.due(t0));
@@ -546,7 +561,7 @@ fn due_follows_the_interval() {
 #[test]
 fn due_retries_sooner_after_an_empty_result() {
     let mut r = resolver(Fake::default());
-    let out = r.expand(&names(&[("nothing.example", Tier::Pool)]));
+    let out = r.expand(t(0), &names(&[("nothing.example", Tier::Pool)]));
     assert_eq!(out.len(), 0);
     let t0 = Mono::from_nanos(1_000_000_000);
     r.mark_resolved(t0);
@@ -558,7 +573,7 @@ fn due_retries_sooner_after_an_empty_result() {
 #[test]
 fn no_names_gives_no_sources() {
     let mut r = resolver(Fake::default());
-    assert_eq!(r.expand(&[]).len(), 0);
+    assert_eq!(r.expand(t(0), &[]).len(), 0);
 }
 
 #[test]
@@ -570,4 +585,108 @@ fn system_lookup_resolves_a_literal_without_dns() {
 #[test]
 fn no_own_addresses_stub_is_empty() {
     assert_eq!(NoOwnAddresses.own_addresses().len(), 0);
+}
+
+fn lookup_err(fake: &mut Fake, name: &str, kind: io::ErrorKind) {
+    fake.answers.insert(name.to_owned(), Err(kind));
+}
+
+#[test]
+fn a_failed_config_name_is_retried_soon_even_when_the_pool_resolves() {
+    let mut f = Fake::default().with("pool", &["203.0.113.1", "203.0.113.2"]);
+    f.fail("mine");
+    let mut r = resolver(f);
+    let n = names(&[("mine", Tier::Config), ("pool", Tier::Pool)]);
+    let out = r.expand(t(100), &n);
+    assert_eq!(out.len(), 2, "pool only");
+    r.mark_resolved(t(100));
+    assert!(!r.due(t(100 + 59)));
+    assert!(r.due(t(100 + 60)));
+
+    // The config name resolves. The retry flag clears.
+    r.lookup_mut().set("mine", &["192.0.2.1"]);
+    let out = r.expand(t(160), &n);
+    assert_eq!(out.len(), 3);
+    r.mark_resolved(t(160));
+    assert!(!r.due(t(160 + 60)));
+    assert!(r.due(t(160).checked_add(RE_RESOLVE_INTERVAL).expect("fits")));
+}
+
+#[test]
+fn a_name_with_no_usable_address_is_retried_soon() {
+    let f = Fake::default()
+        .with("mine", &["127.0.0.1"])
+        .with("pool", &["203.0.113.1"]);
+    let mut r = resolver(f);
+    r.expand(
+        t(0),
+        &names(&[("mine", Tier::Config), ("pool", Tier::Pool)]),
+    );
+    r.mark_resolved(t(0));
+    assert!(r.due(t(60)));
+}
+
+#[test]
+fn a_duplicate_of_a_higher_tier_is_not_a_reason_to_retry() {
+    let f = Fake::default()
+        .with("mine", &["192.0.2.1"])
+        .with("pool", &["192.0.2.1"]);
+    let mut r = resolver(f);
+    r.expand(
+        t(0),
+        &names(&[("mine", Tier::Config), ("pool", Tier::Pool)]),
+    );
+    r.mark_resolved(t(0));
+    assert!(!r.due(t(60)));
+    assert_eq!(r.take_notes().len(), 0);
+}
+
+#[test]
+fn previous_addresses_are_kept_for_24_hours_then_dropped() {
+    let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
+    let n = names(&[("a", Tier::Config)]);
+    assert_eq!(r.expand(t(0), &n).len(), 1);
+    lookup_err(r.lookup_mut(), "a", io::ErrorKind::TimedOut);
+    let day = 24 * 3600;
+    // Still inside the window, and the window counts from the last good answer.
+    assert_eq!(r.expand(t(3600), &n).len(), 1);
+    assert_eq!(r.expand(t(day), &n).len(), 1, "exactly 24 h is kept");
+    r.take_notes();
+    assert_eq!(r.expand(t(day + 1), &n).len(), 0, "past 24 h is dropped");
+    assert!(
+        r.take_notes()
+            .contains(&ResolveNote::PreviousExpired { name: "a".into() })
+    );
+    // Once dropped it stays dropped.
+    assert_eq!(r.expand(t(day + 2), &n).len(), 0);
+}
+
+#[test]
+fn a_good_answer_restarts_the_24_hour_window() {
+    let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
+    let n = names(&[("a", Tier::Config)]);
+    r.expand(t(0), &n);
+    r.expand(t(20 * 3600), &n);
+    lookup_err(r.lookup_mut(), "a", io::ErrorKind::TimedOut);
+    assert_eq!(r.expand(t(40 * 3600), &n).len(), 1);
+}
+
+#[test]
+fn not_found_drops_previous_addresses_at_once() {
+    let mut r = resolver(Fake::default().with("a", &["192.0.2.1"]));
+    let n = names(&[("a", Tier::Config)]);
+    assert_eq!(r.expand(t(0), &n).len(), 1);
+    lookup_err(r.lookup_mut(), "a", io::ErrorKind::NotFound);
+    assert_eq!(r.expand(t(1), &n).len(), 0);
+    let notes = r.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|x| matches!(x, ResolveNote::LookupFailed { .. }))
+    );
+    assert!(
+        !notes
+            .iter()
+            .any(|x| matches!(x, ResolveNote::KeptPrevious { .. }))
+    );
 }
