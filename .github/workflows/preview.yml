@@ -38,6 +38,7 @@ jobs:
       contents: read
     outputs:
       zip_name: ${{ steps.assemble.outputs.zip_name }}
+      zip_sha256: ${{ steps.assemble.outputs.zip_sha256 }}
     steps:
       # actions/checkout v7.0.1, commit looked up with `gh api` on 2026-11-10
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -50,6 +51,8 @@ jobs:
       # No build cache here. A release build must not depend on cache contents
       # that an earlier pull request run could have written.
 
+      # This lint runs AFTER the actions above were fetched, so it cannot stop
+      # the current run from using an unpinned action. It guards future edits.
       - name: Check the pins and placeholders
         shell: pwsh
         run: |
@@ -75,6 +78,31 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked -p ntpc-service
+
+      # Stub gate. Until Tasks 12 and 14 merge, the exe is a stub that ignores
+      # its arguments and exits 0, and install.ps1 would then run it. So the
+      # exe must print a help that lists both subcommands. This gate stays
+      # RED until Tasks 12 and 14 merge. That is intended: no tag can publish
+      # a stub. A manual dry run is red too.
+      # --help is the one argument passed. On a stub or an unknown CLI it does
+      # nothing, and the runner is a throw-away machine in any case.
+      - name: Refuse to package a stub exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = 'target/release/ntptimeclient-winrs.exe', 'target/release/ntpc-service.exe'
+          $exe = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $exe) { Write-Error 'No release binary found.'; exit 1 }
+          $ErrorActionPreference = 'Continue'
+          $help = (& $exe --help 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          Write-Host "exit code $code"
+          Write-Host $help
+          if ([string]::IsNullOrWhiteSpace($help)) { Write-Error 'The exe printed nothing for --help. It is a stub.'; exit 1 }
+          foreach ($word in 'install', 'uninstall') {
+            if ($help -notmatch "(?m)\b$word\b") { Write-Error "The exe help does not list '$word'. It is a stub."; exit 1 }
+          }
 
       - name: Test
         run: cargo test --workspace --locked
@@ -116,6 +144,12 @@ jobs:
           }
           Copy-Item -LiteralPath 'LICENSE-MIT', 'LICENSE-APACHE' -Destination $stage
 
+          # Old Notepad shows LF-only text on one line. The README ships with
+          # CRLF. This is done before SHA256SUMS is computed.
+          $readme = Join-Path $stage 'README-PREVIEW.txt'
+          $text = [System.IO.File]::ReadAllText($readme) -replace "`r?`n", "`r`n"
+          [System.IO.File]::WriteAllText($readme, $text, (New-Object System.Text.UTF8Encoding($false)))
+
           # Reproducibility notes. The toolchain floats on "stable", so the
           # compiler version is recorded here instead of being pinned.
           $rustc = (rustc -vV) -join "`n"
@@ -146,6 +180,7 @@ jobs:
           Remove-Item -LiteralPath $stage -Recurse -Force
           Get-ChildItem dist | Format-Table Name, Length
           "zip_name=$base.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip_sha256=$zipHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # actions/upload-artifact v7.0.2, commit looked up with `gh api` on 2026-11-10
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -178,23 +213,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+          # The hash comes from the build job output, not from a file in the
+          # artifact. The zip is compared with it before it is published.
+          ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
         run: |
           set -euo pipefail
+          actual="$(sha256sum "dist/${ZIP_NAME}" | cut -d' ' -f1)"
+          if [ "$actual" != "$ZIP_SHA256" ]; then
+            echo "zip hash $actual does not match the build job output $ZIP_SHA256" >&2
+            exit 1
+          fi
           cat > notes.md <<'EOF'
           # UNSIGNED PREVIEW. NOT FOR MACHINES THAT MATTER.
 
           This is a developer preview, not a release.
 
-          - The binary is not code signed. Windows SmartScreen or antivirus may warn.
+          - The binary is not code signed. Windows SmartScreen, Smart App Control or antivirus may warn or block it (unverified).
           - It sets the system clock and stops and disables the Windows Time service (w32time).
           - Use it only on a throwaway virtual machine with a snapshot.
           - No accuracy figure is promised.
 
           Read README-PREVIEW.txt inside the zip before you run anything.
-          Install and uninstall with the scripts in the zip. Both need an elevated PowerShell.
+          Extract only into a folder that only administrators can write. Install and uninstall with the scripts in the zip. Both need an elevated PowerShell.
           The hash file inside the zip finds accidental damage only. It does not prove the zip is genuine.
           EOF
-          printf '\nSHA-256 of the zip:\n\n    %s\n' "$(cat "dist/${ZIP_NAME}.sha256")" >> notes.md
+          printf '\nSHA-256 of the zip:\n\n    %s  %s\n' "$ZIP_SHA256" "$ZIP_NAME" >> notes.md
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
