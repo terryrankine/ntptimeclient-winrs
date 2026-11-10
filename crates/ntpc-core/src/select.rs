@@ -45,12 +45,17 @@ pub struct Selection {
 /// Delay floor so a zero delay does not give an infinite weight.
 const MIN_DELAY_SECS: f64 = 1e-6;
 
+/// Cap on the reported error bound. Far beyond any real path.
+const MAX_ERROR_BOUND: Duration = Duration::from_secs(86_400);
+
 fn usable(s: &Sample, now: Mono, cfg: &SelectionConfig) -> bool {
     // Stratum 0 is a kiss-of-death or unspecified.
     s.stratum >= 1
         && s.stratum <= cfg.max_stratum
         && !s.unsynchronised
         && !s.leap_alarm
+        // A negative delay is impossible and would get the largest weight.
+        && s.delay.as_secs() >= 0.0
         && now.saturating_duration_since(s.at) <= cfg.max_age
 }
 
@@ -69,7 +74,8 @@ pub fn select(samples: &[Sample], now: Mono, cfg: &SelectionConfig) -> Option<Se
     let mut cands: Vec<Sample> = Vec::new();
     for s in samples.iter().filter(|s| usable(s, now, cfg)) {
         match cands.iter_mut().find(|c| c.source == s.source) {
-            Some(c) if s.delay < c.delay => *c = *s,
+            // On a delay tie the newest sample wins, as in `SourceFilter`.
+            Some(c) if s.delay < c.delay || (s.delay == c.delay && s.at > c.at) => *c = *s,
             Some(_) => {}
             None => cands.push(*s),
         }
@@ -126,7 +132,8 @@ pub fn select(samples: &[Sample], now: Mono, cfg: &SelectionConfig) -> Option<Se
 
     Some(Selection {
         offset: Offset::from_secs(offset),
-        error_bound: Duration::from_secs_f64(err),
+        error_bound: Duration::try_from_secs_f64(err)
+            .map_or(MAX_ERROR_BOUND, |d| d.min(MAX_ERROR_BOUND)),
         survivors: survivors.iter().map(|s| s.source).collect(),
     })
 }
@@ -218,5 +225,65 @@ mod tests {
         };
         assert!(select(&[s(1, 0.0, 0.01)], now(), &cfg).is_none());
         assert!(select(&[s(1, 0.0, 0.01), s(2, 0.001, 0.01)], now(), &cfg).is_some());
+    }
+
+    #[test]
+    fn two_disagreeing_sources_give_none() {
+        let v = [s(1, 0.0, 0.01), s(2, 1.0, 0.01)];
+        assert!(select(&v, now(), &SelectionConfig::default()).is_none());
+    }
+
+    #[test]
+    fn two_of_four_split_gives_none() {
+        let v = [
+            s(1, 0.0, 0.01),
+            s(2, 0.001, 0.01),
+            s(3, 2.0, 0.01),
+            s(4, 2.001, 0.01),
+        ];
+        assert!(select(&v, now(), &SelectionConfig::default()).is_none());
+    }
+
+    #[test]
+    fn touching_intervals_agree() {
+        // Bounds are 0.5 s each, so the intervals meet at exactly 0.5.
+        let v = [s(1, 0.0, 1.0), s(2, 1.0, 1.0)];
+        let sel = select(&v, now(), &SelectionConfig::default()).expect("selected");
+        assert_eq!(sel.survivors.len(), 2);
+    }
+
+    #[test]
+    fn zero_delay_sources_sweep_and_weight() {
+        let v = [s(1, 0.25, 0.0), s(2, 0.25, 0.0), s(3, 9.0, 0.0)];
+        let sel = select(&v, now(), &SelectionConfig::default()).expect("selected");
+        assert_eq!(sel.survivors, vec![SourceId::new(1), SourceId::new(2)]);
+        assert!((sel.offset.as_secs() - 0.25).abs() < 1e-12);
+        assert_eq!(sel.error_bound, Duration::ZERO);
+    }
+
+    #[test]
+    fn negative_delay_is_never_selected() {
+        let cfg = SelectionConfig::default();
+        assert!(select(&[s(1, 0.0, -0.5)], now(), &cfg).is_none());
+        let sel = select(&[s(1, 7.0, -0.5), s(2, 0.1, 0.02)], now(), &cfg).expect("selected");
+        assert_eq!(sel.survivors, vec![SourceId::new(2)]);
+    }
+
+    #[test]
+    fn delay_tie_prefers_newest_sample_of_a_source() {
+        let mut older = s(1, 0.1, 0.02);
+        older.at = Mono::from_nanos(NOW - 5);
+        let newer = s(1, 0.2, 0.02);
+        for v in [[older, newer], [newer, older]] {
+            let sel = select(&v, now(), &SelectionConfig::default()).expect("selected");
+            assert!((sel.offset.as_secs() - 0.2).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn huge_delay_clamps_error_bound() {
+        let sel =
+            select(&[s(1, 0.0, 1e300)], now(), &SelectionConfig::default()).expect("selected");
+        assert_eq!(sel.error_bound, MAX_ERROR_BOUND);
     }
 }
