@@ -562,5 +562,63 @@ pub fn monitor_decision(prev_running: Option<bool>, now_running: bool) -> Monito
     }
 }
 
+/// The real service control manager. Each call opens its own handle with
+/// only the rights it needs. `query` asks for `SERVICE_QUERY_STATUS |
+/// SERVICE_QUERY_CONFIG` and nothing more.
+#[cfg(windows)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScmControl;
+
+#[cfg(windows)]
+fn os_err(op: &'static str, e: &std::io::Error) -> SvcError {
+    // An error without a code is not a Win32 error. -1 marks it.
+    SvcError::from_code(op, e.raw_os_error().unwrap_or(-1))
+}
+
+#[cfg(windows)]
+impl ServiceControl for ScmControl {
+    fn query(&self, name: &str) -> Result<SvcState, SvcError> {
+        use crate::win32::scm;
+        let s = scm::open_query(name).map_err(|e| os_err("open", &e))?;
+        let raw = scm::current_state(&s).map_err(|e| os_err("status query", &e))?;
+        let run = RunState::from_raw(raw).ok_or(SvcError::UnknownState(raw))?;
+        let raw_start = scm::start_type(&s).map_err(|e| os_err("config query", &e))?;
+        // The delayed flag means something only for auto start (Learn).
+        let delayed = if raw_start == StartType::Automatic.to_raw().0 {
+            scm::delayed_auto_start(&s).map_err(|e| os_err("delayed start query", &e))?
+        } else {
+            false
+        };
+        let start = StartType::from_raw(raw_start, delayed)?;
+        Ok(SvcState { run, start })
+    }
+
+    fn stop(&mut self, name: &str) -> Result<(), SvcError> {
+        use crate::win32::scm;
+        let s = scm::open_stop(name).map_err(|e| os_err("open", &e))?;
+        scm::send_stop(&s).map_err(|e| os_err("stop", &e))
+    }
+
+    fn start(&mut self, name: &str) -> Result<(), SvcError> {
+        use crate::win32::scm;
+        let s = scm::open_start(name).map_err(|e| os_err("open", &e))?;
+        scm::start(&s).map_err(|e| os_err("start", &e))
+    }
+
+    fn set_start_type(&mut self, name: &str, t: StartType) -> Result<(), SvcError> {
+        use crate::win32::scm;
+        let s = scm::open_change_config(name).map_err(|e| os_err("open", &e))?;
+        let (raw, delayed) = t.to_raw();
+        scm::set_start_type(&s, raw).map_err(|e| os_err("set start type", &e))?;
+        if let Some(d) = delayed {
+            scm::set_delayed_auto_start(&s, d).map_err(|e| os_err("set delayed start", &e))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod live_tests;

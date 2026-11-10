@@ -23,6 +23,18 @@ pub use clock::{AdjustmentState, MAX_ADJUSTMENT_PPM, ppm_to_adjustment, quantise
 #[cfg(windows)]
 pub use domain::join_state;
 pub use domain::{JoinState, map_join_status};
+#[cfg(windows)]
+pub use w32time::ScmControl;
+
+/// Whether this process runs elevated. Read only. Install and uninstall
+/// refuse without it.
+///
+/// # Errors
+/// The OS error if the token cannot be read.
+#[cfg(windows)]
+pub fn is_elevated() -> std::io::Result<bool> {
+    win32::token_is_elevated()
+}
 
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";
