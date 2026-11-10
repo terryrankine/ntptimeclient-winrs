@@ -1,0 +1,18 @@
+[package]
+name = "ntpc-core"
+description = "Sans-IO NTP client engine. No OS or network dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Simulation world used by scenario tests. Filled in by a later task.
+sim = []
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
