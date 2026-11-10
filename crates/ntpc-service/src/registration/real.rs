@@ -73,6 +73,11 @@ impl ScmApi for RealScm {
         configure_service(&spec.name, &x).map_err(|(step, e)| (step, scm_err(step, &e)))
     }
 
+    fn park(&mut self, name: &str) -> Result<(), (&'static str, ScmError)> {
+        ntpc_platform::service_host::park_service(name)
+            .map_err(|(step, e)| (step, scm_err(step, &e)))
+    }
+
     fn delete(&mut self, name: &str) -> Result<(), ScmError> {
         ntpc_platform::service_host::delete_service(name).map_err(|e| scm_err("delete", &e))
     }

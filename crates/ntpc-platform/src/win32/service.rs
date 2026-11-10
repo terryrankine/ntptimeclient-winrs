@@ -474,6 +474,36 @@ pub fn configure_service(name: &str, x: &RawExtras) -> Result<(), (&'static str,
     Ok(())
 }
 
+/// R112: parks a service that failed to start: start type
+/// `SERVICE_DEMAND_START` and no failure actions, so nothing restarts it.
+/// Learn (`SERVICE_FAILURE_ACTIONSW`): "If this value is 0, but
+/// lpsaActions is not NULL, the reset period and array of failure actions
+/// are deleted." A later install sets both back.
+///
+/// # Errors
+/// The step that failed and the OS error.
+pub fn park_service(name: &str) -> Result<(), (&'static str, io::Error)> {
+    /// `SERVICE_DEMAND_START`.
+    const DEMAND_START: u32 = 3;
+    let s = super::scm::open_change_config(name).map_err(|e| ("open", e))?;
+    super::scm::set_start_type(&s, DEMAND_START).map_err(|e| ("start type", e))?;
+    let s2 = open_service(name, SERVICE_CHANGE_CONFIG | SERVICE_START).map_err(|e| ("open", e))?;
+    let mut none = [SC_ACTION { Type: 0, Delay: 0 }];
+    let fa = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: 0,
+        lpRebootMsg: ptr::null_mut(),
+        lpCommand: ptr::null_mut(),
+        cActions: 0,
+        lpsaActions: none.as_mut_ptr(),
+    };
+    config2(
+        &s2,
+        SERVICE_CONFIG_FAILURE_ACTIONS,
+        ptr::from_ref(&fa).cast(),
+    )
+    .map_err(|e| ("failure actions", e))
+}
+
 /// Marks the service for deletion. Learn: it goes once every handle is
 /// closed and the service is not running.
 ///

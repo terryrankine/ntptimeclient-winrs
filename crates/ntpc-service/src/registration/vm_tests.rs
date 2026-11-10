@@ -26,6 +26,16 @@ fn allowed() -> bool {
         eprintln!("refused: not elevated");
         return false;
     }
+    // m3: the cleanup deletes our name and register() repoints an existing
+    // service, so never run where a real install is.
+    if !matches!(RealScm.status(SERVICE_NAME), Err(ScmError::NotFound)) {
+        eprintln!("refused: a service named {SERVICE_NAME} exists. Uninstall it first");
+        return false;
+    }
+    if RealRegistry.exists(EVENT_SOURCE_KEY).unwrap_or(true) {
+        eprintln!("refused: the Event Log source exists. Uninstall first");
+        return false;
+    }
     true
 }
 

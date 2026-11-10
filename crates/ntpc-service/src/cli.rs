@@ -29,8 +29,10 @@
 //!    removed again (M8).
 //! 7. Register our service. On failure `w32time` is put back and the
 //!    registration rolls itself back (exit 19).
-//! 8. Start our service. A failed start keeps the install: the service
-//!    starts at the next boot (exit 21).
+//! 8. Start our service and wait for it to stay `RUNNING` (R109, R113).
+//!    If it does not: `w32time` is put back, our service is set to manual
+//!    start with no failure restarts (R112), the registration is kept
+//!    (exit 21).
 //!
 //! Uninstall (`cli/uninstall.rs`): stop our service (hook), secure the state
 //! directory and read the record with the provenance checks (R86), restore
@@ -95,7 +97,7 @@ pub mod exit {
     /// The `w32time` takeover failed. The message says what changed. The
     /// record stays so uninstall can restore.
     pub const TAKEOVER: u8 = 8;
-    /// Our service registration is not built yet (not ready). Install
+    /// Registration is not available in this build (not ready). Install
     /// refused before any change.
     pub const REGISTER: u8 = 9;
     /// Uninstall could not restore `w32time`. The record and our service
@@ -460,6 +462,11 @@ pub trait Registration {
     /// # Errors
     /// Why it failed, with the service exit code when it stopped.
     fn start_service(&mut self) -> Result<(), String>;
+    /// R112: manual start and no failure actions, after a failed start.
+    ///
+    /// # Errors
+    /// Why it failed.
+    fn park(&mut self) -> Result<(), String>;
     /// R110: an existing service with our name must run our exe.
     ///
     /// # Errors
@@ -487,6 +494,11 @@ const UNKNOWN_WARNING: &str = "The domain join state could not be read. It is tr
 
 /// Runs the install steps. Returns an [`exit`] code.
 pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
+    // m6: elevation first, so a non-elevated admin gets exit 3, not a
+    // token owner refusal that only elevation would fix.
+    if let Some(code) = require_elevated(d.host, "Install") {
+        return code;
+    }
     match d.reg.ready() {
         Ok(()) => {}
         Err(NotReady::NotBuilt(e)) => {
@@ -502,10 +514,6 @@ pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
             for r in reasons {
                 d.host.say(&format!("  {r}"));
             }
-            d.host.say(
-                "Put the files in a folder created from an elevated prompt (for example under \
-                 Program Files) and run install from there.",
-            );
             return exit::EXE_LOCATION;
         }
         Err(NotReady::Foreign(e)) => {
@@ -515,14 +523,14 @@ pub fn install(opts: &InstallOptions, d: &mut Deps<'_>) -> u8 {
         }
         Err(NotReady::TokenOwner(e)) => {
             d.host.say(&format!(
-                "Install refused, nothing changed: {e}. Run install from an elevated prompt \
-                 of an account whose new files are owned by Administrators."
+                "Install refused, nothing changed: {e}. New files must be owned by the \
+                 Administrators group. Under UAC a normal administrator account needs an \
+                 elevated prompt. If this prompt is elevated, the security policy 'System \
+                 objects: Default owner for objects created by members of the Administrators \
+                 group' must be set to Administrators group."
             ));
             return exit::TOKEN_OWNER;
         }
-    }
-    if let Some(code) = require_elevated(d.host, "Install") {
-        return code;
     }
     if let Some(code) = domain_rule(*opts, d.host) {
         return code;
@@ -664,30 +672,68 @@ fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
     }
     d.host.say("Service registered.");
     if let Err(e) = d.reg.start_service() {
-        d.host.say(&format!(
-            "The service did not start: {e}. Putting w32time back so this machine keeps time \
-             sync. The service registration is kept: fix the cause, then run install again."
-        ));
-        put_w32time_back(d, record);
+        start_failed(d, record, &e);
         return exit::START_FAILED;
     }
     d.host.say("Installed and started.");
     exit::OK
 }
 
+/// Exit 21 path: put `w32time` back, say what was restored, park our
+/// service (R112).
+fn start_failed(d: &mut Deps<'_>, record: Restore, e: &str) {
+    d.host.say(&format!(
+        "The service did not start: {e}. Putting w32time back to its recorded state. The \
+         service registration is kept: fix the cause, then run install again."
+    ));
+    let back = put_w32time_back(d, record);
+    if back && record.start_type() == StartType::Disabled {
+        d.host.say(
+            "w32time was disabled before install, so it stays disabled. This machine has \
+             no time sync until the service runs.",
+        );
+    } else if back && record.was_running() {
+        d.host
+            .say("w32time runs again, so this machine keeps time sync.");
+    }
+    // R112: no restart loop and no clock adjustment by a service that
+    // nobody asked to run. A new install turns both back on.
+    match d.reg.park() {
+        Ok(()) => d
+            .host
+            .say("The service was set to manual start with no restart on failure."),
+        Err(e) => d.host.say(&format!(
+            "Setting the service to manual start failed: {e}. It may restart on its own. \
+             Stop it with: sc.exe config {} start= demand",
+            crate::registration::SERVICE_NAME
+        )),
+    }
+}
+
 /// Restores `w32time` from `record` after a later install step failed,
 /// and removes the record when that worked. Says what happened.
-fn put_w32time_back(d: &mut Deps<'_>, record: Restore) {
+fn put_w32time_back(d: &mut Deps<'_>, record: Restore) -> bool {
+    let start = record.start_type().as_str();
     match restore(&mut *d.scm, &record) {
-        Ok(_) => match d.store.remove() {
-            Ok(()) => d.host.say("w32time was put back as it was."),
-            Err(e) => d.host.say(&format!(
-                "w32time was put back as it was. The restore record could not be removed ({e})."
-            )),
-        },
-        Err(e) => d.host.say(&format!(
-            "w32time was NOT put back: {e}. The restore record is kept. Run uninstall."
-        )),
+        Ok(_) => {
+            match d.store.remove() {
+                Ok(()) => d
+                    .host
+                    .say(&format!("w32time was put back: start type {start}.")),
+                Err(e) => d.host.say(&format!(
+                    "w32time was put back: start type {start}. The restore record could not be \
+                     removed ({e})."
+                )),
+            }
+            true
+        }
+        Err(e) => {
+            d.host.say(&format!(
+                "w32time was NOT put back: {e}. The restore record is kept. Run uninstall. \
+                 {MANUAL_RESTORE}"
+            ));
+            false
+        }
     }
 }
 
@@ -771,6 +817,9 @@ impl Registration for PendingRegistration {
     }
     fn check_ours(&self) -> Result<(), String> {
         Ok(())
+    }
+    fn park(&mut self) -> Result<(), String> {
+        Err(NOT_AVAILABLE.to_owned())
     }
 }
 

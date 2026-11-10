@@ -329,6 +329,11 @@ pub trait ScmApi {
     /// # Errors
     /// [`ScmError`].
     fn start(&mut self, name: &str) -> Result<(), ScmError>;
+    /// R112: `SERVICE_DEMAND_START` and no failure actions.
+    ///
+    /// # Errors
+    /// The step that failed and why.
+    fn park(&mut self, name: &str) -> Result<(), (&'static str, ScmError)>;
     /// Waits between polls. Fakes override it so tests do not sleep.
     fn pause(&mut self, d: Duration) {
         std::thread::sleep(d);
@@ -371,6 +376,11 @@ pub fn is_our_image_path(p: &str) -> bool {
 /// How long `start_service` waits for `RUNNING` (R109).
 pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the service must stay `RUNNING` before install calls it
+/// started (R113). A failure while building the adapters can show up just
+/// after the first `RUNNING`.
+pub const START_SOAK: Duration = Duration::from_secs(3);
+
 /// The real [`Registration`].
 pub struct ScmRegistration<'a> {
     scm: &'a mut dyn ScmApi,
@@ -382,6 +392,7 @@ pub struct ScmRegistration<'a> {
     host_ready: Result<(), String>,
     stop_timeout: Duration,
     start_timeout: Duration,
+    soak: Duration,
 }
 
 impl<'a> ScmRegistration<'a> {
@@ -399,6 +410,7 @@ impl<'a> ScmRegistration<'a> {
             host_ready,
             stop_timeout: STOP_TIMEOUT,
             start_timeout: START_TIMEOUT,
+            soak: START_SOAK,
         }
     }
 
@@ -407,6 +419,13 @@ impl<'a> ScmRegistration<'a> {
     pub fn with_timeouts(mut self, stop: Duration, start: Duration) -> Self {
         self.stop_timeout = stop;
         self.start_timeout = start;
+        self
+    }
+
+    /// Changes the soak after the first `RUNNING`, for tests.
+    #[must_use]
+    pub fn with_soak(mut self, d: Duration) -> Self {
+        self.soak = d;
         self
     }
 
@@ -582,15 +601,28 @@ impl Registration for ScmRegistration<'_> {
     /// Starts the service and waits for `RUNNING` (R109). `StartService`
     /// returns once the process connects, so a service that fails while
     /// building its adapters is seen only here.
+    fn park(&mut self) -> Result<(), String> {
+        self.scm
+            .park(SERVICE_NAME)
+            .map_err(|(step, e)| format!("setting the {step} failed: {e}"))
+    }
+
     fn start_service(&mut self) -> Result<(), String> {
         match self.scm.start(SERVICE_NAME) {
             Ok(()) | Err(ScmError::AlreadyRunning) => {}
             Err(e) => return Err(format!("starting the service failed: {e}")),
         }
         let mut waited = Duration::ZERO;
+        let mut running_for: Option<Duration> = None;
         loop {
             match self.scm.status(SERVICE_NAME) {
-                Ok(s) if s.state == RunState::Running => return Ok(()),
+                Ok(s) if s.state == RunState::Running => {
+                    // R113: stay a few seconds to see it keep running.
+                    let since = *running_for.get_or_insert(waited);
+                    if waited.saturating_sub(since) >= self.soak {
+                        return Ok(());
+                    }
+                }
                 Ok(s) if s.state == RunState::Stopped => {
                     return Err(format!(
                         "the service stopped right after it started (exit code {}, service \
@@ -599,10 +631,15 @@ impl Registration for ScmRegistration<'_> {
                         s.win32_exit, s.specific_exit
                     ));
                 }
+                Ok(_) if running_for.is_some() => {
+                    return Err(format!(
+                        "the service left the running state right after it started. The                          Application event log, source {SERVICE_NAME}, says why"
+                    ));
+                }
                 Ok(_) => {}
                 Err(e) => return Err(format!("reading the service state failed: {e}")),
             }
-            if waited >= self.start_timeout {
+            if running_for.is_none() && waited >= self.start_timeout {
                 return Err(format!(
                     "the service did not report running within {} s. The Application event \
                      log, source {SERVICE_NAME}, may say why",

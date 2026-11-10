@@ -326,12 +326,33 @@ fn a_successful_uninstall_never_starts_our_service() {
 }
 
 #[test]
-fn uninstall_refuses_a_foreign_service_and_changes_nothing() {
+fn uninstall_restores_w32time_but_leaves_a_foreign_service_alone() {
+    // R113: the record still puts w32time back. Exit 31 comes after that.
+    let mut w = disabled_world_with_record();
+    w.reg.foreign = true;
+    w.reg.present = true;
+    assert_eq!(w.uninstall(), exit::FOREIGN_SERVICE);
+    assert!(!w.reg.stopped, "the foreign service is not stopped");
+    assert_eq!(w.reg.unregister_calls, 0);
+    assert_eq!(w.reg.start_calls, 0);
+    let back = w.w32time().unwrap();
+    assert_ne!(
+        back.start,
+        StartType::Disabled,
+        "w32time restored from the record"
+    );
+}
+
+#[test]
+fn a_failed_restore_ranks_above_a_foreign_service() {
     let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::missing());
     w.store = MemStore::with(Restore::new(StartType::Manual, true));
     w.reg.foreign = true;
-    assert_eq!(w.uninstall(), exit::FOREIGN_SERVICE);
-    assert!(!w.reg.stopped);
-    assert_eq!(w.reg.unregister_calls, 0);
-    assert!(!w.scm.mutated());
+    assert_eq!(w.uninstall(), exit::RESTORE);
+    assert!(
+        w.host.text().contains("services.msc"),
+        "m4: {}",
+        w.host.text()
+    );
 }

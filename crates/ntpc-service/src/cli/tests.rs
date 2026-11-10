@@ -143,6 +143,7 @@ struct FakeReg {
     unsafe_location: bool,
     foreign: bool,
     bad_owner: bool,
+    parked: bool,
     start_error: Option<String>,
     start_calls: u32,
     register_error: Option<String>,
@@ -169,6 +170,10 @@ impl Registration for FakeReg {
         } else {
             Ok(())
         }
+    }
+    fn park(&mut self) -> Result<(), String> {
+        self.parked = true;
+        Ok(())
     }
     fn check_ours(&self) -> Result<(), String> {
         if self.foreign {
