@@ -2,6 +2,7 @@
 //! It never touches the clock, the network or the file system.
 
 pub mod discipline;
+pub mod engine;
 mod error;
 pub mod filter;
 mod ports;
