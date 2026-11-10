@@ -25,7 +25,11 @@ What may and may not be claimed from the results is in the plan, section 1.
 This is a measurement on a real Windows machine. Follow these rules.
 
 - The sampler, the summary, `wait-synced.ps1` and every `w32tm /query`, `/dumpreg`, `/monitor` and `/stripchart` command are read only. They need no admin and change no state.
-- Three scripts change the machine: `apply-tuned-profile.ps1`, `disturb-clock.ps1` and `restore-clock.ps1`. Each refuses unless the environment variable `MEASURE_TEST_MACHINE` is `1`, and unless the session is elevated. Each supports `-WhatIf`. Set the variable only on a throwaway VM or a test machine, and only in that session.
+- Four scripts can change the machine: `apply-tuned-profile.ps1`, `disturb-clock.ps1`, `restore-clock.ps1` and `w32time-state.ps1 -Restore`. Each refuses unless ALL of these hold, in this order:
+  1. The environment variable `MEASURE_TEST_MACHINE` is `1`. Set it only on a throwaway VM or a test machine, and only in that session.
+  2. A second test-machine signal holds. It is read only. It is true when `Win32_ComputerSystem` reports a model or manufacturer that looks virtual (Virtual, VMware, KVM, QEMU, Hyper-V, Xen, innotek, Parallels, Red Hat), or when `MEASURE_I_AM_ON_A_TEST_MACHINE` is `1`. This is a heuristic. It is not proof. The `HypervisorPresent` property is not used, because it is also true on a physical host that runs virtualisation based security. Use the second variable on a physical test box.
+  3. The session is elevated.
+  Each supports `-WhatIf`. `disturb-clock.ps1` is capped at 2000 ms and refuses a larger value.
 - Anything that stops `w32time`, installs a service, sets the clock or changes the registry needs a throwaway VM or a test machine. Never run it on a machine that matters.
 - Do not run the load generator, a sleep test or a long run on a machine that must stay in use.
 
@@ -59,7 +63,7 @@ The first prints `Stratum`, `Root Delay`, `Root Dispersion` and `ReferenceId`. T
 | Delay spread (p95 minus p5) | 2 ms or less | the 30 samples |
 | Error rate | 0 of 30 | the 30 samples |
 | Anycast | Known and recorded. Prefer unicast | Operator documentation. Repeat the probe hours apart. A changed `ReferenceId` or a jump in delay suggests another machine |
-| Leap second smearing | Known and recorded. A smeared server disagrees with unsmeared ones by up to a fraction of a second around a leap second | Operator documentation. The owner must verify. UNVERIFIED here |
+| Leap second smearing | Known and recorded | Operator documentation. The owner must verify. UNVERIFIED here |
 | Rate limits | Policy read. The interval and two samplers fit inside it | Operator policy. Fast polling may be rate limited or get Kiss-of-Death. That shows as error rows |
 | Independence | Different operator from the contenders' sources and from the other reference | Operator documentation |
 
@@ -100,7 +104,7 @@ WARNING. This changes the machine. Test machine only. Microsoft marks these regi
 
 Values on a real machine can differ from the page defaults. Read them first (`w32tm /dumpreg /subkey:Config`, no admin needed).
 
-Apply and undo with the guarded script. Apply saves the current values, and the ones that were absent, to a JSON file and refuses to overwrite it. Undo restores recorded values and removes those that were absent. `reg import` cannot do that, because it does not remove a value that was absent before.
+Apply and undo with the guarded script. Apply saves the current values, and the ones that were absent, to a JSON file. It writes a temp file, moves it into place, reads it back and compares it before the first registry change, and it refuses to overwrite an existing file. If any later step fails, the script restores from that file by itself and exits 1. Undo restores recorded values and removes those that were absent, including `NtpServer` or `Type` when they were absent. `reg import` cannot do that, because it does not remove a value that was absent before.
 
 ```powershell
 reg export HKLM\SYSTEM\CurrentControlSet\Services\W32Time .\out\w32time-before.reg /y
@@ -111,6 +115,28 @@ $env:MEASURE_TEST_MACHINE = '1'
 ```
 
 After the undo, compare `w32tm /dumpreg /subkey:Config` and `/subkey:Parameters` with the "before" dumps.
+
+### The w32time start type
+
+Installing the service stops and disables `w32time`. The Meinberg installer stops it. Record the start type and the trigger info BEFORE the first contender that touches it, and restore them after each contender that stops or disables it. Never restore a guessed default: the start type may be delayed automatic, and `w32time` has service triggers.
+
+Record (read only, no admin). It writes a JSON record and a `reg export` of the W32Time key:
+
+```powershell
+sc.exe qc w32time
+sc.exe qtriggerinfo w32time
+.\scripts\w32time-state.ps1 -Record -File .\out\w32time-service-state.json
+```
+
+Both `sc.exe` queries ran without admin. The record holds the registry `Start` and `DelayedAutostart` values, the `sc.exe` keyword derived from them (`boot`, `system`, `auto`, `delayed-auto`, `demand` or `disabled`), whether the service was running, and the text of both queries.
+
+Restore (guarded, test machine only). It sets the recorded start type with `sc.exe config`, reads it back and compares the trigger info. A difference in the trigger info is an error and is never guessed. The fix is then `reg import` of the saved `.reg` file and a reboot. `-StartIfWasRunning` starts the service again when it was running.
+
+```powershell
+$env:MEASURE_TEST_MACHINE = '1'
+.\scripts\w32time-state.ps1 -Restore -File .\out\w32time-service-state.json -WhatIf
+.\scripts\w32time-state.ps1 -Restore -File .\out\w32time-service-state.json -StartIfWasRunning
+```
 
 ### Meinberg NTP (optional)
 
@@ -162,6 +188,8 @@ Check it from the data, per contender: compare the median of the dropped part wi
 | VM idle, with `free-run` | 5 | 30 min | 4 | 10 |
 | Long run, 24 h each for default, service, free-run | 3 | 24 h | 1 | 72 |
 | Switching and checks, about 10 minutes for each of 84 blocks | | | | 14 |
+| Meinberg as a fifth contender (optional): one more block per round in every case, about 0.5 h x 4 rounds for idle, load, disturbance and VM, 0.75 h x 4 for sleep, plus a 24 h long run | | | | about 35 (4 rounds, seeded order) |
+| Meinberg with a Williams design: 10 rounds of 5 blocks instead of 4 | | | | about 15 more per 30 minute case |
 | Total | | | | about 132 |
 
 That is about 5.5 days. The minimum useful set is idle, load, disturbed clock and the long run for default, service and free-run.
@@ -188,7 +216,7 @@ Sample size, honestly: 4 rounds of 120 primary samples is 480 per contender per 
 
 ### Idle
 
-Nothing else running. Sleep disabled. Record the CSVs, the state files (section 9) and the service status output at the start, middle and end of each block.
+Nothing else running. Sleep disabled. Record the CSVs, the state files (section 8) and the service status output at the start, middle and end of each block.
 
 ### CPU load
 
@@ -220,9 +248,13 @@ $jobs | Remove-Job
 ### Sleep and resume
 
 - Sleep by hand from the Start menu. Do not script hibernation.
-- Per block, 3 cycles of 5 minutes awake and 10 minutes asleep.
+- The order inside a block is fixed. The sampler starts and takes ONE sample while awake. Then three times: sleep for 10 minutes, wake, stay awake for 5 minutes. That gives 3 wakes per block, so 12 wake events per contender over 4 rounds.
+- The sample count is 180: 1 sample before the first sleep, then 179 across the three awake segments. The last awake segment ends about 5 s short of 5 minutes, and the block ends when the 180th sample is taken.
 - Start both samplers once per block. They continue after resume. A gap in `utc_iso` marks each sleep.
-- The summary finds each wake: the first row after a gap longer than 120 s. Recovery time is from that row to the first row that starts 3 consecutive good rows below 10 ms. An error row breaks the run. No hand-typed wake time is used.
+- The summary finds each wake: the first row after a gap longer than 120 s. A network that is not up yet often gives an error row first, so the event time is the first GOOD row after the gap. Recovery time is from that row to the first row that starts 3 consecutive good rows below 10 ms. An error row breaks the run. No hand-typed wake time is used.
+- Each wake has its own window. It ends at the next gap or at the end of the block. A recovery is credited only when it is seen inside its own window. A wake that does not recover inside its 5 minutes is unrecovered, and a later wake cannot rescue it. A wake with no good row at all before the next gap is unrecovered.
+- Only the gap detector runs on sleep cases. The step detector does not.
+- A sleep block must hold 3 wake events on each reference. The summary prints `events expected 3 found N` for every block and flags a block with another count. The flagged round is excluded and the line is printed, never dropped silently.
 
 ### Virtual machine
 
@@ -245,7 +277,7 @@ $env:MEASURE_TEST_MACHINE = '1'
 .\scripts\disturb-clock.ps1 -Milliseconds -2000
 ```
 
-3. Watch for the other 20 minutes. The summary finds the step by itself: the first good row above 100 ms after a good row at or below 10 ms. Error rows in between are skipped. Recovery is measured from that row. Sample timestamps come from the clock under test, so a second step by the contender moves them by up to the step size.
+3. Watch for the other 20 minutes. The summary finds the step by itself: the first good row above 100 ms after a good row at or below 10 ms. Error rows in between are skipped. Recovery is measured from that row, and must be seen before the end of the block. Only the step detector runs on disturbance cases. A disturbance block must hold 1 step event on each reference. A block with no step seen (the contender corrected before the next sample) is flagged as `event count`, and its round is excluded and listed. Sample timestamps come from the clock under test, so a second step by the contender moves them by up to the step size.
 4. A 2 s error is above the service step threshold of 128 ms (spec). `w32time` steps above its `MaxAllowedPhaseOffset` (the Microsoft page gives 1 s for stand-alone).
 5. A 50 ms disturbance is exploratory. It tests slewing.
 
@@ -254,7 +286,7 @@ $env:MEASURE_TEST_MACHINE = '1'
 A contender that has not recovered in the 20 minutes would leave the clock about 2 s off for the next block. After EVERY disturbance block:
 
 1. Stop the contender, so it does not fight the reset.
-2. Step the clock back to the first reference. The script reads 5 samples (read only), takes the median offset, refuses a step above 10 s, and steps by it. A positive offset moves the clock forward.
+2. Step the clock back to the first reference. The script reads 5 samples (read only), needs MORE than half of them to be good, takes the median offset, refuses a step above 10 s (a hard cap, not a parameter you can raise), and steps by it. A positive offset moves the clock forward.
 
 ```powershell
 $env:MEASURE_TEST_MACHINE = '1'
@@ -276,7 +308,7 @@ Exit 0 means synced. Exit 3 means the start is not clean. The next block must th
 
 ## 7. The sampler and the summary
 
-Files: `scripts/measure-offset.ps1`, `scripts/summarise-offset.ps1`, `scripts/wait-synced.ps1`, `scripts/offset-lib.ps1` (shared functions), the three guarded helpers above, and `scripts/test-measure.ps1`.
+Files: `scripts/measure-offset.ps1`, `scripts/summarise-offset.ps1`, `scripts/wait-synced.ps1`, `scripts/offset-lib.ps1` and `scripts/w32time-lib.ps1` (shared functions), the four guarded helpers above, and `scripts/test-measure.ps1`.
 
 ### Sampler
 
@@ -321,37 +353,31 @@ CSV columns: `utc_iso, contender, case, reference, offset_s, delay_s, error, rou
 .\scripts\summarise-offset.ps1 .\out\*.csv -DropSeconds 600 -Primary <REF_A_IP> -IncludeFlagged
 ```
 
-It prints, in order: the flagged blocks and the excluded rounds, the five PRIMARY verdict lines, and then the exploratory tables (blocks, pooled, comparison, agreement, recovery). The meaning of each is in the plan. Slope is not printed for event cases, because a per-block slope there is dominated by the disturbance. Medians are interpolated. p5, p95 and p99 use nearest rank. A CSV without a `round` column is read as round 0 with a warning.
+It prints, in order: the flagged blocks and the excluded rounds, the five PRIMARY verdict lines, and then the exploratory tables (blocks, pooled, comparison, agreement, recovery, events per block). The `-Part washout` and `-Part all` views print `NOT PRIMARY` instead of the primary heading. The meaning of each is in the plan. Slope is not printed for event cases, because a per-block slope there is dominated by the disturbance. Medians are interpolated. p5, p95 and p99 use nearest rank. A CSV without a `round` column is read as round 0 with a warning.
+
+Flags (each excludes the case and round for every contender, and is printed): `DISAGREE` (references differ by more than 2 ms in a block), `no second reference`, `no data from a reference`, `start not clean` (a block label ending `-unclean`), `event count` (a sleep or disturbance block with the wrong number of events), `reference errors` (the reference shows more than 5 percent errors in the baseline or A/A blocks of that case and round, which is attributed to the reference or the host and not to a contender) and `excluded by file`.
+
+Invalid blocks are never removed by deleting CSV files. Write them in an exclusion file and pass it with `-ExcludeBlocks`. The file is a CSV with the columns `case,round,block,contender,reason`. Every entry needs a reason. The entries and reasons are printed in the output and the appendix. An entry that matches no block prints a warning.
+
+```powershell
+.\scripts\summarise-offset.ps1 .\out\*.csv -DropSeconds 600 -Primary <REF_A_IP> -ExcludeBlocks .\out\excluded-blocks.csv
+```
 
 ### Tests
 
 `powershell -NoProfile -File scripts\test-measure.ps1` runs with no network. It covers the parser, the CSV rows, validation, `Invoke-Measure` against a stand-in for `w32tm`, every summary statistic against hand-computed values, the verdict rules, the exclusion of flagged blocks, recovery with unrecovered events, `wait-synced.ps1`, the restore arithmetic, and that each dangerous helper refuses without `MEASURE_TEST_MACHINE`. Pester 3.4.0 is the only version installed here, so plain checks are used.
 
-## 8. Reporting
+## 8. Checklist for the person running it
 
-The report format, the table and the rules for reporting losses are in the plan, sections 6 and 7.
+Machine, network and VM:
 
-## 9. Checklist for the person running it
-
-Machine and system:
-
-- [ ] Throwaway VM or a test machine for everything that stops `w32time`, installs a service or sets the clock.
-- [ ] Not domain-joined. Group Policy may restart `w32time` and change its settings.
-- [ ] Windows build: `(Get-CimInstance Win32_OperatingSystem).Version`. CPU, cores, RAM, VM or not.
-- [ ] Power plan fixed: `powercfg /getactivescheme`. Same for every run. No sleep or hibernate in blocks that should not sleep. Time zone is irrelevant because everything is UTC.
-- [ ] Antivirus and updates: no scan or Windows Update during a block. Record the policy.
-- [ ] No other time tool installed. No VPN that moves the route during a block.
-
-Network:
-
-- [ ] Wired if possible. No Wi-Fi roaming. No large transfers during blocks.
-- [ ] UDP 123 outbound open. The sampler uses an ephemeral source port. `w32time` uses 123 (Microsoft page).
+- [ ] Throwaway VM or a test machine for everything that stops `w32time`, installs a service or sets the clock. Not domain-joined, because Group Policy may restart `w32time`.
+- [ ] Windows build (`(Get-CimInstance Win32_OperatingSystem).Version`), CPU, cores, RAM, VM or not. Host load and hypervisor version for a VM.
+- [ ] Power plan fixed (`powercfg /getactivescheme`) and the same for every run. No sleep or hibernate in blocks that should not sleep. Time zone is irrelevant because everything is UTC.
+- [ ] No scan or Windows Update during a block. No other time tool installed. No VPN that moves the route.
+- [ ] Wired if possible, no large transfers during blocks. UDP 123 outbound open (the sampler uses an ephemeral source port, `w32time` uses 123).
 - [ ] Both reference IPs, probe results and operator facts (anycast, smearing, rate limits) recorded.
-
-VM:
-
-- [ ] Hypervisor time sync off, or documented. `Source` in `w32tm /query /status` is not the VM provider.
-- [ ] Host load and hypervisor version recorded.
+- [ ] VM: hypervisor time sync off, or documented. `Source` in `w32tm /query /status` is not the VM provider.
 
 Software under test:
 
@@ -365,7 +391,8 @@ w32tm /dumpreg /subkey:Config     | Out-File .\out\r1-B1-state.txt -Append
 w32tm /dumpreg /subkey:Parameters | Out-File .\out\r1-B1-state.txt -Append
 ```
 
-- [ ] `w32tm /query /configuration` needs admin (Access denied unelevated).
+- [ ] The w32time start type and trigger info recorded once per machine, before the first contender that stops or disables `w32time`: `sc.exe qc w32time`, `sc.exe qtriggerinfo w32time`, `reg export HKLM\SYSTEM\CurrentControlSet\Services\W32Time .\out\w32time-before.reg /y`, and `w32time-state.ps1 -Record`. All run without admin.
+- [ ] After each contender that stops or disables `w32time` (the service install, the Meinberg installer, `free-run`), restore the recorded start type with `w32time-state.ps1 -Restore` and check it with `sc.exe qc w32time`. A trigger info difference stops the run until it is fixed.
 - [ ] The service's own view of its offset and source list, copied at the start, middle and end of each block. The design leaves the status command and log format open (spec). Record whatever it prints with the time and compare its offset with the external reference columns.
 - [ ] Wash-out recorded and checked (section 5).
 - [ ] The service log shows no panic, no refused step and no `w32time` conflict during the block. A conflict makes the block invalid.
@@ -379,7 +406,7 @@ During a block:
 - [ ] After the block, run the summary, check the error rate and the flagged blocks, keep the CSVs.
 - [ ] After a disturbance block, do the reset in section 6 before the next block.
 
-Invalid block (exclude, say so in the report, never because it is an outlier):
+Invalid block (exclude it through the exclusion file with the reason, say so in the report, never because it is an outlier and never by deleting a CSV):
 
 - A reference changed address or was down for more than 5 percent of samples.
 - Another time tool or Group Policy changed the clock.
@@ -389,9 +416,6 @@ Invalid block (exclude, say so in the report, never because it is an outlier):
 
 ## Sources and unverified items
 
-- `w32tm /?` on Windows 11: `/stripchart`, `/rdtsc`, `/packetinfo`, `/config`, `/dumpreg`, `/query`, `/monitor`, checked by running them.
-- [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings): `/stripchart` and `/rdtsc` columns, the registry settings and defaults, the `NtpServer` flags, UDP 123.
-- Observed by running read-only commands: the `/rdtsc` row format, the `error: 0x800705B4` timeout form, the plain `HH:MM:SS, error: 0x...` form, the `/packetinfo` and `/monitor` output, `w32tm /dumpreg`, `/query /status`, `/query /peers` and `reg export` without admin, `/query /configuration` denied without admin.
-- Offset sign: verified independently with a raw NTP exchange.
+Sources: `w32tm /?` on Windows 11, checked by running each command, and [Windows Time Service Tools and Settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings). Observed by running read-only commands: the `/rdtsc` and plain row formats, the timeout form `error: 0x800705B4`, the `/packetinfo` and `/monitor` output, and that `/dumpreg`, `/query /status`, `/query /peers`, `reg export`, `sc.exe qc` and `sc.exe qtriggerinfo` run without admin. The offset sign was verified independently with a raw NTP exchange.
 
 Unverified: that the tuned profile improves sync, the meaning of a `d` suffix, Meinberg steps, hypervisor settings other than Hyper-V, that the half-delay bound applies as stated to `w32tm` offsets, leap second smearing and rate limits for any given server, that `w32time-default` can converge inside a 30 minute block.

@@ -48,7 +48,12 @@ param(
     [double]$GapSeconds = 120,
     [double]$StepMs = 100,
     [double]$RecoveryMinPeriods = 2,
-    [string[]]$RecoveryCases = @('sleep*', 'disturb*')
+    [string[]]$SleepCases = @('sleep*'),
+    [string[]]$DisturbCases = @('disturb*'),
+    [int]$ExpectedSleepEvents = 3,
+    [int]$ExpectedDisturbEvents = 1,
+    [double]$RefErrPct = 5,
+    [string]$ExcludeBlocks = ''
 )
 
 Set-StrictMode -Version Latest
@@ -97,6 +102,7 @@ function R3($v) {
     return [math]::Round($d, 3)
 }
 
+function Get-EventCases { @($SleepCases) + @($DisturbCases) }
 function Test-CaseLike { param([string]$Case, [string[]]$Patterns) @($Patterns | Where-Object { $Case -like $_ }).Count -gt 0 }
 
 function ConvertTo-TypedRows {
@@ -145,7 +151,7 @@ function Get-PartByBlock {
 
 function Get-BlockFlags {
     # One row per flagged block. Uses the primary part (event and long cases use every row).
-    param([object[]]$Rows, [double]$Drop, [double]$AgreeMs)
+    param([object[]]$Rows, [double]$Drop, [double]$AgreeMs, [object[]]$Events = @())
     $flags = @()
     $partRows = @(Get-PartByBlock -Rows $Rows -Drop $Drop -Which 'primary')
     $blocks = @($Rows | Group-Object { "$($_.Contender)|$($_.Case)|$($_.Round)|$($_.Block)" } | Sort-Object Name)
@@ -179,6 +185,25 @@ function Get-BlockFlags {
             }
         }
     }
+    # The number of events a block must hold. A block with another count is flagged, never dropped silently.
+    foreach ($g in ($Rows | Where-Object { Test-CaseLike $_.Case (Get-EventCases) } | Group-Object { "$($_.Contender)|$($_.Case)|$($_.Round)|$($_.Block)" } | Sort-Object Name)) {
+        $f = $g.Group[0]
+        $exp = if (Test-CaseLike $f.Case $SleepCases) { $ExpectedSleepEvents } else { $ExpectedDisturbEvents }
+        foreach ($ref in @($g.Group | Select-Object -ExpandProperty Ref -Unique | Sort-Object)) {
+            $found = @($Events | Where-Object { $_.contender -eq $f.Contender -and $_.case -eq $f.Case -and $_.round -eq $f.Round -and $_.block -eq $f.Block -and $_.reference -eq $ref }).Count
+            if ($found -ne $exp) {
+                $flags += [pscustomobject][ordered]@{ case = $f.Case; round = $f.Round; block = $f.Block; contender = $f.Contender; flag = 'event count'; detail = "events expected $exp found $found on $ref"; id = "$($f.Case) round $($f.Round) block $($f.Block) $($f.Contender)" }
+            }
+        }
+    }
+    # A reference that fails in the baseline or A/A blocks is attributed to the reference, not the contender.
+    foreach ($g in ($Rows | Where-Object { $_.Contender -eq $Baseline -or $_.Contender -eq "$Baseline-aa" } | Group-Object { "$($_.Contender)|$($_.Case)|$($_.Round)|$($_.Block)|$($_.Ref)" } | Sort-Object Name)) {
+        $f = $g.Group[0]
+        $pct = 100.0 * @($g.Group | Where-Object { -not $_.Good }).Count / $g.Group.Count
+        if ($pct -gt $RefErrPct) {
+            $flags += [pscustomobject][ordered]@{ case = $f.Case; round = $f.Round; block = $f.Block; contender = $f.Contender; flag = 'reference errors'; detail = "$($f.Ref) $([math]::Round($pct, 1)) % over $RefErrPct %"; id = "$($f.Case) round $($f.Round) block $($f.Block) $($f.Contender)" }
+        }
+    }
     $flags
 }
 
@@ -193,7 +218,7 @@ function Get-BlockTable {
         $abs = @(Get-AbsMs $use | Sort-Object)
         $dl = @($good | Where-Object { $null -ne $_.Delay } | ForEach-Object { $_.Delay * 1000.0 } | Sort-Object)
         $slope = $null
-        if ($good.Count -ge 3 -and -not (Test-CaseLike $g[0].Case $RecoveryCases)) {
+        if ($good.Count -ge 3 -and -not (Test-CaseLike $g[0].Case (Get-EventCases))) {
             $t0 = $good[0].T
             $slope = Get-SlopePpm -T @($good | ForEach-Object { ($_.T - $t0).TotalSeconds }) -Y @($good | ForEach-Object { $_.Offset })
         }
@@ -252,38 +277,55 @@ function Get-PooledTable {
 }
 
 function Get-RecoveryTable {
-    # Events: a gap in sample times (wake from sleep) or a step in the offset (clock set wrong).
-    # Step rule: the previous GOOD row is at or below the limit and the next GOOD row is above the
-    # step size. Error rows between them are skipped. The event row is that next good row.
-    # Recovery: the first row that starts Consecutive good rows below the limit. An error row breaks the run.
-    param([object[]]$Rows, [string[]]$Cases, [double]$LimitMs, [int]$Consecutive, [double]$GapSeconds, [double]$StepMs)
+    # Sleep cases: a wake is a gap in the sample times. The event row is the first GOOD row after the gap.
+    # Disturbance cases: a step is a good row above the step size after a good row at or below the limit.
+    # Error rows between them are skipped. Only these detectors run, one per case type.
+    # Recovery: the first row that starts Consecutive good rows below the limit, found INSIDE the event's own
+    # window. The window ends at the next wake gap, the next step, or the end of the block. A recovery that
+    # is not seen inside the window is not recovered, and is never credited from a later window.
+    param([object[]]$Rows, [string[]]$SleepCases, [string[]]$DisturbCases, [double]$LimitMs, [int]$Consecutive, [double]$GapSeconds, [double]$StepMs)
     $limit = $LimitMs / 1000.0
     $step = $StepMs / 1000.0
     $out = @()
-    $pick = @($Rows | Where-Object { Test-CaseLike $_.Case $Cases })
+    $pick = @($Rows | Where-Object { (Test-CaseLike $_.Case $SleepCases) -or (Test-CaseLike $_.Case $DisturbCases) })
     foreach ($g in ($pick | Group-Object { Get-GroupKey $_ } | Sort-Object Name)) {
         $r = @($g.Group)
         $n = $r.Count
+        $isSleep = Test-CaseLike $r[0].Case $SleepCases
         $events = @()
-        $gapAt = @{}
-        for ($i = 1; $i -lt $n; $i++) {
-            if (($r[$i].T - $r[$i - 1].T).TotalSeconds -gt $GapSeconds) { $events += [pscustomobject]@{ Idx = $i; Type = 'gap' }; $gapAt[$i] = $true }
+        if ($isSleep) {
+            $gaps = @(for ($i = 1; $i -lt $n; $i++) { if (($r[$i].T - $r[$i - 1].T).TotalSeconds -gt $GapSeconds) { $i } })
+            for ($q = 0; $q -lt $gaps.Count; $q++) {
+                $winEnd = if ($q + 1 -lt $gaps.Count) { $gaps[$q + 1] - 1 } else { $n - 1 }
+                $first = -1
+                for ($i = $gaps[$q]; $i -le $winEnd; $i++) { if ($r[$i].Good) { $first = $i; break } }
+                if ($first -ge 0) { $events += [pscustomobject]@{ Idx = $first; End = $winEnd; Type = 'wake'; Seen = $true } }
+                else { $events += [pscustomobject]@{ Idx = $gaps[$q]; End = $winEnd; Type = 'wake'; Seen = $false } }
+            }
         }
-        $goodIdx = @(for ($i = 0; $i -lt $n; $i++) { if ($r[$i].Good) { $i } })
-        for ($k = 1; $k -lt $goodIdx.Count; $k++) {
-            $a = $goodIdx[$k - 1]; $b = $goodIdx[$k]
-            if ($gapAt.ContainsKey($b)) { continue }
-            if ([math]::Abs($r[$a].Offset) -le $limit -and [math]::Abs($r[$b].Offset) -gt $step) { $events += [pscustomobject]@{ Idx = $b; Type = 'step' } }
+        else {
+            $goodIdx = @(for ($i = 0; $i -lt $n; $i++) { if ($r[$i].Good) { $i } })
+            $steps = @()
+            for ($k = 1; $k -lt $goodIdx.Count; $k++) {
+                $a = $goodIdx[$k - 1]; $b = $goodIdx[$k]
+                if ([math]::Abs($r[$a].Offset) -le $limit -and [math]::Abs($r[$b].Offset) -gt $step) { $steps += $b }
+            }
+            for ($q = 0; $q -lt $steps.Count; $q++) {
+                $winEnd = if ($q + 1 -lt $steps.Count) { $steps[$q + 1] - 1 } else { $n - 1 }
+                $events += [pscustomobject]@{ Idx = $steps[$q]; End = $winEnd; Type = 'step'; Seen = $true }
+            }
         }
-        foreach ($e in @($events | Sort-Object Idx)) {
+        foreach ($e in $events) {
             $idx = $e.Idx
             $rec = $script:Inf
-            for ($j = $idx; $j -le $n - $Consecutive; $j++) {
-                $ok = $true
-                for ($k = 0; $k -lt $Consecutive; $k++) {
-                    if (-not ($r[$j + $k].Good -and [math]::Abs($r[$j + $k].Offset) -lt $limit)) { $ok = $false; break }
+            if ($e.Seen) {
+                for ($j = $idx; $j -le $e.End - $Consecutive + 1; $j++) {
+                    $ok = $true
+                    for ($k = 0; $k -lt $Consecutive; $k++) {
+                        if (-not ($r[$j + $k].Good -and [math]::Abs($r[$j + $k].Offset) -lt $limit)) { $ok = $false; break }
+                    }
+                    if ($ok) { $rec = ($r[$j].T - $r[$idx].T).TotalSeconds; break }
                 }
-                if ($ok) { $rec = ($r[$j].T - $r[$idx].T).TotalSeconds; break }
             }
             $f = $r[0]
             $out += [pscustomobject][ordered]@{
@@ -369,13 +411,20 @@ function Get-Verdict {
     $all = { param($u) @($u.Keys | ForEach-Object { $u[$_] } | ForEach-Object { $_ }) }
     $vx = @(& $all $ux); $vb = @(& $all $ub)
     $res.x_pooled = Get-Median $vx; $res.base_pooled = Get-Median $vb
+    if ($ua.Count -eq 0) { return (& $fin 'no noise floor, cannot call' "There is no $Baseline-aa twin in case $Case, so the noise floor is unknown. No verdict is given.") }
+    $va = @(& $all $ua)
     $unrX = @($vx | Where-Object { [double]::IsPositiveInfinity($_) }).Count
     $unrB = @($vb | Where-Object { [double]::IsPositiveInfinity($_) }).Count
-    $res.unrecovered = "$unrX of $($vx.Count) versus $unrB of $($vb.Count)"
-    if ($Metric -eq 'recovery' -and $unrX -gt $unrB) {
-        return (& $fin 'worse' "$Name did not recover in $unrX of $($vx.Count) events and $Baseline did not in $unrB of $($vb.Count). An unrecovered event counts as a loss.")
+    $unrA = @($va | Where-Object { [double]::IsPositiveInfinity($_) }).Count
+    $res.unrecovered = "$unrX of $($vx.Count) versus $unrB of $($vb.Count) (A/A twin $unrA of $($va.Count))"
+    if ($Metric -eq 'recovery') {
+        # An unrecovered event is a loss when the service has more of them than the baseline by more than
+        # the A/A pair differ in their own unrecovered counts.
+        $unrNoise = [math]::Abs($unrB - $unrA)
+        if (($unrX - $unrB) -gt $unrNoise) {
+            return (& $fin 'worse' "$Name did not recover in $unrX of $($vx.Count) events and $Baseline did not in $unrB of $($vb.Count). The A/A twin differs by $unrNoise unrecovered events, so the excess of $($unrX - $unrB) is a loss.")
+        }
     }
-    if ($ua.Count -eq 0) { return (& $fin 'no noise floor, cannot call' "There is no $Baseline-aa twin in case $Case, so the noise floor is unknown. No verdict is given.") }
     $roundsXB = @($ux.Keys | Where-Object { $ub.ContainsKey($_) } | Sort-Object)
     $res.rounds_compared = $roundsXB.Count
     if ($roundsXB.Count -lt $MinRounds) { return (& $fin 'not enough rounds' "Only $($roundsXB.Count) common rounds. At least $MinRounds are needed.") }
@@ -397,9 +446,23 @@ function Get-Verdict {
     $same = if ($diff -lt 0) { $neg } else { $pos }
     $need = if ($MinSignRounds -gt 0) { $MinSignRounds } else { $diffs.Count }
     $res.same_sign_rounds = "$same of $($diffs.Count)"
-    $why = "pooled $(R3 $res.x_pooled) $unit versus $(R3 $res.base_pooled) $unit, difference $(R3 $diff) $unit, threshold $(R3 $thr) $unit, A/A noise floor $(R3 $noise) $unit, same sign in $same of $($diffs.Count) rounds"
+    # Error rate. For load, the rise from idle is compared. The limit is the larger of -ErrPp and the
+    # A/A twin's own gap. It is judged for ties and wins alike, and a worse rate makes the verdict mixed.
+    $useRise = ($Case -like 'load*') -and ($null -ne (Get-ErrPct $Rows 'idle' $Ref $Name)) -and ($null -ne (Get-ErrPct $Rows 'idle' $Ref $Baseline)) -and ($null -ne (Get-ErrPct $Rows 'idle' $Ref "$Baseline-aa"))
+    $er = { param($n) $p = Get-ErrPct $Rows $Case $Ref $n; if ($useRise) { $p - (Get-ErrPct $Rows 'idle' $Ref $n) } else { $p } }
+    $ex = & $er $Name; $eb = & $er $Baseline; $ea = & $er "$Baseline-aa"
+    $ed = $ex - $eb
+    $ethr = [math]::Max($ErrPp, [math]::Abs($eb - $ea))
+    $res.error_pct_diff = $ed
+    $note = if ($useRise) { ' (rise from idle compared with the baseline rise)' } elseif ($Case -like 'load*') { ' (no idle data for the load rule)' } else { '' }
+    $errText = "the error rate is higher by $(R3 $ed) points, limit $(R3 $ethr) points$note"
+    $errBad = $ed -gt $ethr
+    $why = "pooled $(R3 $res.x_pooled) $unit versus $(R3 $res.base_pooled) $unit, difference $(R3 $diff) $unit, threshold $(R3 $thr) $unit, A/A noise floor $(R3 $noise) $unit, same sign in $same of $($diffs.Count) rounds, error rate $(R3 (Get-ErrPct $Rows $Case $Ref $Name)) % versus $(R3 (Get-ErrPct $Rows $Case $Ref $Baseline)) %$note"
     $meaningful = ([math]::Abs($diff) -ge $thr) -and ([math]::Abs($diff) -gt $noise) -and ($diffs.Count -ge $MinRounds) -and ($same -ge $need)
-    if (-not $meaningful) { return (& $fin 'no meaningful difference' $why) }
+    if (-not $meaningful) {
+        if ($errBad) { return (& $fin 'mixed' ($why + ". No meaningful difference in the median, but $errText")) }
+        return (& $fin 'no meaningful difference' $why)
+    }
     if ($diff -gt 0) { return (& $fin 'worse' $why) }
     # A better median is a win only when the p99 and the error rate do not object.
     $extra = @()
@@ -408,15 +471,7 @@ function Get-Verdict {
         $res.diff_p99_ms = $px - $pb
         if (($px - $pb) -gt [math]::Max($MinAbsMs, $MinRel * $pb)) { $extra += "p99 is worse by $(R3 ($px - $pb)) ms" }
     }
-    $ex = Get-ErrPct $Rows $Case $Ref $Name; $eb = Get-ErrPct $Rows $Case $Ref $Baseline
-    $ed = $ex - $eb
-    $note = ''
-    if ($Case -like 'load*') {
-        $ix = Get-ErrPct $Rows 'idle' $Ref $Name; $ib = Get-ErrPct $Rows 'idle' $Ref $Baseline
-        if ($null -ne $ix -and $null -ne $ib) { $ed = ($ex - $ix) - ($eb - $ib); $note = ' (rise from idle compared with the baseline rise)' } else { $note = ' (no idle data for the load rule)' }
-    }
-    $res.error_pct_diff = $ed
-    if ($ed -gt $ErrPp) { $extra += "error rate is higher by $(R3 $ed) points$note" }
+    if ($errBad) { $extra += $errText }
     if ($extra.Count -gt 0) { return (& $fin 'mixed' ($why + '. Median is better but ' + ($extra -join ' and '))) }
     return (& $fin 'better' $why)
 }
@@ -428,7 +483,7 @@ function Get-ComparisonTable {
     foreach ($case in @($Rows | Select-Object -ExpandProperty Case -Unique | Sort-Object)) {
         $refs = @($Rows | Where-Object { $_.Case -eq $case } | Select-Object -ExpandProperty Ref -Unique | Sort-Object)
         $ref = if ($Primary -and ($refs -contains $Primary)) { $Primary } else { $refs[0] }
-        $metrics = @('abs'); if (Test-CaseLike $case $RecoveryCases) { $metrics = @('recovery') }
+        $metrics = @('abs'); if (Test-CaseLike $case (Get-EventCases)) { $metrics = @('recovery') }
         foreach ($name in @($Rows | Where-Object { $_.Case -eq $case -and $_.Ref -eq $ref } | Select-Object -ExpandProperty Contender -Unique | Sort-Object)) {
             if ($name -eq $Baseline) { continue }
             foreach ($m in $metrics) {
@@ -498,14 +553,49 @@ function Format-SummaryText {
     $out -join "`n"
 }
 
+function Read-ExcludeFile {
+    # CSV with the columns case, round, block, contender, reason. Every entry needs a reason.
+    param([string]$File)
+    if (-not (Test-Path -LiteralPath $File)) { throw "exclusion file not found: $File" }
+    $r = @(Import-Csv -LiteralPath $File)
+    foreach ($col in 'case', 'round', 'block', 'contender', 'reason') {
+        if ($r.Count -eq 0 -or $r[0].PSObject.Properties.Name -notcontains $col) { throw "exclusion file lacks column $col or has no rows: $File" }
+    }
+    foreach ($e in $r) {
+        if ([string]::IsNullOrWhiteSpace($e.reason)) { throw "exclusion file entry $($e.case) round $($e.round) block $($e.block) $($e.contender) has no reason" }
+        $x = 0; if (-not [int]::TryParse($e.round, [ref]$x)) { throw "exclusion file round is not a number: $($e.round)" }
+    }
+    $r
+}
+
+function Get-FileFlags {
+    param([object[]]$Rows, [object[]]$Entries)
+    foreach ($e in $Entries) {
+        $m = @($Rows | Where-Object { $_.Case -eq $e.case -and $_.Round -eq [int]$e.round -and $_.Block -eq $e.block -and $_.Contender -eq $e.contender })
+        if ($m.Count -eq 0) { Write-Warning "summarise-offset: exclusion entry matches no block: $($e.case) round $($e.round) block $($e.block) $($e.contender)"; continue }
+        [pscustomobject][ordered]@{ case = $e.case; round = [int]$e.round; block = $e.block; contender = $e.contender; flag = 'excluded by file'; detail = $e.reason; id = "$($e.case) round $($e.round) block $($e.block) $($e.contender)" }
+    }
+}
+
+function Get-EventCountTable {
+    param([object[]]$Rows, [object[]]$Events)
+    foreach ($g in ($Rows | Where-Object { Test-CaseLike $_.Case (Get-EventCases) } | Group-Object { Get-GroupKey $_ } | Sort-Object Name)) {
+        $f = $g.Group[0]
+        $exp = if (Test-CaseLike $f.Case $SleepCases) { $ExpectedSleepEvents } else { $ExpectedDisturbEvents }
+        $found = @($Events | Where-Object { $_.contender -eq $f.Contender -and $_.case -eq $f.Case -and $_.round -eq $f.Round -and $_.block -eq $f.Block -and $_.reference -eq $f.Ref }).Count
+        [pscustomobject][ordered]@{ contender = $f.Contender; case = $f.Case; reference = $f.Ref; round = $f.Round; block = $f.Block; events_expected = $exp; events_found = $found; ok = $(if ($found -eq $exp) { 'yes' } else { 'NO' }) }
+    }
+}
+
 function Get-OffsetReport {
-    param([object[]]$Rows)
-    $flags = @(Get-BlockFlags -Rows $Rows -Drop $DropSeconds -AgreeMs $AgreeMs)
+    param([object[]]$Rows, [object[]]$ExcludeEntries = @())
+    $allEvents = @(Get-RecoveryTable -Rows $Rows -SleepCases $SleepCases -DisturbCases $DisturbCases -LimitMs $LimitMs -Consecutive $Consecutive -GapSeconds $GapSeconds -StepMs $StepMs)
+    $flags = @(Get-BlockFlags -Rows $Rows -Drop $DropSeconds -AgreeMs $AgreeMs -Events $allEvents) + @(Get-FileFlags -Rows $Rows -Entries $ExcludeEntries)
     $excl = @($flags | ForEach-Object { "$($_.case)|$($_.round)" } | Select-Object -Unique)
     $use = @($Rows | Where-Object { $IncludeFlagged -or ($excl -notcontains "$($_.Case)|$($_.Round)") })
+    $events = @($allEvents | Where-Object { $IncludeFlagged -or ($excl -notcontains "$($_.case)|$($_.round)") })
     $blocks = @(Get-BlockTable -Rows $use -Drop $DropSeconds -Which $Part)
     $partRows = @(Get-PartByBlock -Rows $use -Drop $DropSeconds -Which $Part)
-    $events = @(Get-RecoveryTable -Rows $use -Cases $RecoveryCases -LimitMs $LimitMs -Consecutive $Consecutive -GapSeconds $GapSeconds -StepMs $StepMs)
     [pscustomobject]@{
         Flags = $flags
         ExcludedRounds = $(if ($IncludeFlagged) { @() } else { $excl })
@@ -514,6 +604,7 @@ function Get-OffsetReport {
         Pooled = @(Get-PooledTable -Rows $use -Blocks $blocks -Drop $DropSeconds -Which $Part)
         Comparison = @(Get-ComparisonTable -Rows $partRows -Events $events -Primary $Primary -Baseline $Baseline)
         Agreement = @(Get-AgreementTable -Rows $Rows -Drop $DropSeconds -Which $Part -AgreeMs $AgreeMs)
+        EventCounts = @(Get-EventCountTable -Rows $Rows -Events $allEvents)
         Recovery = $events
         RecoverySummary = @(Get-RecoverySummary $events)
     }
@@ -539,7 +630,12 @@ function Invoke-Summarise {
         }
         $rows += @(ConvertTo-TypedRows -Csv $r)
     }
-    $rep = Get-OffsetReport -Rows $rows
+    $entries = @()
+    if ($ExcludeBlocks) {
+        try { $entries = @(Read-ExcludeFile -File $ExcludeBlocks) }
+        catch { [Console]::Error.WriteLine("summarise-offset: $($_.Exception.Message)"); return 2 }
+    }
+    $rep = Get-OffsetReport -Rows $rows -ExcludeEntries $entries
     $script:Report = $rep
     if ($AsObject) { return 0 }
     $refs = @($rows | Select-Object -ExpandProperty Ref -Unique)
@@ -547,7 +643,12 @@ function Invoke-Summarise {
     $nEx = @($rep.ExcludedRounds).Count
     Write-Host "== Flagged blocks: $(@($rep.Flags).Count). Excluded case-rounds: $nEx$(if ($IncludeFlagged) { ' (none excluded, -IncludeFlagged is set)' })"
     if (@($rep.Flags).Count) { Write-Host (Format-SummaryText @($rep.Flags | Select-Object case, round, block, contender, flag, detail)) }
-    Write-Host "`n== PRIMARY (service against $Baseline). Only these five lines are primary. Everything below is exploratory."
+    if ($Part -eq 'primary') {
+        Write-Host "`n== PRIMARY ($Contender against $Baseline). Only these five lines are primary. Everything below is exploratory."
+    }
+    else {
+        Write-Host "`n== NOT PRIMARY: -Part $Part. These tables are the appendix view. The five lines below are NOT the registered primary lines."
+    }
     foreach ($v in $rep.Primary) { Write-Host ("{0} {1}, {2}: {3}. {4}" -f $v.id, $v.case, $v.metric, $v.verdict.ToUpper(), $v.reason) }
     Write-Host "`n== EXPLORATORY 1 Blocks (part: $Part, drop first $DropSeconds s where the case allows)"; Write-Host (Format-SummaryText $rep.Blocks)
     Write-Host "`n== EXPLORATORY 2 Pooled over rounds"; Write-Host (Format-SummaryText $rep.Pooled)
@@ -555,6 +656,7 @@ function Invoke-Summarise {
     Write-Host (Format-SummaryText @($rep.Comparison | Select-Object case, metric, contender, rounds_compared, @{ n = 'diff'; e = { R3 $_.diff } }, @{ n = 'diff_p99_ms'; e = { R3 $_.diff_p99_ms } }, @{ n = 'error_pct_diff'; e = { R3 $_.error_pct_diff } }, per_round_diff, same_sign_rounds, @{ n = 'threshold'; e = { R3 $_.threshold } }, @{ n = 'noise_floor'; e = { R3 $_.aa_noise_floor } }, unrecovered, verdict))
     Write-Host "`n== EXPLORATORY 4 Agreement between two references per block (limit $AgreeMs ms, all blocks)"; Write-Host (Format-SummaryText $rep.Agreement)
     Write-Host "`n== EXPLORATORY 5 Recovery events (limit $LimitMs ms for $Consecutive rows)"; Write-Host (Format-SummaryText @($rep.Recovery | Select-Object contender, case, reference, round, block, event, event_utc, recovery_s))
+    Write-Host "`n== EXPLORATORY 6 Events per block (expected $ExpectedSleepEvents per sleep block, $ExpectedDisturbEvents per disturbance block)"; Write-Host (Format-SummaryText @($rep.EventCounts))
     if (@($rep.RecoverySummary).Count) { Write-Host "`n== EXPLORATORY 5b Recovery per contender"; Write-Host (Format-SummaryText $rep.RecoverySummary) }
     return 0
 }

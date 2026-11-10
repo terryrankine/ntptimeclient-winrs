@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here 'offset-lib.ps1')
 . (Join-Path $here 'summarise-offset.ps1')
+. (Join-Path $here 'w32time-lib.ps1')
 
 # The helpers that change the machine must refuse without this variable. Clear it for the whole run.
 $savedGuard = [Environment]::GetEnvironmentVariable('MEASURE_TEST_MACHINE', 'Process')
@@ -381,24 +382,24 @@ try {
     $names = 'w32time-default', 'w32time-default-aa', 'service'
     $rows = Load @(EvRows $names 'sleep')
     # default 10,12,14,12 (pooled 12). aa 10.5,12,13,12 (noise floor 1). service 5,6,7,6 (pooled 6). Diff -6. Threshold max(2.4, 2 periods = 2) = 2.4.
-    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'gap') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'gap') + (Ev 'service' @(5, 6, 7, 6) 'sleep' 'gap'))
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'wake') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'wake') + (Ev 'service' @(5, 6, 7, 6) 'sleep' 'wake'))
     $v = Verdict $rows 'service' 'sleep' 'recovery' $ev
     CheckNear 'recovery verdict: diff' $v.diff -6 1e-9
     CheckNear 'recovery verdict: threshold' $v.threshold 2.4 1e-9
     CheckNear 'recovery verdict: noise floor' $v.aa_noise_floor 1 1e-9
     Check 'recovery verdict: better' $v.verdict 'better'
     # Service fails to recover in 1 of 4 events: a loss even though the median is finite (6.5).
-    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'gap') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'gap') + (Ev 'service' @(5, 6, 7, $inf) 'sleep' 'gap'))
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'wake') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'wake') + (Ev 'service' @(5, 6, 7, $inf) 'sleep' 'wake'))
     $v = Verdict $rows 'service' 'sleep' 'recovery' $ev
     Check 'unrecovered event is a loss' $v.verdict 'worse'
     Check 'unrecovered event: reason' ($v.reason -like '*did not recover in 1 of 4 events*') $true
     # Both fail once: not a loss for that reason. Per-round diffs skip the inf against inf round.
-    $ev = @((Ev 'w32time-default' @(10, 12, 14, $inf) 'sleep' 'gap') + (Ev 'w32time-default-aa' @(10.5, 12, 13, $inf) 'sleep' 'gap') + (Ev 'service' @(5, 6, 7, $inf) 'sleep' 'gap'))
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, $inf) 'sleep' 'wake') + (Ev 'w32time-default-aa' @(10.5, 12, 13, $inf) 'sleep' 'wake') + (Ev 'service' @(5, 6, 7, $inf) 'sleep' 'wake'))
     $v = Verdict $rows 'service' 'sleep' 'recovery' $ev
     Check 'equal unrecovered counts: compared on the rest' $v.verdict 'better'
     Check 'equal unrecovered counts: three usable rounds' $v.same_sign_rounds '3 of 3'
     # No twin for recovery.
-    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'gap') + (Ev 'service' @(5, 6, 7, 6) 'sleep' 'gap'))
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'wake') + (Ev 'service' @(5, 6, 7, 6) 'sleep' 'wake'))
     Check 'recovery without twin' (Verdict $rows 'service' 'sleep' 'recovery' $ev).verdict 'no noise floor, cannot call'
 
     # --- Primary lines through the whole script. P1 better, P2 to P5 have no data.
@@ -491,11 +492,11 @@ try {
     $ls = @()
     foreach ($t in 0, 1, 2) { $ls += (CsvRow $t 'svc' 'sleep' 'r' 0.001 0.004 '' 1 'B1') }
     foreach ($pair in @(@(1000, 0.5), @(1001, 0.2), @(1002, 0.005), @(1003, 0.004), @(1004, 0.003), @(1005, 0.001))) { $ls += (CsvRow $pair[0] 'svc' 'sleep' 'r' $pair[1] 0.004 '' 1 'B1') }
-    $rec = @(Get-RecoveryTable -Rows (Load $ls) -Cases @('sleep*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    $rec = @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
     Check 'recovery gap: one event' $rec.Count 1
-    Check 'recovery gap: type' $rec[0].event 'gap'
+    Check 'recovery gap: type' $rec[0].event 'wake'
     CheckNear 'recovery gap: seconds' $rec[0].recovery_s 2 1e-6
-    Check 'recovery: case filter' @(Get-RecoveryTable -Rows (Load ($ls -replace ',sleep,', ',idle,')) -Cases @('sleep*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100).Count 0
+    Check 'recovery: case filter' @(Get-RecoveryTable -Rows (Load ($ls -replace ',sleep,', ',idle,')) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100).Count 0
 
     # Step: t = 0..9 at 1 ms. t=10 -2 s, 11 -1.5, 12 -0.5, 13 8 ms, 14 7 ms, 15 6 ms, 16 1 ms. Event t = 10. First start t = 13. Recovery 3 s.
     function StepRows([int]$Round, [string[]]$Tail, [double]$T0) {
@@ -508,24 +509,24 @@ try {
         $r
     }
     $ls = @((StepRows 1 @('-2', '-1.5', '-0.5', '0.008', '0.007', '0.006', '0.001') 0) + (StepRows 2 @('-2', '-1.5', '-0.5', '-0.1', '-0.05', '-0.02', '0.008', '0.007', '0.006', '0.001') 1000))
-    $rec = @(Get-RecoveryTable -Rows (Load $ls) -Cases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    $rec = @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
     Check 'recovery step: two events' $rec.Count 2
     Check 'recovery step: type' $rec[0].event 'step'
     CheckNear 'recovery step: round 1 seconds' $rec[0].recovery_s 3 1e-6
     CheckNear 'recovery step: round 2 seconds' $rec[1].recovery_s 6 1e-6
     # The row right after the step is an error row. The step is the next good row, at t = 11. Recovery from there: starts at t = 14, 3 s.
     $ls = @(StepRows 1 @('error', '-2', '-1.5', '-0.5', '0.008', '0.007', '0.006', '0.001') 0)
-    $rec = @(Get-RecoveryTable -Rows (Load $ls) -Cases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    $rec = @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
     Check 'step after an error row: found' $rec.Count 1
     Check 'step after an error row: event row is the next good row' $rec[0].event_utc '2026-11-10T00:00:11.000Z'
     CheckNear 'step after an error row: seconds' $rec[0].recovery_s 3 1e-6
     # An error row inside the recovery window breaks the run. t=14 8 ms, 15 error, 16 6 ms, 17 5 ms, 18 4 ms. Event t = 10 (-2 s). Start t = 16, 6 s.
     $ls = @(StepRows 1 @('-2', '-1.5', '-0.5', '-0.1', '0.008', 'error', '0.006', '0.005', '0.004') 0)
-    $rec = @(Get-RecoveryTable -Rows (Load $ls) -Cases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    $rec = @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
     CheckNear 'error row breaks the run: seconds' $rec[0].recovery_s 6 1e-6
     # Never recovers.
     $ls = @(StepRows 1 @('-2', '-2', '-2', '-2') 0)
-    $rec = @(Get-RecoveryTable -Rows (Load $ls) -Cases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    $rec = @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
     Check 'not recovered: text' $rec[0].recovery_s 'not recovered'
     Check 'not recovered: censored value' ([double]::IsPositiveInfinity($rec[0].recovery_value)) $true
     Check 'not recovered: counted in the summary' @(Get-RecoverySummary $rec)[0].not_recovered 1
@@ -582,17 +583,348 @@ try {
     Check 'restore: no samples throws' $thrown $true
     $thrown = $false; try { Get-RestoreAdjustment -Offsets @(25) -MaxStepSeconds 10 | Out-Null } catch { $thrown = $true }
     Check 'restore: too large throws' $thrown $true
-    foreach ($h in 'disturb-clock', 'restore-clock', 'apply-tuned-profile') {
+    foreach ($h in 'disturb-clock', 'restore-clock', 'apply-tuned-profile', 'w32time-state') {
         $path = Join-Path $here "$h.ps1"
-        $extra = switch ($h) { 'restore-clock' { @('-Reference', '192.0.2.7') } 'apply-tuned-profile' { @('-BeforeFile', (Join-Path $tmp 'x.json')) } default { @() } }
+        $extra = switch ($h) {
+            'restore-clock' { @('-Reference', '192.0.2.7') }
+            'apply-tuned-profile' { @('-BeforeFile', (Join-Path $tmp 'x.json')) }
+            'w32time-state' { @('-Restore', '-File', (Join-Path $tmp 'x.json')) }
+            default { @() }
+        }
         $c = Child (@($path) + $extra)
         Check "$h refuses without MEASURE_TEST_MACHINE" $c.Code 2
         Check "$h says why" ($c.Out -match 'refused\. Set MEASURE_TEST_MACHINE=1') $true
         $text = Get-Content -LiteralPath $path -Raw
+        $start = $text.IndexOf('Set-StrictMode')
         $guard = $text.IndexOf('$env:MEASURE_TEST_MACHINE')
-        $first = @('Set-ItemProperty', 'Remove-ItemProperty', 'Set-Date', 'Restart-Service', 'w32tm /config') | ForEach-Object { $i = $text.IndexOf($_, $text.IndexOf('Set-StrictMode')); if ($i -ge 0) { $i } } | Sort-Object | Select-Object -First 1
+        $second = $text.IndexOf('Test-SecondTestMachineSignal')
+        $first = @('Set-ItemProperty', 'Remove-ItemProperty', 'Set-Date', 'Restart-Service', 'Start-Service', 'w32tm /config', 'sc.exe config', 'Invoke-TunedProfile', 'Invoke-TunedUndo', 'Restore-W32TimeServiceState') | ForEach-Object { $i = $text.IndexOf($_, $start); if ($i -ge 0) { $i } } | Sort-Object | Select-Object -First 1
         Check "$h guard comes before any change" ($guard -ge 0 -and $guard -lt $first) $true
+        Check "$h second signal comes after the guard and before any change" ($second -gt $guard -and $second -lt $first) $true
+        if ($h -ne 'w32time-state') {
+            # With the env var set but no second signal the helper must refuse. -WhatIf keeps a test
+            # on a virtual machine from changing anything.
+            $env:MEASURE_TEST_MACHINE = '1'
+            try { $c2 = Child (@($path) + $extra + @('-WhatIf')) } finally { [Environment]::SetEnvironmentVariable('MEASURE_TEST_MACHINE', $null, 'Process') }
+            if (-not (Test-SecondTestMachineSignal)) {
+                Check "$h refuses without a second signal" $c2.Code 2
+                Check "$h names the second signal" ($c2.Out -match 'No second test-machine signal') $true
+            }
+        }
     }
+    # The 2 s cap on disturb-clock is refused at parameter binding, before anything runs.
+    $c = Child @((Join-Path $here 'disturb-clock.ps1'), '-Milliseconds', '3000')
+    Check 'disturb-clock: more than 2000 ms is refused' ($c.Code -ne 0) $true
+    Check 'disturb-clock: cap named in the error' ($c.Out -match '2000') $true
+    $c = Child @((Join-Path $here 'w32time-state.ps1'), '-Record')
+    Check 'w32time-state: -Record without -File is refused' $c.Code 2
+
+    # --- restore-clock: more than half of the samples must be good.
+    CheckNear 'restore: 3 of 5 good is enough' (Get-RestoreAdjustment -Offsets @(0.1, 0.2, 0.3) -MaxStepSeconds 10 -Requested 5) 0.2 1e-9
+    $thrown = $false; try { Get-RestoreAdjustment -Offsets @(0.1, 0.2) -MaxStepSeconds 10 -Requested 5 | Out-Null } catch { $thrown = $true }
+    Check 'restore: 2 of 5 good is refused' $thrown $true
+
+    # --- Second signal: the model heuristic.
+    Check 'vm model Hyper-V' (Test-VirtualMachineModel -Model 'Virtual Machine' -Manufacturer 'Microsoft Corporation') $true
+    Check 'vm model VMware' (Test-VirtualMachineModel -Model 'VMware7,1' -Manufacturer 'VMware, Inc.') $true
+    Check 'vm model KVM' (Test-VirtualMachineModel -Model 'Standard PC (Q35 + ICH9, 2009)' -Manufacturer 'QEMU') $true
+    Check 'physical Dell is not a vm' (Test-VirtualMachineModel -Model 'Latitude 7420' -Manufacturer 'Dell Inc.') $false
+    Check 'empty strings are not a vm' (Test-VirtualMachineModel -Model '' -Manufacturer '') $false
+    $env:MEASURE_I_AM_ON_A_TEST_MACHINE = '1'
+    try { Check 'explicit second signal' (Test-SecondTestMachineSignal) $true } finally { [Environment]::SetEnvironmentVariable('MEASURE_I_AM_ON_A_TEST_MACHINE', $null, 'Process') }
+
+    # --- w32time start type mapping, and the state read from a throwaway HKCU key.
+    Check 'start 0' (ConvertTo-ScStartKeyword -Start 0) 'boot'
+    Check 'start 1' (ConvertTo-ScStartKeyword -Start 1) 'system'
+    Check 'start 2 is auto' (ConvertTo-ScStartKeyword -Start 2) 'auto'
+    Check 'start 2 delayed 0 is auto' (ConvertTo-ScStartKeyword -Start 2 -DelayedAutostart 0) 'auto'
+    Check 'start 2 delayed 1 is delayed-auto' (ConvertTo-ScStartKeyword -Start 2 -DelayedAutostart 1) 'delayed-auto'
+    Check 'start 3 is demand' (ConvertTo-ScStartKeyword -Start 3) 'demand'
+    Check 'start 3 ignores the delayed flag' (ConvertTo-ScStartKeyword -Start 3 -DelayedAutostart 1) 'demand'
+    Check 'start 4 is disabled' (ConvertTo-ScStartKeyword -Start 4) 'disabled'
+    $thrown = $false; try { ConvertTo-ScStartKeyword -Start 5 | Out-Null } catch { $thrown = $true }
+    Check 'start 5 is unknown and throws' $thrown $true
+
+    # The next block touches the registry. It creates ONE throwaway key under
+    #   HKCU:\Software\ntptimeclient-winrs-test-<guid>
+    # with the subkeys Config, Parameters and Svc, and removes it in a finally block. It never touches HKLM
+    # and never the real W32Time key. The library refuses any other key in test mode.
+    $tk = "HKCU:\Software\ntptimeclient-winrs-test-$([guid]::NewGuid().ToString('N'))"
+    try {
+        if ($tk -notlike 'HKCU:\Software\ntptimeclient-winrs-test-*') { throw 'unsafe test key' }
+        $cfgK = "$tk\Config"; $parK = "$tk\Parameters"; $svcK = "$tk\Svc"
+        New-Item -Path $cfgK -Force | Out-Null; New-Item -Path $parK -Force | Out-Null; New-Item -Path $svcK -Force | Out-Null
+        function ResetKeys {
+            foreach ($n in 'MinPollInterval', 'MaxPollInterval', 'UpdateInterval', 'PhaseCorrectRate', 'FrequencyCorrectRate') { Remove-ItemProperty -Path $cfgK -Name $n -ErrorAction SilentlyContinue }
+            foreach ($n in 'NtpServer', 'Type') { Remove-ItemProperty -Path $parK -Name $n -ErrorAction SilentlyContinue }
+            Set-ItemProperty -Path $cfgK -Name MinPollInterval -Value 10 -Type DWord
+            Set-ItemProperty -Path $cfgK -Name MaxPollInterval -Value 15 -Type DWord
+            Set-ItemProperty -Path $cfgK -Name UpdateInterval -Value 360000 -Type DWord
+            Set-ItemProperty -Path $cfgK -Name FrequencyCorrectRate -Value 4 -Type DWord      # PhaseCorrectRate stays absent
+            Set-ItemProperty -Path $parK -Name Type -Value 'NTP' -Type String                  # NtpServer stays absent
+        }
+        function Snap { ConvertTo-StateKey (Get-ProfileState -ConfigKey $cfgK -ParametersKey $parK) }
+        ResetKeys
+        $orig = Snap
+        Check 'registry fixture: absent values read as null' ($orig -like '*Config.PhaseCorrectRate=<absent>*Parameters.NtpServer=<absent>*') $true
+
+        # Success, then undo. The absent values come back as absent.
+        $sf = Join-Path $tmp 'before-ok.json'
+        Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService
+        $after = Get-ProfileState -ConfigKey $cfgK -ParametersKey $parK
+        Check 'apply: values set' (@($after.Config.MinPollInterval, $after.Config.MaxPollInterval, $after.Config.UpdateInterval, $after.Config.PhaseCorrectRate, $after.Config.FrequencyCorrectRate) -join ',') '6,6,100,1,2'
+        $saved = Read-StateFile -Path $sf
+        Check 'apply: saved file keeps the absent value as null' ($null -eq $saved.Config.PhaseCorrectRate) $true
+        Check 'apply: saved file keeps NtpServer null' ($null -eq $saved.Parameters.NtpServer) $true
+        Check 'apply: saved file holds the old value' $saved.Config.UpdateInterval 360000
+        Invoke-TunedUndo -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService
+        Check 'undo: registry back to the original, absent values removed' (Snap) $orig
+
+        # A failure in the middle restores everything and throws.
+        ResetKeys
+        $sf = Join-Path $tmp 'before-fail.json'
+        $msg = ''; try { Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService -FailAt 3 } catch { $msg = $_.Exception.Message }
+        Check 'failure: throws' ($msg -like 'apply failed*injected failure at step 3*The saved values were restored.') $true
+        Check 'failure: registry restored by the automatic undo' (Snap) $orig
+
+        # The before file cannot be written: nothing is changed.
+        ResetKeys
+        $msg = ''; try { Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile (Join-Path $tmp 'no-such-dir\before.json') -ConfigKey $cfgK -ParametersKey $parK -SkipService } catch { $msg = $_.Exception.Message }
+        Check 'unwritable state file: throws' ($msg -ne '') $true
+        Check 'unwritable state file: registry untouched' (Snap) $orig
+        # An existing state file is never overwritten.
+        $sf = Join-Path $tmp 'exists.json'; Set-Content -LiteralPath $sf -Value 'keep'
+        $msg = ''; try { Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService } catch { $msg = $_.Exception.Message }
+        Check 'existing state file: refused' ($msg -like '*Refusing to overwrite*') $true
+        Check 'existing state file: untouched' ((Get-Content -LiteralPath $sf -Raw).Trim()) 'keep'
+        Check 'existing state file: registry untouched' (Snap) $orig
+
+        # Undo with a saved NtpServer of null removes a value that was added later.
+        ResetKeys
+        $sf = Join-Path $tmp 'before-null.json'
+        Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService
+        Set-ItemProperty -Path $parK -Name NtpServer -Value '192.0.2.1,0x8' -Type String
+        Invoke-TunedUndo -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService
+        Check 'undo with null NtpServer removes the added value' (Snap) $orig
+        # Undo with a saved string puts it back.
+        Set-ItemProperty -Path $parK -Name NtpServer -Value 'ntp.example,0x9' -Type String
+        $sf = Join-Path $tmp 'before-str.json'
+        Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService
+        Set-ItemProperty -Path $parK -Name NtpServer -Value 'other,0x8' -Type String
+        Invoke-TunedUndo -StateFile $sf -ConfigKey $cfgK -ParametersKey $parK -SkipService
+        Check 'undo restores a saved NtpServer' ((Get-ItemProperty -Path $parK).NtpServer) 'ntp.example,0x9'
+
+        # Key allow list.
+        $msg = ''; try { Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile (Join-Path $tmp 'never.json') -SkipService } catch { $msg = $_.Exception.Message }
+        Check 'test mode refuses the real HKLM key' ($msg -like 'test mode refuses key*') $true
+        Check 'test mode wrote no state file' (Test-Path -LiteralPath (Join-Path $tmp 'never.json')) $false
+        $msg = ''; try { Invoke-TunedProfile -Peers @('192.0.2.1') -StateFile (Join-Path $tmp 'never2.json') -ConfigKey $cfgK -ParametersKey $parK } catch { $msg = $_.Exception.Message }
+        Check 'normal mode refuses a key that is not the real one' ($msg -like 'refusing key*') $true
+
+        # Service start type read from the fixture, without sc.exe.
+        Set-ItemProperty -Path $svcK -Name Start -Value 2 -Type DWord
+        Set-ItemProperty -Path $svcK -Name DelayedAutostart -Value 1 -Type DWord
+        $st = Get-W32TimeServiceState -ServiceKey $svcK -SkipSc
+        Check 'service state: delayed-auto from the registry' $st.StartKeyword 'delayed-auto'
+        Remove-ItemProperty -Path $svcK -Name DelayedAutostart
+        Check 'service state: absent DelayedAutostart means auto' (Get-W32TimeServiceState -ServiceKey $svcK -SkipSc).StartKeyword 'auto'
+        Set-ItemProperty -Path $svcK -Name Start -Value 4 -Type DWord
+        Check 'service state: disabled' (Get-W32TimeServiceState -ServiceKey $svcK -SkipSc).StartKeyword 'disabled'
+    }
+    finally {
+        if ($tk -like 'HKCU:\Software\ntptimeclient-winrs-test-*' -and (Test-Path -LiteralPath $tk)) { Remove-Item -LiteralPath $tk -Recurse -Force }
+    }
+    Check 'throwaway registry key removed' (Test-Path -LiteralPath $tk) $false
+
+    # --- Cases from the second review, ported from its generator. 4 rounds, three contenders, one reference.
+    function GOff([string]$C, [string]$Case, [int]$Rnd, [string]$Blk, [double]$BaseOff, [int[]]$ErrAt = @(), [int]$N = 20, [double]$Per = 10) {
+        for ($i = 0; $i -lt $N; $i++) {
+            $t = $Rnd * 10800 + $i * $Per
+            if ($ErrAt -contains $i) { CsvRow $t $C $Case 'r' $null $null 'w32tm error 0x800705B4' $Rnd $Blk }
+            else { CsvRow $t $C $Case 'r' ($BaseOff + 0.00001 * ($i % 3)) 0.01 '' $Rnd $Blk }
+        }
+    }
+    # One row, then for each segment 600 s asleep and 60 rows awake at 5 s. R is the recovery time in
+    # seconds, or $null when the clock never comes back inside that segment.
+    function GSleep([string]$C, [int]$Rnd, [string]$Blk, $Rs, [switch]$ErrWake) {
+        $t = $Rnd * 10800
+        CsvRow $t $C 'sleep' 'r' 0.001 0.01 '' $Rnd $Blk
+        foreach ($R in $Rs) {
+            $t += 600
+            if ($ErrWake) { CsvRow $t $C 'sleep' 'r' $null $null 'w32tm error 0x800705B4' $Rnd $Blk; $t += 5 }
+            for ($i = 0; $i -lt 60; $i++) {
+                $k = $i * 5
+                $off = if ($null -eq $R -or $k -lt $R) { 0.5 } else { 0.001 }
+                CsvRow $t $C 'sleep' 'r' $off 0.01 '' $Rnd $Blk
+                $t += 5
+            }
+        }
+    }
+
+    # I1: the service never recovers from wake 1 in rounds 2 and 3. Later segments must not credit it.
+    $ls = @()
+    for ($rd = 1; $rd -le 4; $rd++) {
+        $ls += GSleep 'w32time-default' $rd 'B1' @(60, 60, 60)
+        $ls += GSleep 'w32time-default-aa' $rd 'B2' @(60, 65, 60)
+        $firstR = if ($rd -in 2, 3) { $null } else { 20 }
+        $ls += GSleep 'service' $rd 'B3' @($firstR, 20, 20)
+    }
+    $rows = Load $ls
+    $rec = @(Get-RecoveryTable -Rows $rows -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    $svc = @($rec | Where-Object { $_.contender -eq 'service' })
+    Check 'cross segment: 12 wake events for the service' $svc.Count 12
+    Check 'cross segment: only wake events' @($svc | Where-Object { $_.event -ne 'wake' }).Count 0
+    Check 'cross segment: wake 1 of round 2 is not recovered' @($svc | Where-Object { $_.round -eq 2 })[0].recovery_s 'not recovered'
+    Check 'cross segment: wake 2 of round 2 is recovered' @($svc | Where-Object { $_.round -eq 2 })[1].recovery_s 20
+    $sum = @(Get-RecoverySummary $rec | Where-Object { $_.contender -eq 'service' })[0]
+    Check 'cross segment: 2 unrecovered, not 0' $sum.not_recovered 2
+    Check 'cross segment: worst is not recovered' $sum.worst_s 'not recovered'
+    $rep = Get-OffsetReport -Rows $rows
+    Check 'cross segment: no block flagged' @($rep.Flags).Count 0
+    $p4 = @($rep.Primary | Where-Object { $_.id -eq 'P4' })[0]
+    Check 'cross segment: P4 is a loss' $p4.verdict 'worse'
+    Check 'cross segment: P4 reason counts the unrecovered events' ($p4.reason -like '*did not recover in 2 of 12 events*') $true
+
+    # Ruling (b): the loss needs an excess over the A/A pair's own unrecovered difference.
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, $inf) 'sleep' 'wake') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'wake') + (Ev 'service' @(5, 6, $inf, 6) 'sleep' 'wake'))
+    $rows2 = Load @(EvRows $names 'sleep')
+    $v = Verdict $rows2 'service' 'sleep' 'recovery' $ev
+    Check 'unrecovered noise: baseline 1, twin 0, service 1 is not a loss' ($v.verdict -ne 'worse') $true
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, $inf) 'sleep' 'wake') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'wake') + (Ev 'service' @(5, 6, $inf, $inf) 'sleep' 'wake'))
+    $v = Verdict $rows2 'service' 'sleep' 'recovery' $ev
+    Check 'unrecovered noise: service 2 against baseline 1 and twin 0, excess 1 equals noise 1, is not called a loss' $v.verdict 'no meaningful difference'
+    $ev = @((Ev 'w32time-default' @(10, 12, 14, 12) 'sleep' 'wake') + (Ev 'w32time-default-aa' @(10.5, 12, 13, 12) 'sleep' 'wake') + (Ev 'service' @(5, $inf, $inf, 6) 'sleep' 'wake'))
+    $v = Verdict $rows2 'service' 'sleep' 'recovery' $ev
+    Check 'unrecovered noise: excess 2 over noise 0 is a loss' $v.verdict 'worse'
+
+    # I2: the first row after each wake is an error row. Gap detector only, event at the first good row.
+    $ls = @()
+    for ($rd = 1; $rd -le 4; $rd++) { foreach ($c in 'w32time-default', 'w32time-default-aa', 'service') { $ls += GSleep $c $rd 'B1' @(20, 20, 20) -ErrWake } }
+    $rows = Load $ls
+    $rec = @(Get-RecoveryTable -Rows $rows -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    Check 'error wake: 12 events per contender, 36 in all' $rec.Count 36
+    Check 'error wake: no step events in a sleep case' @($rec | Where-Object { $_.event -eq 'step' }).Count 0
+    Check 'error wake: every recovery is 20 s from the first good row' @($rec | Where-Object { $_.recovery_s -ne 20 }).Count 0
+    $rep = Get-OffsetReport -Rows $rows
+    Check 'error wake: expected events found, nothing flagged' @($rep.Flags).Count 0
+    Check 'error wake: event count table is all yes' @($rep.EventCounts | Where-Object { $_.ok -ne 'yes' }).Count 0
+    Check 'error wake: event count table says expected 3' $rep.EventCounts[0].events_expected 3
+    # A wake with no good row at all before the next gap is an unrecovered event.
+    $ls = @((CsvRow 0 'svc' 'sleep' 'r' 0.001 0.01 '' 1 'B1'), (CsvRow 600 'svc' 'sleep' 'r' $null $null 'w32tm error 0x800705B4' 1 'B1'), (CsvRow 605 'svc' 'sleep' 'r' $null $null 'w32tm error 0x800705B4' 1 'B1'), (CsvRow 1300 'svc' 'sleep' 'r' 0.001 0.01 '' 1 'B1'), (CsvRow 1305 'svc' 'sleep' 'r' 0.001 0.01 '' 1 'B1'), (CsvRow 1310 'svc' 'sleep' 'r' 0.001 0.01 '' 1 'B1'))
+    $rec = @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100)
+    Check 'wake with only error rows: unrecovered' $rec[0].recovery_s 'not recovered'
+    Check 'wake with only error rows: second wake recovered at once' $rec[1].recovery_s 0
+    # A step detector must not run on a sleep case, and a gap detector must not run on a disturbance case.
+    $ls = @(); for ($i = 0; $i -lt 10; $i++) { $ls += (CsvRow $i 'svc' 'disturb2s' 'r' 0.001 0.01 '' 1 'B1') }
+    $ls += (CsvRow 3000 'svc' 'disturb2s' 'r' 0.001 0.01 '' 1 'B1'); $ls += (CsvRow 3001 'svc' 'disturb2s' 'r' 0.001 0.01 '' 1 'B1'); $ls += (CsvRow 3002 'svc' 'disturb2s' 'r' 0.001 0.01 '' 1 'B1')
+    Check 'disturbance case: a time gap is not an event' @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100).Count 0
+    $ls = @(); for ($i = 0; $i -lt 6; $i++) { $ls += (CsvRow $i 'svc' 'sleep' 'r' $(if ($i -lt 3) { 0.001 } else { 2.0 }) 0.01 '' 1 'B1') }
+    Check 'sleep case: an offset step is not an event' @(Get-RecoveryTable -Rows (Load $ls) -SleepCases @('sleep*') -DisturbCases @('disturb*') -LimitMs 10 -Consecutive 3 -GapSeconds 120 -StepMs 100).Count 0
+
+    # Expected events per block: a block with another count is flagged and its round excluded, never dropped silently.
+    $ls = @()
+    for ($rd = 1; $rd -le 4; $rd++) {
+        $ls += GSleep 'w32time-default' $rd 'B1' @(60, 60, 60)
+        $ls += GSleep 'w32time-default-aa' $rd 'B2' @(60, 65, 60)
+        $ls += GSleep 'service' $rd 'B3' $(if ($rd -eq 3) { @(20, 20) } else { @(20, 20, 20) })
+    }
+    $rep = Get-OffsetReport -Rows (Load $ls)
+    Check 'event count: one flag' @($rep.Flags).Count 1
+    Check 'event count: flag type' $rep.Flags[0].flag 'event count'
+    Check 'event count: detail says expected and found' $rep.Flags[0].detail 'events expected 3 found 2 on r'
+    Check 'event count: round 3 excluded' ((@($rep.ExcludedRounds) -join ',')) 'sleep|3'
+    Check 'event count: table lists the block as NO' @($rep.EventCounts | Where-Object { $_.ok -eq 'NO' }).Count 1
+    # A disturbance block where no step is seen (the contender corrected before the next sample).
+    $ls = @()
+    for ($rd = 1; $rd -le 4; $rd++) { foreach ($c in 'w32time-default', 'w32time-default-aa', 'service') { for ($i = 0; $i -lt 30; $i++) { $ls += (CsvRow ($rd * 10800 + $i) $c 'disturb2s' 'r' 0.001 0.01 '' $rd 'B1') } } }
+    $rep = Get-OffsetReport -Rows (Load $ls)
+    Check 'no step seen: every block flagged' @($rep.Flags | Where-Object { $_.flag -eq 'event count' }).Count 12
+    Check 'no step seen: detail' ($rep.Flags[0].detail -like 'events expected 1 found 0 on r') $true
+
+    # I3: the error rate is judged for ties and wins.
+    $ls = @()
+    for ($rd = 1; $rd -le 4; $rd++) {
+        $ls += GOff 'w32time-default' 'idle' $rd 'B1' 0.005
+        $ls += GOff 'w32time-default-aa' 'idle' $rd 'B2' 0.0051
+        $ls += GOff 'service' 'idle' $rd 'B3' 0.005 @(2, 5, 8, 11, 14, 17)
+    }
+    $rows = Load $ls
+    $v = Verdict $rows
+    Check 'tie with 30 percent errors: mixed' $v.verdict 'mixed'
+    Check 'tie with 30 percent errors: reason says tie and errors' ($v.reason -like '*No meaningful difference in the median, but the error rate is higher by 30 points, limit 2 points*') $true
+    Check 'tie with 30 percent errors: error rates printed' ($v.reason -like '*error rate 30 % versus 0 %*') $true
+    $rep = Get-OffsetReport -Rows $rows
+    Check 'tie with errors: P1 is mixed in the report' (@($rep.Primary | Where-Object { $_.id -eq 'P1' })[0].verdict) 'mixed'
+    # A tie with a clean error rate stays a tie.
+    $ls = @(); for ($rd = 1; $rd -le 4; $rd++) { $ls += GOff 'w32time-default' 'idle' $rd 'B1' 0.005; $ls += GOff 'w32time-default-aa' 'idle' $rd 'B2' 0.0051; $ls += GOff 'service' 'idle' $rd 'B3' 0.005 }
+    Check 'clean tie' (Verdict (Load $ls)).verdict 'no meaningful difference'
+    # A win with 30 percent errors is mixed.
+    $ls = @(); for ($rd = 1; $rd -le 4; $rd++) { $ls += GOff 'w32time-default' 'idle' $rd 'B1' 0.005; $ls += GOff 'w32time-default-aa' 'idle' $rd 'B2' 0.0051; $ls += GOff 'service' 'idle' $rd 'B3' 0.002 @(2, 5, 8, 11, 14, 17) }
+    $v = Verdict (Load $ls)
+    Check 'win with 30 percent errors: mixed' $v.verdict 'mixed'
+    Check 'win with 30 percent errors: reason' ($v.reason -like '*Median is better but the error rate is higher by 30 points*') $true
+    # The limit is the larger of 2 points and the A/A pair's own error gap. Twin at 10 percent, default 0: limit 10, service at 8 percent passes.
+    $ls = @(); for ($rd = 1; $rd -le 4; $rd++) { $ls += GOff 'w32time-default' 'idle' $rd 'B1' 0.005; $ls += GOff 'w32time-default-aa' 'idle' $rd 'B2' 0.0051 @(3, 9); $ls += GOff 'service' 'idle' $rd 'B3' 0.002 @(4, 12) }
+    $v = Verdict (Load $ls)
+    Check 'error limit widens with the A/A gap: 10 points' ($v.reason -notlike '*error rate is higher*') $true
+    Check 'error limit widens with the A/A gap: win stands' $v.verdict 'better'
+
+    # --- Reference errors in the baseline blocks, and the exclusion file.
+    $ls = @(); for ($rd = 1; $rd -le 4; $rd++) { $ls += GOff 'w32time-default' 'idle' $rd 'B1' 0.005 $(if ($rd -eq 2) { @(1, 2, 3) } else { @() }); $ls += GOff 'w32time-default-aa' 'idle' $rd 'B2' 0.0051; $ls += GOff 'service' 'idle' $rd 'B3' 0.002 }
+    $rep = Get-OffsetReport -Rows (Load $ls)
+    Check 'reference down in a baseline block: flagged' $rep.Flags[0].flag 'reference errors'
+    Check 'reference down: detail names the reference and the limit' ($rep.Flags[0].detail -like 'r 15 % over 5 %') $true
+    Check 'reference down: round excluded' ((@($rep.ExcludedRounds) -join ',')) 'idle|2'
+    $clean = @(); for ($rd = 1; $rd -le 4; $rd++) { $clean += GOff 'w32time-default' 'idle' $rd 'B1' 0.005; $clean += GOff 'w32time-default-aa' 'idle' $rd 'B2' 0.0051; $clean += GOff 'service' 'idle' $rd 'B3' 0.002 }
+    $ex = Join-Path $tmp 'exclude.csv'
+    Set-Content -LiteralPath $ex -Value @('case,round,block,contender,reason', 'idle,3,B3,service,machine slept during the block')
+    Set-Content -LiteralPath (Join-Path $tmp 'excl-data.csv') -Value (@($hdr) + $clean)
+    $c = Child @((Join-Path $here 'summarise-offset.ps1'), (Join-Path $tmp 'excl-data.csv'), '-ExcludeBlocks', $ex)
+    Check 'exclusion file: exit 0' $c.Code 0
+    Check 'exclusion file: reason is printed' ($c.Out -match 'excluded by file\s+machine slept during the block') $true
+    Check 'exclusion file: counted' ($c.Out -match 'Flagged blocks: 1\. Excluded case-rounds: 1') $true
+    $entries = @(Read-ExcludeFile -File $ex)
+    Check 'exclusion file: parsed' $entries.Count 1
+    $rep = Get-OffsetReport -Rows (Load $clean) -ExcludeEntries $entries
+    Check 'exclusion file: round 3 gone from the tables' @($rep.Blocks | Where-Object { $_.round -eq 3 }).Count 0
+    $w = Get-OffsetReport -Rows (Load $clean) -ExcludeEntries @([pscustomobject]@{ case = 'idle'; round = '9'; block = 'B9'; contender = 'nobody'; reason = 'typo' }) 3>&1 | Out-String
+    Check 'exclusion file: an entry that matches no block warns' ($w -match 'matches no block') $true
+    Set-Content -LiteralPath (Join-Path $tmp 'noreason.csv') -Value @('case,round,block,contender,reason', 'idle,3,B3,service,')
+    $c = Child @((Join-Path $here 'summarise-offset.ps1'), (Join-Path $tmp 'excl-data.csv'), '-ExcludeBlocks', (Join-Path $tmp 'noreason.csv'))
+    Check 'exclusion file without a reason: exit 2' $c.Code 2
+    Set-Content -LiteralPath (Join-Path $tmp 'nocol.csv') -Value @('case,round,block,contender', 'idle,3,B3,service')
+    $c = Child @((Join-Path $here 'summarise-offset.ps1'), (Join-Path $tmp 'excl-data.csv'), '-ExcludeBlocks', (Join-Path $tmp 'nocol.csv'))
+    Check 'exclusion file without the reason column: exit 2' $c.Code 2
+    $c = Child @((Join-Path $here 'summarise-offset.ps1'), (Join-Path $tmp 'excl-data.csv'), '-ExcludeBlocks', (Join-Path $tmp 'missing.csv'))
+    Check 'exclusion file that does not exist: exit 2' $c.Code 2
+
+    # --- The wash-out view is not primary.
+    $c = Child @((Join-Path $here 'summarise-offset.ps1'), (Join-Path $tmp 'excl-data.csv'), '-Part', 'washout', '-DropSeconds', '60')
+    Check 'washout view: heading says not primary' ($c.Out -match 'NOT PRIMARY: -Part washout') $true
+    Check 'washout view: no PRIMARY heading' ($c.Out -notmatch '== PRIMARY') $true
+
+    # --- The plan's command line must carry every threshold, and the script defaults must equal it.
+    $plan = Get-Content -LiteralPath (Join-Path $here '..\docs\measuring-plan.md') -Raw
+    $m = [regex]::Match($plan, '(?s)```powershell\r?\n(\.\\scripts\\summarise-offset\.ps1.*?)\r?\n```')
+    Check 'plan: command line found' $m.Success $true
+    $cmdLine = ($m.Groups[1].Value -replace '`\r?\n', ' ')
+    $pairs = @{}
+    foreach ($pm in [regex]::Matches($cmdLine, '-(\w+)\s+([^\s-][^\s]*)')) { $pairs[$pm.Groups[1].Value] = $pm.Groups[2].Value }
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $here 'summarise-offset.ps1'), [ref]$null, [ref]$null)
+    $defaults = @{}
+    foreach ($pa in $ast.ParamBlock.Parameters) { if ($pa.DefaultValue) { $defaults[$pa.Name.VariablePath.UserPath] = $pa.DefaultValue.Extent.Text.Trim("'") } }
+    $need = 'DropSeconds', 'MinAbsMs', 'MinRel', 'MinRounds', 'ErrPp', 'AgreeMs', 'LimitMs', 'Consecutive', 'StepMs', 'GapSeconds', 'RecoveryMinPeriods', 'ExpectedSleepEvents', 'ExpectedDisturbEvents', 'RefErrPct'
+    foreach ($n in $need) {
+        Check "plan command line carries -$n" $pairs.ContainsKey($n) $true
+        if ($pairs.ContainsKey($n) -and $defaults.ContainsKey($n)) {
+            # DropSeconds is the one deliberate difference: the script default is 0 so that a bare run drops
+            # nothing, and the plan states the 600 s wash-out explicitly.
+            $want = if ($n -eq 'DropSeconds') { '0' } else { $pairs[$n] }
+            CheckNear "script default of -$n matches the plan" ([double]::Parse($defaults[$n], [cultureinfo]::InvariantCulture)) ([double]::Parse($want, [cultureinfo]::InvariantCulture)) 1e-12
+        }
+    }
+    Check 'plan: wash-out is 600 s' $pairs['DropSeconds'] '600'
+    foreach ($k in $pairs.Keys) { Check "plan parameter -$k exists in the script" ($defaults.ContainsKey($k) -or $ast.ParamBlock.Parameters.Name.VariablePath.UserPath -contains $k) $true }
 }
 catch { $script:fail++; Write-Host "FAIL unhandled error: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)`n$($_.ScriptStackTrace)" }
 finally {
