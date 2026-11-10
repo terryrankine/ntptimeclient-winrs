@@ -1,0 +1,204 @@
+name: preview
+
+# Builds the UNSIGNED PREVIEW zip.
+#
+# - A push of a tag "v*" builds, uploads the zip as a workflow artifact and
+#   attaches it to a GitHub PRE-RELEASE.
+# - A manual run (workflow_dispatch) is a dry run. It builds and uploads the
+#   artifact only. It never publishes a release.
+#
+# There is NO code signing step. Previews are unsigned on purpose. The planned
+# route for public releases is SignPath Foundation, after a public release
+# exists. That is a human decision and is not made here. No secret other than
+# the built-in GITHUB_TOKEN is used.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One preview build per ref at a time. A second tag push waits. It never
+# cancels a build that may be half way through publishing.
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build unsigned preview zip
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      zip_name: ${{ steps.assemble.outputs.zip_name }}
+    steps:
+      # actions/checkout v7.0.1, commit looked up with `gh api` on 2026-11-10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain stable branch, pinned by commit (same pin as ci.yml)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      # No build cache here. A release build must not depend on cache contents
+      # that an earlier pull request run could have written.
+
+      - name: Check the pins and placeholders
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Fails if a placeholder was left in the workflow or the packaged files.
+          # The pattern is written so that this step does not match itself.
+          $files = @('.github/workflows/preview.yml') + @(Get-ChildItem packaging -Recurse -File | ForEach-Object FullName)
+          $hits = Select-String -Path $files -Pattern 'T[O]DO'
+          if ($hits) { $hits | ForEach-Object { Write-Error "$($_.Path):$($_.LineNumber): $($_.Line)" }; exit 1 }
+          # Every "uses:" in this file must be a full 40 character commit SHA.
+          $bad = Select-String -Path '.github/workflows/preview.yml' -Pattern '^\s*-?\s*uses:\s*(\S+)' |
+            Where-Object { $_.Matches[0].Groups[1].Value -notmatch '@[0-9a-f]{40}$' }
+          if ($bad) { $bad | ForEach-Object { Write-Error "unpinned action: $($_.Line)" }; exit 1 }
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup show
+          rustc -vV
+          cargo -V
+          if ((rustc -vV) -notmatch 'host: x86_64-pc-windows-msvc') { Write-Error 'host is not x86_64-pc-windows-msvc'; exit 1 }
+
+      - name: Build release binary
+        run: cargo build --release --locked -p ntpc-service
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Dependency rule
+        run: pwsh scripts/check-deps.ps1
+
+      - name: Assemble zip
+        id: assemble
+        shell: pwsh
+        env:
+          # Passed as env, never spliced into the script, so a tag name cannot inject commands.
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $tag = if ($env:EVENT_NAME -eq 'push') { $env:REF_NAME } else { 'dispatch-' + $env:COMMIT_SHA.Substring(0, 7) }
+          # The tag ends up in a file name. Allow only plain characters.
+          if ($tag -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$') { Write-Error "Unusable tag name: $tag"; exit 1 }
+
+          $base = "ntptimeclient-winrs-$tag-UNSIGNED-PREVIEW-x86_64-windows"
+          $stage = Join-Path 'dist' $base
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          # The scripts and the plan call the binary ntptimeclient-winrs.exe.
+          # Cargo names it after the [[bin]] or the package. Take either and
+          # ship it under the documented name.
+          $candidates = 'target/release/ntptimeclient-winrs.exe', 'target/release/ntpc-service.exe'
+          $built = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $built) { Write-Error "No release binary found. Looked for: $($candidates -join ', ')"; exit 1 }
+          Write-Host "Using $built"
+          Copy-Item -LiteralPath $built -Destination (Join-Path $stage 'ntptimeclient-winrs.exe')
+
+          foreach ($f in 'install.ps1', 'uninstall.ps1', 'preview-common.ps1', 'default-config.toml', 'README-PREVIEW.txt') {
+            Copy-Item -LiteralPath (Join-Path 'packaging' $f) -Destination $stage
+          }
+          Copy-Item -LiteralPath 'LICENSE-MIT', 'LICENSE-APACHE' -Destination $stage
+
+          # Reproducibility notes. The toolchain floats on "stable", so the
+          # compiler version is recorded here instead of being pinned.
+          $rustc = (rustc -vV) -join "`n"
+          $version = @(
+            'product: ntptimeclient-winrs'
+            'channel: UNSIGNED PREVIEW, NOT FOR MACHINES THAT MATTER'
+            "tag: $tag"
+            "commit: $($env:COMMIT_SHA)"
+            'target: x86_64-pc-windows-msvc'
+            "cargo: $((cargo -V))"
+            "runner image: $($env:ImageOS) $($env:ImageVersion)"
+            'built with: cargo build --release --locked -p ntpc-service'
+            'rustc -vV:'
+            $rustc
+          ) -join "`n"
+          [System.IO.File]::WriteAllText((Join-Path $stage 'VERSION'), $version + "`n", (New-Object System.Text.UTF8Encoding($false)))
+
+          # SHA256SUMS covers every other file in the zip. LF line ends, "hash  name".
+          $lines = Get-ChildItem -LiteralPath $stage -File | Where-Object Name -ne 'SHA256SUMS' | Sort-Object Name |
+            ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }
+          [System.IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS'), ($lines -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+
+          $zip = Join-Path 'dist' "$base.zip"
+          Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$zip.sha256", "$zipHash  $base.zip`n", (New-Object System.Text.UTF8Encoding($false)))
+
+          Remove-Item -LiteralPath $stage -Recurse -Force
+          Get-ChildItem dist | Format-Table Name, Length
+          "zip_name=$base.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # actions/upload-artifact v7.0.2, commit looked up with `gh api` on 2026-11-10
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: preview-zip
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: attach to pre-release
+    needs: build
+    # Real tag pushes only. A manual run stops after the artifact upload.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # actions/download-artifact v8.0.2, commit looked up with `gh api` on 2026-11-10
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: preview-zip
+          path: dist
+      - name: Create pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          # UNSIGNED PREVIEW. NOT FOR MACHINES THAT MATTER.
+
+          This is a developer preview, not a release.
+
+          - The binary is not code signed. Windows SmartScreen or antivirus may warn.
+          - It sets the system clock and stops and disables the Windows Time service (w32time).
+          - Use it only on a throwaway virtual machine with a snapshot.
+          - No accuracy figure is promised.
+
+          Read README-PREVIEW.txt inside the zip before you run anything.
+          Install and uninstall with the scripts in the zip. Both need an elevated PowerShell.
+          The hash file inside the zip finds accidental damage only. It does not prove the zip is genuine.
+          EOF
+          printf '\nSHA-256 of the zip:\n\n    %s\n' "$(cat "dist/${ZIP_NAME}.sha256")" >> notes.md
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --title "$TAG UNSIGNED PREVIEW" \
+            --notes-file notes.md \
+            "dist/${ZIP_NAME}" "dist/${ZIP_NAME}.sha256"
