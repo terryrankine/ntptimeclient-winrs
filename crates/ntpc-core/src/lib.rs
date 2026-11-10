@@ -5,6 +5,7 @@ mod error;
 pub mod filter;
 mod ports;
 pub mod select;
+pub mod tier;
 mod types;
 
 pub use error::{ClockError, StoreError};
