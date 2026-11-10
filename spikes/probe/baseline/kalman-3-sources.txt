@@ -1,0 +1,37 @@
+i=0 src=1 snapshot=true used=None has_msg=false
+i=0 src=2 snapshot=true used=None has_msg=false
+i=0 src=3 snapshot=true used=None has_msg=false
+i=1 src=1 snapshot=true used=None has_msg=false
+i=1 src=2 snapshot=true used=None has_msg=false
+i=1 src=3 snapshot=true used=None has_msg=false
+i=2 src=1 snapshot=true used=None has_msg=false
+i=2 src=2 snapshot=true used=None has_msg=false
+i=2 src=3 snapshot=true used=None has_msg=false
+i=3 src=1 snapshot=true used=None has_msg=false
+i=3 src=2 snapshot=true used=None has_msg=false
+i=3 src=3 snapshot=true used=None has_msg=false
+i=4 src=1 snapshot=true used=None has_msg=false
+i=4 src=2 snapshot=true used=None has_msg=false
+i=4 src=3 snapshot=true used=None has_msg=false
+i=5 src=1 snapshot=true used=None has_msg=false
+i=5 src=2 snapshot=true used=None has_msg=false
+i=5 src=3 snapshot=true used=None has_msg=false
+i=6 src=1 snapshot=true used=None has_msg=false
+i=6 src=2 snapshot=true used=None has_msg=false
+i=6 src=3 snapshot=true used=None has_msg=false
+i=7 src=1 snapshot=true used=None has_msg=false
+i=7 src=2 snapshot=true used=None has_msg=false
+  (mock) step +0.011820s
+i=7 src=3 snapshot=true used=Some([3, 2, 1]) has_msg=true
+i=8 src=1 no message
+i=8 src=2 no message
+i=8 src=3 no message
+i=9 src=1 snapshot=true used=None has_msg=false
+i=9 src=2 snapshot=true used=None has_msg=false
+i=9 src=3 snapshot=true used=None has_msg=false
+i=10 src=1 snapshot=true used=None has_msg=false
+i=10 src=2 snapshot=true used=None has_msg=false
+i=10 src=3 snapshot=true used=None has_msg=false
+i=11 src=1 snapshot=true used=None has_msg=false
+i=11 src=2 snapshot=true used=None has_msg=false
+i=11 src=3 snapshot=true used=None has_msg=false
