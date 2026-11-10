@@ -283,3 +283,30 @@ The goal is to prove the printed manual rollback works. Run each on a reverted s
 ## 10. Record the result
 
 Revert to `before-preview` when done. Write down per step: pass or fail, what you saw, any message that was unclear. Attach the output of the step 1, 3, 5 and 6 commands. Do not claim accuracy from one ten-minute run.
+
+## Recovery commands (if install fails halfway)
+
+Run these in an elevated PowerShell on the VM. If none of this works, revert to the `before-preview` snapshot.
+
+```powershell
+# 1. Stop and remove our service
+sc.exe stop ntptimeclient-winrs
+sc.exe delete ntptimeclient-winrs        # "marked for deletion": close services.msc or reboot
+# 2. Remove the Event Log source
+Remove-Item 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\ntptimeclient-winrs' -Recurse -ErrorAction SilentlyContinue
+# 3. Read the restore record (the authority) if it exists
+Get-Content 'C:\ProgramData\ntptimeclient-winrs\restore.json'
+#    automatic -> auto, automatic_delayed -> delayed-auto, manual -> demand, disabled -> disabled
+sc.exe config w32time start= <keyword>   # or the line install.ps1 printed, or your step 1 record
+sc.exe start w32time                     # only if was_running is true and the type is not disabled
+w32tm.exe /resync /force
+sc.exe qc w32time
+# 4. Reset the clock rate: reboot (kernel default). Starting w32time also takes the rate over (unverified)
+Restart-Computer
+# 5. Before deleting anything, look inside any quarantine for restore.json
+Get-ChildItem 'C:\ProgramData' -Directory -Filter 'ntptimeclient-winrs.old-*' | ForEach-Object { Get-ChildItem $_.FullName -Force }
+# 6. Clean the state directory and the quarantines
+Remove-Item 'C:\ProgramData\ntptimeclient-winrs' -Recurse -Force
+Get-ChildItem 'C:\ProgramData' -Directory -Filter 'ntptimeclient-winrs.old-*' | Remove-Item -Recurse -Force
+#    if access is denied: takeown /f <dir> /r /d y ; icacls <dir> /reset /t ; then remove
+```
