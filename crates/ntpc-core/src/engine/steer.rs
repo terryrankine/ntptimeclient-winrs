@@ -54,8 +54,19 @@ impl Steer {
         }
     }
 
+    /// True when the history reaches back to `t`.
+    pub(super) fn covers(&self, t: Mono) -> bool {
+        self.marks.front().is_none_or(|m| t >= m.0)
+    }
+
     /// Phase the slew removed between `at` and `now`, in seconds.
+    ///
+    /// A time before the oldest kept mark is read as that mark. The slew
+    /// before it is pruned and unknown, so the correction covers at most
+    /// the kept window. No caller needs more: stored samples and the jitter
+    /// reading are no older than `max_age`.
     pub(super) fn since(&self, at: Mono, now: Mono) -> f64 {
+        let at = self.marks.front().map_or(at, |m| at.max(m.0));
         if at >= now {
             return 0.0;
         }
@@ -185,5 +196,48 @@ mod tests {
         assert!((e.corrected(s).offset.as_secs() - 0.5).abs() < 1e-12);
         let old = e.corrected(sample(0.5, at(0))).offset.as_secs();
         assert!((old - 0.495).abs() < 1e-12, "{old}");
+    }
+
+    /// 100 ppm for 10 000 s (1 s of phase), then no slew, re-marked every
+    /// 2000 s so the early marks are pruned.
+    fn long_history() -> Steer {
+        let mut s = Steer::default();
+        let keep = Duration::from_secs(1024);
+        s.set(at(0), 100.0, keep);
+        for t in (10_000..=20_000).step_by(2000) {
+            s.set(at(t), 0.0, keep);
+        }
+        s
+    }
+
+    #[test]
+    fn time_before_the_oldest_kept_mark_is_clamped_to_it() {
+        let s = long_history();
+        let first = s.marks.front().expect("kept").0;
+        assert!(first > at(10_000), "early marks pruned");
+        // Unclamped, the pruned time would read the whole 1 s of history.
+        // The kept window holds no slew, so the correction is zero.
+        assert!(s.since(at(5000), at(20_000)).abs() < 1e-12);
+        let a = s.since(at(5000), at(20_000));
+        let b = s.since(first, at(20_000));
+        assert!((a - b).abs() < 1e-15);
+    }
+
+    #[test]
+    fn reading_older_than_the_slew_history_is_not_compared_for_jitter() {
+        use crate::select::Selection;
+        let mut e = engine();
+        e.steer = long_history();
+        e.now = at(20_000);
+        e.poll = Duration::from_secs(256);
+        // A reading from before a long outage.
+        e.prev_offset = Some((Offset::from_secs(0.0), at(0)));
+        e.adapt_poll(&Selection {
+            offset: Offset::from_secs(0.0),
+            error_bound: Duration::from_millis(15),
+            survivors: vec![SourceId::new(1)],
+        });
+        assert_eq!(e.poll, Duration::from_secs(256), "no spurious reset");
+        assert_eq!(e.prev_offset, Some((Offset::from_secs(0.0), at(20_000))));
     }
 }
