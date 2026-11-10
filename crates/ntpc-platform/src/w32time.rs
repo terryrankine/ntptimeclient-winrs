@@ -634,6 +634,53 @@ impl ServiceControl for ScmControl {
     }
 }
 
+/// What the restore record reader needs to know about an open file before
+/// it trusts it (R86). Read through the handle, so a rename after the open
+/// cannot change the answer.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordFileFacts {
+    /// Owned by SYSTEM or Administrators.
+    pub owner_trusted: bool,
+    /// Hard link count.
+    pub links: u32,
+    /// Carries `FILE_ATTRIBUTE_REPARSE_POINT`.
+    pub reparse: bool,
+    /// Is a directory.
+    pub directory: bool,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+/// Reads [`RecordFileFacts`] of an open file. Read only. Uses the existing
+/// handle wrappers, so no new `unsafe`. The handle needs `READ_CONTROL`,
+/// which a read open has.
+///
+/// # Errors
+/// The OS error.
+#[cfg(windows)]
+pub fn record_file_facts(file: &std::fs::File) -> std::io::Result<RecordFileFacts> {
+    use crate::win32::{self, Principal};
+    /// `FILE_ATTRIBUTE_DIRECTORY` and `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const ATTR_DIRECTORY: u32 = 0x10;
+    const ATTR_REPARSE_POINT: u32 = 0x400;
+    // A duplicate of the handle, so the wrappers can take an OwnedHandle.
+    let h = std::os::windows::io::OwnedHandle::from(file.try_clone()?);
+    let tag = win32::attribute_tag(&h)?;
+    let link = win32::link_info(&h)?;
+    let sec = win32::read_security(&h)?;
+    Ok(RecordFileFacts {
+        owner_trusted: matches!(
+            sec.owner,
+            Some(Principal::System | Principal::Administrators)
+        ),
+        links: link.links,
+        reparse: tag.attributes & ATTR_REPARSE_POINT != 0,
+        directory: tag.attributes & ATTR_DIRECTORY != 0,
+        size: link.size,
+    })
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -52,15 +52,6 @@ pub fn replace_file_write_through(
     win32::scm::replace_file_write_through(from, to)
 }
 
-/// The hard link count of an open file. Read only.
-///
-/// # Errors
-/// The OS error.
-#[cfg(windows)]
-pub fn file_link_count(file: &std::fs::File) -> std::io::Result<u32> {
-    win32::scm::file_link_count(file)
-}
-
 /// Crate name, used by the smoke test.
 pub const CRATE_NAME: &str = "ntpc-platform";
 

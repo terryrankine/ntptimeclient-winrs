@@ -13,24 +13,35 @@
 //!    asks on stderr, default no.
 //! 4. Secure the state directory. Refuse if it cannot be secured: a
 //!    stopped `w32time` with no restore record is worse than no install.
+//!    Each refusal class has its own exit code. A dropped restore record
+//!    (it failed the provenance checks and stays in the quarantine) refuses
+//!    too (R86): recording the current state would lose the real original.
 //! 5. Load an existing record. A tampered one refuses and changes nothing.
 //!    With no record and `w32time` already disabled, refuse unless
 //!    `--accept-disabled-original` (R84): a lost record must not turn
-//!    "disabled" into the original for ever.
+//!    "disabled" into the original for ever. This check needs to know
+//!    whether a record exists, so it runs after step 4. On exit 12 the state
+//!    directory may therefore have been created and secured. `w32time` is
+//!    not changed and no record is written.
 //! 6. Take over `w32time`. The record is written before anything changes.
 //!    If the takeover fails before any change, the record this run wrote is
 //!    removed again (M8).
 //! 7. Register our service (Task 14 hook). On failure `w32time` is put back.
 //!
-//! Uninstall: stop our service (hook), restore `w32time` from the record,
-//! remove the registration (hook). It restores even if our service is
+//! Uninstall: stop our service (hook), secure the state directory and read
+//! the record with the provenance checks (R86), restore `w32time` from it,
+//! remove the registration (hook). A directory or record that cannot be
+//! trusted leaves `w32time` alone (exit 17) with a manual restore hint that
+//! guesses no start type. It restores even if our service is
 //! missing. Without a record `w32time` is left as it is: guessing a start
 //! type could undo an administrator's choice. The state directory stays.
 //!
 //! Messages carry no paths, machine names, user names or domain names.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::Path;
+
+use crate::config::Config;
 
 use ntpc_platform::JoinState;
 use ntpc_platform::w32time::{
@@ -81,9 +92,26 @@ pub mod exit {
     /// `--accept-disabled-original`. `w32time` was not changed. Distinct from
     /// the packaging wrapper's own codes 40 to 47.
     pub const DISABLED_ORIGINAL: u8 = 12;
+    /// Install: a previous restore record existed but could not be trusted
+    /// and stays in the quarantine directory. Nothing changed.
+    pub const RECORD_DROPPED: u8 = 13;
+    /// Install: replacing a weak state directory failed and so did moving
+    /// the old one back. A restore record may be in a sibling quarantine
+    /// directory. Nothing changed. See the recovery steps in the docs.
+    pub const ROLLBACK_FAILED: u8 = 14;
+    /// Install: the restore record could not be carried into the fresh
+    /// state directory. Nothing on `w32time` changed.
+    pub const CARRY_FAILED: u8 = 15;
+    /// Install: the configured state directory path is not acceptable
+    /// (reserved name, colon, trailing dot or space, not absolute, not a
+    /// fixed drive). Nothing changed.
+    pub const BAD_STATE_PATH: u8 = 16;
+    /// Install or uninstall: the state directory or the restore record could
+    /// not be trusted (R86). `w32time` was left alone.
+    pub const RECORD_NOT_TRUSTED: u8 = 17;
 
     /// Every code, for tests.
-    pub const ALL: [u8; 12] = [
+    pub const ALL: [u8; 17] = [
         OK,
         USAGE,
         NOT_ELEVATED,
@@ -96,6 +124,11 @@ pub mod exit {
         RESTORE,
         UNREGISTER,
         DISABLED_ORIGINAL,
+        RECORD_DROPPED,
+        ROLLBACK_FAILED,
+        CARRY_FAILED,
+        BAD_STATE_PATH,
+        RECORD_NOT_TRUSTED,
     ];
 }
 
@@ -180,18 +213,124 @@ pub enum LoadError {
     /// The file is there and could not be read.
     #[error("cannot read the restore record: {0}")]
     Io(io::ErrorKind),
-    /// The file has more than one hard link.
-    #[error("the restore record has more than one hard link")]
-    Linked,
+    /// The file failed a provenance check before it was read (R86).
+    #[error("the restore record cannot be trusted: {0}")]
+    NotTrusted(TrustFailure),
 }
+
+/// Which provenance check a restore record file failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TrustFailure {
+    /// It is a directory.
+    #[error("it is not a plain file")]
+    NotAFile,
+    /// It is a reparse point.
+    #[error("it is a link or reparse point")]
+    Reparse,
+    /// It has more than one hard link.
+    #[error("it has more than one hard link")]
+    Links,
+    /// It is larger than the record cap.
+    #[error("it is larger than a restore record can be")]
+    TooLarge,
+    /// It is not owned by SYSTEM or Administrators.
+    #[error("it is not owned by SYSTEM or Administrators")]
+    Owner,
+}
+
+/// Why the state directory was not accepted, by class. Text holds no path.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SecureRefusal {
+    /// The directory or a parent failed a check, or an OS call failed.
+    #[error("the state directory cannot be secured: {0}")]
+    Directory(String),
+    /// The configured path is not acceptable.
+    #[error("the state directory path is not acceptable: {0}")]
+    BadPath(String),
+    /// Replacing a weak directory failed and moving the old one back failed.
+    #[error("{0}")]
+    RollbackFailed(String),
+    /// The restore record could not be carried into a fresh directory.
+    #[error("{0}")]
+    CarryFailed(String),
+    /// A previous restore record failed its checks and stays in quarantine.
+    #[error("a previous restore record could not be trusted")]
+    RecordDropped,
+}
+
+impl SecureRefusal {
+    /// The install exit code for this class.
+    #[must_use]
+    pub const fn install_code(&self) -> u8 {
+        match self {
+            Self::Directory(_) => exit::STATE_DIR,
+            Self::BadPath(_) => exit::BAD_STATE_PATH,
+            Self::RollbackFailed(_) => exit::ROLLBACK_FAILED,
+            Self::CarryFailed(_) => exit::CARRY_FAILED,
+            Self::RecordDropped => exit::RECORD_DROPPED,
+        }
+    }
+
+    /// What the administrator should do. No paths.
+    #[must_use]
+    pub const fn advice(&self) -> &'static str {
+        match self {
+            Self::Directory(_) => {
+                "Check the state directory and its parents (owner SYSTEM or Administrators, \
+                 no links), then run again."
+            }
+            Self::BadPath(_) => "Fix the state_dir setting in the config file, then run again.",
+            Self::RollbackFailed(_) => {
+                "A restore record may be in a sibling quarantine directory. See the \
+                 RollbackFailed recovery steps in the documentation before running again."
+            }
+            Self::CarryFailed(_) => {
+                "The restore record could not be moved into the fresh state directory. \
+                 Check the state directory and run again."
+            }
+            Self::RecordDropped => {
+                "A previous restore record could not be trusted. Restore w32time by hand \
+                 first, then run install again, or remove the quarantine directory and the \
+                 state directory after checking them."
+            }
+        }
+    }
+}
+
+/// Maps a platform refusal to its class. The enum is non-exhaustive: any
+/// variant added later lands in the safe `Directory` class.
+#[cfg(windows)]
+#[must_use]
+pub fn classify_acl_error(e: &ntpc_platform::AclError) -> SecureRefusal {
+    use ntpc_platform::AclError as A;
+    let text = e.to_string();
+    match e {
+        A::BadPath | A::TrailingDotOrSpace | A::ReservedName | A::NotFixedDrive => {
+            SecureRefusal::BadPath(text)
+        }
+        A::RollbackFailed { .. } => SecureRefusal::RollbackFailed(text),
+        A::RestoreCarryFailed { .. } => SecureRefusal::CarryFailed(text),
+        // PathChanged, Link, ParentLink, NotADirectory, UntrustedOwner,
+        // UntrustedParent, UnexpectedChild, DaclNotApplied, Os, and any
+        // variant added later: the directory is refused.
+        _ => SecureRefusal::Directory(text),
+    }
+}
+
+/// How to put `w32time` back by hand. Guesses no start type: the right one
+/// is whatever it was before install, which only the record knew.
+pub const MANUAL_RESTORE: &str = "To put w32time back by hand: open Services (services.msc), \
+     open Windows Time, set the startup type it had before this tool was installed, and start \
+     it if it was running before.";
 
 /// Where the restore record lives.
 pub trait RecordStore {
-    /// Secures the state directory before anything is written there.
+    /// Secures the state directory before the record is read or written.
+    /// A dropped record is a refusal.
     ///
     /// # Errors
-    /// Why it could not be secured.
-    fn secure(&mut self) -> Result<(), String>;
+    /// [`SecureRefusal`] by class.
+    fn secure(&mut self) -> Result<(), SecureRefusal>;
     /// The record, `None` if there is none.
     ///
     /// # Errors
@@ -335,9 +474,10 @@ fn domain_rule(opts: InstallOptions, host: &mut dyn Host) -> Option<u8> {
 fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
     if let Err(e) = d.store.secure() {
         d.host.say(&format!(
-            "Cannot secure the state directory ({e}). The w32time restore record cannot be kept safely. Nothing changed."
+            "Install refused: {e}. {} w32time was not changed.",
+            e.advice()
         ));
-        return exit::STATE_DIR;
+        return e.install_code();
     }
     let existing = match d.store.load() {
         Ok(r) => r,
@@ -347,6 +487,12 @@ fn install_after_checks(opts: InstallOptions, d: &mut Deps<'_>) -> u8 {
                  Check the w32time start type by hand, then delete the record file."
             ));
             return exit::RECORD_INVALID;
+        }
+        Err(e @ LoadError::NotTrusted(_)) => {
+            d.host.say(&format!(
+                "{e}. Nothing changed. {MANUAL_RESTORE} Then delete the record file."
+            ));
+            return exit::RECORD_NOT_TRUSTED;
         }
         Err(e) => {
             d.host.say(&format!("{e}. Nothing changed."));
@@ -480,6 +626,46 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
         }
     }
 
+    match d.store.secure() {
+        Ok(()) => restore_from_record(d, &mut codes),
+        Err(e) => {
+            d.host.say(&format!(
+                "{e}. The restore record cannot be trusted. w32time is left as it is. {} {MANUAL_RESTORE}",
+                e.advice()
+            ));
+            codes.push(exit::RECORD_NOT_TRUSTED);
+        }
+    }
+
+    match d.reg.unregister() {
+        Ok(OwnService::Present) => d.host.say("Service registration removed."),
+        Ok(OwnService::Absent) => {}
+        Err(e) => {
+            d.host
+                .say(&format!("Removing the service registration failed: {e}."));
+            codes.push(exit::UNREGISTER);
+        }
+    }
+
+    // Most important first: w32time, then our files, then our service.
+    [
+        exit::RESTORE,
+        exit::RECORD_NOT_TRUSTED,
+        exit::RECORD_INVALID,
+        exit::STATE_DIR,
+        exit::UNREGISTER,
+    ]
+    .into_iter()
+    .find(|c| codes.contains(c))
+    .unwrap_or_else(|| {
+        d.host.say("Uninstalled. The state directory is kept.");
+        exit::OK
+    })
+}
+
+/// Uninstall step: read the record from the secured directory and restore
+/// `w32time` from it. Pushes failure codes.
+fn restore_from_record(d: &mut Deps<'_>, codes: &mut Vec<u8>) {
     match d.store.load() {
         Ok(Some(record)) => match restore(&mut *d.scm, &record) {
             Ok(out) => {
@@ -517,35 +703,17 @@ pub fn uninstall(d: &mut Deps<'_>) -> u8 {
             ));
             codes.push(exit::RECORD_INVALID);
         }
+        Err(e @ LoadError::NotTrusted(_)) => {
+            d.host.say(&format!(
+                "{e}. w32time is left as it is. {MANUAL_RESTORE} Then delete the record file."
+            ));
+            codes.push(exit::RECORD_NOT_TRUSTED);
+        }
         Err(e) => {
             d.host.say(&format!("{e}. w32time is left as it is."));
             codes.push(exit::RESTORE);
         }
     }
-
-    match d.reg.unregister() {
-        Ok(OwnService::Present) => d.host.say("Service registration removed."),
-        Ok(OwnService::Absent) => {}
-        Err(e) => {
-            d.host
-                .say(&format!("Removing the service registration failed: {e}."));
-            codes.push(exit::UNREGISTER);
-        }
-    }
-
-    // Most important first: w32time, then our files, then our service.
-    [
-        exit::RESTORE,
-        exit::RECORD_INVALID,
-        exit::STATE_DIR,
-        exit::UNREGISTER,
-    ]
-    .into_iter()
-    .find(|c| codes.contains(c))
-    .unwrap_or_else(|| {
-        d.host.say("Uninstalled. The state directory is kept.");
-        exit::OK
-    })
 }
 
 /// The registration hook until Task 14 builds it.
@@ -572,20 +740,15 @@ impl Registration for PendingRegistration {
     }
 }
 
-/// The default state directory. The record always lives here, whatever the
-/// config says, so uninstall finds it even when the config is gone.
-fn state_dir() -> PathBuf {
-    crate::config::Config::default().state_dir
-}
-
 /// The line `--help` prints. It does not list `install` or `uninstall` yet:
 /// the release gate must stay red until Task 14 makes them real (R85).
 pub const HELP: &str = "usage: ntptimeclient-winrs (pre-alpha: no subcommands are available yet)";
 
-/// Dispatches the command line. No arguments keeps the pre-alpha stub
+/// Dispatches the command line. `config` gives the state directory
+/// (`Config.state_dir`, R86). No arguments keeps the pre-alpha stub
 /// (exit 0). `--help` prints [`HELP`] (exit 0). An unknown subcommand or
 /// argument prints one usage line to `err` and exits [`exit::USAGE`] (M6).
-pub fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+pub fn dispatch(args: &[String], config: &Config, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     match args.first().map(String::as_str) {
         None => {
             let _ = writeln!(
@@ -599,8 +762,8 @@ pub fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8
             let _ = writeln!(out, "{HELP}");
             exit::OK
         }
-        Some("install") => run_install(&args[1..]),
-        Some("uninstall") => run_uninstall(&args[1..]),
+        Some("install") => run_install(&args[1..], config),
+        Some("uninstall") => run_uninstall(&args[1..], config),
         Some(_) => {
             let _ = writeln!(err, "unknown subcommand or argument. Run with --help.");
             exit::USAGE
@@ -610,7 +773,7 @@ pub fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8
 
 /// `install` from the command line. Returns an [`exit`] code.
 #[must_use]
-pub fn run_install(args: &[String]) -> u8 {
+pub fn run_install(args: &[String], config: &Config) -> u8 {
     let opts = match parse_install_args(args) {
         Ok(o) => o,
         Err(e) => {
@@ -618,26 +781,26 @@ pub fn run_install(args: &[String]) -> u8 {
             return exit::USAGE;
         }
     };
-    run_install_real(opts)
+    run_install_real(opts, &config.state_dir)
 }
 
 /// `uninstall` from the command line. Returns an [`exit`] code.
 #[must_use]
-pub fn run_uninstall(args: &[String]) -> u8 {
+pub fn run_uninstall(args: &[String], config: &Config) -> u8 {
     if let Err(e) = parse_uninstall_args(args) {
         eprintln!("{e}");
         return exit::USAGE;
     }
-    run_uninstall_real()
+    run_uninstall_real(&config.state_dir)
 }
 
 #[cfg(windows)]
-fn run_install_real(opts: InstallOptions) -> u8 {
+fn run_install_real(opts: InstallOptions, state_dir: &Path) -> u8 {
     install(
         &opts,
         &mut Deps {
             host: &mut ConsoleHost::new(),
-            store: &mut FileRecordStore::new(state_dir()),
+            store: &mut FileRecordStore::new(state_dir),
             scm: &mut ntpc_platform::ScmControl,
             reg: &mut PendingRegistration,
         },
@@ -645,24 +808,23 @@ fn run_install_real(opts: InstallOptions) -> u8 {
 }
 
 #[cfg(windows)]
-fn run_uninstall_real() -> u8 {
+fn run_uninstall_real(state_dir: &Path) -> u8 {
     uninstall(&mut Deps {
         host: &mut ConsoleHost::new(),
-        store: &mut FileRecordStore::new(state_dir()),
+        store: &mut FileRecordStore::new(state_dir),
         scm: &mut ntpc_platform::ScmControl,
         reg: &mut PendingRegistration,
     })
 }
 
 #[cfg(not(windows))]
-fn run_install_real(_opts: InstallOptions) -> u8 {
-    let _ = state_dir();
+fn run_install_real(_opts: InstallOptions, _state_dir: &Path) -> u8 {
     eprintln!("install runs on Windows only");
     exit::USAGE
 }
 
 #[cfg(not(windows))]
-fn run_uninstall_real() -> u8 {
+fn run_uninstall_real(_state_dir: &Path) -> u8 {
     eprintln!("uninstall runs on Windows only");
     exit::USAGE
 }
