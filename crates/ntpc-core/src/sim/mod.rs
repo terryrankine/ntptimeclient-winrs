@@ -18,7 +18,7 @@
 //! - Monotonic time runs at the true rate and stands still in sleep.
 //! - A started `w32time` takes the clock and runs it at the nominal rate.
 //!   Its own discipline is not modelled.
-//! - The simulated clock never fails a command.
+//! - A clock command fails only while [`SimEvent::ClockFails`] is on.
 //!
 //! Built only with the `sim` feature.
 
@@ -104,6 +104,12 @@ pub enum SimEvent {
     W32TimeStopped,
     /// The clock's true drift changes, as on a machine that warms up.
     SetDrift(Ppm),
+    /// While true, every clock command fails. The host stops the rest of
+    /// that batch's clock actions.
+    ClockFails(bool),
+    /// The host re-arms the engine after a clock failure. It sends
+    /// `AdjustmentAllowed(false)`, then its level.
+    HostRearm,
 }
 
 /// What happened during one [`SimWorld::run`].
@@ -117,7 +123,8 @@ pub struct SimReport {
     pub max_abs_error: f64,
     /// Error at the end of the run.
     pub final_error: f64,
-    /// Every step the host applied, with its time.
+    /// Every step the host applied, with its time. A failed step is not
+    /// here.
     pub steps: Vec<(Mono, Offset)>,
     /// Every log line, with its time.
     pub logs: Vec<(Mono, LogEvent)>,
@@ -125,9 +132,15 @@ pub struct SimReport {
     pub queries: BTreeMap<String, u32>,
     /// Clock commands the host performed.
     pub clock_commands: u32,
-    /// Clock commands the engine sent while the host had adjustment off.
-    /// Always zero for a correct engine.
+    /// Clock commands the engine sent while the host had adjustment off,
+    /// or after a failure before the host re-armed it. Always zero for a
+    /// correct engine.
     pub commands_while_disabled: u32,
+    /// Clock commands that failed.
+    pub clock_failures: u32,
+    /// Clock actions not performed because an earlier one in the same
+    /// batch failed.
+    pub skipped_after_failure: u32,
     /// Largest applied frequency size, in ppm, after quantisation.
     pub max_abs_frequency: f64,
     /// The last drift the engine asked to save.

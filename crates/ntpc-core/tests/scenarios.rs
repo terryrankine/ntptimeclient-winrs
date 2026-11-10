@@ -591,3 +591,48 @@ fn external_step_is_slewed_back_without_a_step() {
         assert_eq!(changes.len(), 0, "jump {jump}: tier flapped {changes:?}");
     }
 }
+
+/// Added in round 2. The clock fails a step end to end. The host stops
+/// the rest of the batch. The failure latches: the host's periodic `true`
+/// does not re-open adjustment. Only a re-arm (`false` then `true`) does,
+/// and it allows the step that never reached the clock once more.
+#[test]
+fn clock_failure_stops_the_batch_and_latches_until_rearm() {
+    let mut w = world(61, 0.0);
+    add_pool(&mut w, 4);
+    let mut e = engine(Some(DRIFT));
+    let _ = w.run(&mut e, 6 * HOUR);
+    w.schedule(6 * HOUR, SimEvent::ClockFails(true));
+    // A wake 2 s off asks for a step. Step and SetFrequency are one batch.
+    w.schedule(6 * HOUR, SimEvent::Resume(Offset::from_secs(2.0)));
+    let broken = w.run(&mut e, 2 * HOUR);
+    assert_eq!(broken.clock_failures, 1);
+    assert_eq!(broken.skipped_after_failure, 1, "the batch's SetFrequency");
+    no_steps(&broken);
+    // The level is re-sent every 300 s, 24 times here. None re-opens.
+    assert_eq!(broken.commands_while_disabled, 0);
+    let off = LogEvent::AdjustmentDisabled {
+        reason: DisableReason::ClockFailed,
+    };
+    assert!(has_log(&broken, &off));
+    assert!(!e.status().adjustment_allowed);
+    // Nothing moved the clock. Its last rate was the drift plus a settled
+    // phase term under 0.2 ppm, so 2 h add under 1.5 ms.
+    within(
+        "|broken.final_error - 2|",
+        (broken.final_error - 2.0).abs(),
+        SETTLED,
+    );
+    w.schedule(8 * HOUR, SimEvent::ClockFails(false));
+    w.schedule(8 * HOUR, SimEvent::HostRearm);
+    let fixed = w.run(&mut e, 6 * HOUR);
+    assert!(e.status().adjustment_allowed);
+    assert_eq!(fixed.steps.len(), 1, "{:?}", fixed.steps);
+    within(
+        "|step + 2|",
+        (fixed.steps[0].1.as_secs() + 2.0).abs(),
+        0.002,
+    );
+    within("fixed.final_error.abs()", fixed.final_error.abs(), SETTLED);
+    assert_eq!(fixed.clock_failures + fixed.commands_while_disabled, 0);
+}
