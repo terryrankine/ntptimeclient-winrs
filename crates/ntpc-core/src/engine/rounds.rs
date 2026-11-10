@@ -146,8 +146,11 @@ impl Engine {
         }
         // A switch made by observe-only samples does not feed the clock. The
         // next regular round of the tier does.
-        if !round.observe_only && self.tiers.active() == Some(tier) {
-            self.feed_loop(tier, out);
+        if !round.observe_only
+            && self.tiers.active() == Some(tier)
+            && let Some(picked) = picked
+        {
+            self.feed_loop(tier, &picked, out);
         }
     }
 

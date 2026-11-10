@@ -219,6 +219,16 @@ const ROUND_TIMEOUT: Duration = Duration::from_secs(30);
 /// that noise would pin the poll at its minimum.
 const JITTER_FLOOR: Duration = Duration::from_millis(5);
 
+/// A new sample this many times slower than the source's best of its last
+/// eight is a delay spike. Queuing on such a path skews the offset, and the
+/// skew is not symmetric, so the loop must not follow it.
+const POPCORN_RATIO: f64 = 3.0;
+
+/// Below this delay a spike is ignored. A LAN path at 0.3 ms that reads 1 ms
+/// once is still far better than any internet path, and its offset error is
+/// bounded by half that delay.
+const POPCORN_FLOOR: Duration = Duration::from_millis(10);
+
 const PPM_PER_UNIT: f64 = 1e-6;
 
 fn slot(tier: Tier) -> usize {
@@ -698,9 +708,16 @@ impl Engine {
             return CrossCheck::NotRequired;
         }
         let cap = self.cfg.selection.max_age.min(self.cfg.tier.reprobe_every);
+        // Inclusive of the change instant. A reply stamped at that instant
+        // measured the clock just as the new frequency took over, so the
+        // change has added no phase error to it yet. A coarse Mono (15.6 ms
+        // ticks) or a fast LAN pool often gives exactly that stamp. A strict
+        // window would drop it and stall a start step.
+        let age = self.freq_changed_at.map_or(cap, |changed| {
+            self.now.saturating_duration_since(changed).min(cap)
+        });
         // Pool servers that cannot agree give no answer, so the step waits.
-        self.window(self.freq_changed_at, cap)
-            .and_then(|age| self.select_in(Tier::Pool, age))
+        self.select_in(Tier::Pool, age)
             .map_or(CrossCheck::Pending, |s| CrossCheck::Offset(s.offset))
     }
 
@@ -722,7 +739,9 @@ impl Engine {
     /// after the last one the loop considered and after the last frequency
     /// change. An older one was already used or measured a clock that has
     /// moved since, so it can neither feed the loop again nor decide a step.
-    /// Also returns each considered sample, to mark as used.
+    /// A delay spike is left out (see [`POPCORN_RATIO`]). It still counts
+    /// for tier usability. Also returns each considered sample, to mark as
+    /// used.
     fn select_new(&self, tier: Tier) -> Option<(Selection, Vec<(SourceId, Mono)>)> {
         let max_age = self.cfg.selection.max_age;
         let samples: Vec<Sample> = self
@@ -731,7 +750,14 @@ impl Engine {
             .filter(|s| s.spec.tier == tier)
             .filter_map(|s| {
                 let age = self.window(s.fed_until.max(self.freq_changed_at), max_age)?;
-                s.filter.best_fresh(self.now, age)
+                let new = s.filter.best_fresh(self.now, age)?;
+                // The best of the last eight includes `new`, so a source
+                // with one sample, or a path that stays slow for eight
+                // samples, is never a spike.
+                let best = s.filter.best().map_or(new.delay, |b| b.delay).as_secs();
+                let d = new.delay.as_secs();
+                let spike = d > POPCORN_RATIO * best && d > POPCORN_FLOOR.as_secs_f64();
+                (!spike).then_some(new)
             })
             .collect();
         let sel = select(&samples, self.now, &self.cfg.selection)?;
@@ -739,10 +765,21 @@ impl Engine {
     }
 
     /// Feeds the loop from new samples of the active tier, if any.
-    fn feed_loop(&mut self, tier: Tier, out: &mut Vec<Action>) {
+    ///
+    /// `picked` is the tier-wide selection over the last eight samples of
+    /// each source. The new samples may feed the loop only if every one of
+    /// their survivors is also a survivor there. Otherwise sources with
+    /// nothing new (lost reply, timeout, kiss-of-death) would leave a falseticker to
+    /// win alone. In that case nothing is fed this round and the samples
+    /// stay unused, so the next round with replies from the majority can
+    /// still use them.
+    fn feed_loop(&mut self, tier: Tier, picked: &Selection, out: &mut Vec<Action>) {
         let Some((sel, used)) = self.select_new(tier) else {
             return;
         };
+        if !sel.survivors.iter().all(|id| picked.survivors.contains(id)) {
+            return;
+        }
         for (id, at) in used {
             if let Some(src) = self.sources.get_mut(&id) {
                 src.fed_until = Some(at);
