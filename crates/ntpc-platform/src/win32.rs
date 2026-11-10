@@ -13,31 +13,35 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
 
+use windows_sys::core::PWSTR;
+
 use windows_sys::Win32::Foundation::{
     ERROR_NOT_ALL_ASSIGNED, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID, LocalFree,
     SYSTEMTIME,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SetSecurityInfo,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, AdjustTokenPrivileges, DACL_SECURITY_INFORMATION, GetAce,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    GetTokenInformation, IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_SYSTEMTIME_NAME, SECURITY_ATTRIBUTES,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_OWNER, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    TokenElevation, TokenOwner, TokenPrivileges, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    SE_PRIVILEGE_ENABLED, SE_SYSTEMTIME_NAME, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_OWNER, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenOwner,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FULL_DIR_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
+    FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustment, GetSystemTimeAdjustmentPrecise, GetSystemTimePreciseAsFileTime,
-    SetSystemTime, SetSystemTimeAdjustmentPrecise,
+    GetSystemTimeAdjustmentPrecise, GetSystemTimePreciseAsFileTime, SetSystemTime,
+    SetSystemTimeAdjustmentPrecise,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::Time::FileTimeToSystemTime;
@@ -77,11 +81,13 @@ pub fn time_adjustment_precise() -> io::Result<RawAdjustment> {
     })
 }
 
+#[cfg(test)]
 /// Reads the legacy `GetSystemTimeAdjustment`. Read only. Used to compare.
 ///
 /// # Errors
 /// The OS error if the call fails.
 pub fn time_adjustment_legacy() -> io::Result<RawAdjustment> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAdjustment;
     let mut adjustment = 0u32;
     let mut increment = 0u32;
     let mut disabled = 0;
@@ -247,18 +253,21 @@ pub fn token_default_owner() -> io::Result<Principal> {
     if len < size_of::<TOKEN_OWNER>() {
         return Err(io::Error::other("token owner is truncated"));
     }
-    // SAFETY: the OS filled `buf` with a TOKEN_OWNER, checked to fit. Its
-    // SID pointer points into `buf`, which lives across `classify`.
+    // SAFETY: the OS filled `buf` with a TOKEN_OWNER, checked to fit.
     let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_OWNER>()).Owner };
-    Ok(classify(sid))
+    // SAFETY: GetTokenInformation stores the owner SID inside `buf` itself,
+    // right after the TOKEN_OWNER header, and `buf` lives across the call.
+    Ok(unsafe { classify(sid) })
 }
 
+#[cfg(test)]
 /// Whether the process token holds `SeSystemtimePrivilege` at all, enabled
 /// or not. Read only.
 ///
 /// # Errors
 /// The OS error if the token cannot be read.
 pub fn token_has_systemtime_privilege() -> io::Result<bool> {
+    use windows_sys::Win32::Security::TokenPrivileges;
     let luid = systemtime_luid()?;
     let token = process_token(TOKEN_QUERY)?;
     let (buf, len) = token_info(&token, TokenPrivileges)?;
@@ -291,11 +300,13 @@ pub fn token_has_systemtime_privilege() -> io::Result<bool> {
         .any(|e| e.Luid.LowPart == luid.LowPart && e.Luid.HighPart == luid.HighPart))
 }
 
+#[cfg(test)]
 /// Whether the process token is elevated. Read only.
 ///
 /// # Errors
 /// The OS error if the token cannot be read.
 pub fn token_is_elevated() -> io::Result<bool> {
+    use windows_sys::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
     let token = process_token(TOKEN_QUERY)?;
     let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut len = 0u32;
@@ -451,8 +462,29 @@ pub enum Principal {
     System,
     /// `BUILTIN\Administrators`.
     Administrators,
+    /// `NT SERVICE\TrustedInstaller`. Owns many system folders.
+    TrustedInstaller,
     /// Anyone else.
     Other,
+}
+
+/// SYSTEM, `S-1-5-18`.
+const SID_SYSTEM: &str = "S-1-5-18";
+/// Administrators, `S-1-5-32-544`.
+const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
+/// `TrustedInstaller`, the service SID of `NT SERVICE\TrustedInstaller`.
+const SID_TRUSTED_INSTALLER: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Sorts a SID in string form. Pure, so the mapping is unit tested.
+#[must_use]
+pub fn principal_from_sid_string(sid: &str) -> Principal {
+    match sid {
+        SID_SYSTEM => Principal::System,
+        SID_ADMINISTRATORS => Principal::Administrators,
+        SID_TRUSTED_INSTALLER => Principal::TrustedInstaller,
+        _ => Principal::Other,
+    }
 }
 
 /// One ACE of a DACL.
@@ -487,29 +519,54 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// Frees a `LocalAlloc` buffer from the OS on drop.
 struct LocalMem(*mut c_void);
 
+impl LocalMem {
+    /// Takes ownership of `ptr`.
+    ///
+    /// # Safety
+    /// `ptr` is null or came from an OS call documented to return memory
+    /// that the caller frees with `LocalFree`. Nothing else frees it.
+    unsafe fn new(ptr: *mut c_void) -> Self {
+        Self(ptr)
+    }
+}
+
 impl Drop for LocalMem {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: the pointer came from an OS call documented to return
-            // LocalAlloc memory, and it is freed once, here.
+            // SAFETY: `new`'s contract says the pointer is LocalAlloc memory
+            // owned by this value alone, and it is freed once, here.
             unsafe { LocalFree(self.0) };
         }
     }
 }
 
-fn classify(sid: PSID) -> Principal {
+/// Sorts a SID.
+///
+/// # Safety
+/// `sid` is null or points at a valid SID that stays alive for the call.
+unsafe fn classify(sid: PSID) -> Principal {
     if sid.is_null() {
         return Principal::Other;
     }
-    // SAFETY: `sid` points at a valid SID inside a live security descriptor.
-    if unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0 {
-        return Principal::System;
+    let mut text: PWSTR = ptr::null_mut();
+    // SAFETY: the caller guarantees `sid` is a valid live SID. `text` is an
+    // out slot that receives LocalAlloc memory on success.
+    if unsafe { ConvertSidToStringSidW(sid, &raw mut text) } == 0 {
+        // An unreadable SID is never trusted.
+        return Principal::Other;
     }
-    // SAFETY: as above.
-    if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0 {
-        return Principal::Administrators;
+    // SAFETY: on success `text` is LocalAlloc memory we must free.
+    let _guard = unsafe { LocalMem::new(text.cast()) };
+    let mut len = 0usize;
+    // SAFETY: the OS returns a NUL-terminated wide string. The scan stops at
+    // the NUL, which lies inside the allocation.
+    while unsafe { *text.add(len) } != 0 {
+        len += 1;
     }
-    Principal::Other
+    // SAFETY: `len` wide chars from `text` are initialised and inside the
+    // allocation, which `_guard` keeps alive until the end of the function.
+    let units = unsafe { std::slice::from_raw_parts(text, len) };
+    principal_from_sid_string(&String::from_utf16_lossy(units))
 }
 
 /// Reads owner and DACL through an open handle.
@@ -539,7 +596,8 @@ pub fn read_security(handle: &OwnedHandle) -> io::Result<Security> {
     }
     // `owner` and `dacl` point into `sd`, which lives until this guard drops
     // at the end of the function.
-    let _guard = LocalMem(sd);
+    // SAFETY: GetSecurityInfo documents `sd` as LocalFree memory.
+    let _guard = unsafe { LocalMem::new(sd) };
     let mut control = 0u16;
     let mut revision = 0u32;
     // SAFETY: `sd` is the live descriptor from the call above.
@@ -549,7 +607,8 @@ pub fn read_security(handle: &OwnedHandle) -> io::Result<Security> {
     let owner = if owner.is_null() {
         None
     } else {
-        Some(classify(owner))
+        // SAFETY: `owner` points at the owner SID inside `sd`, alive here.
+        Some(unsafe { classify(owner) })
     };
     let aces = if dacl.is_null() {
         None
@@ -622,7 +681,8 @@ fn descriptor(sddl: &str) -> io::Result<LocalMem> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(LocalMem(sd))
+    // SAFETY: the call documents `sd` as LocalFree memory.
+    Ok(unsafe { LocalMem::new(sd) })
 }
 
 /// Writes the state directory DACL through `handle`, protected so nothing
@@ -697,6 +757,148 @@ pub fn create_secure_dir(path: &Path) -> io::Result<()> {
     // SAFETY: `name` is NUL-terminated. `attrs` and the descriptor it points
     // at outlive the call.
     let ok = unsafe { CreateDirectoryW(name.as_ptr(), &raw const attrs) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// One entry of a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// The entry's own name, no path.
+    pub name: std::ffi::OsString,
+    /// `FILE_ATTRIBUTE_*` bits as the listing reports them.
+    pub attributes: u32,
+}
+
+/// Lists a directory through its open handle. The handle needs
+/// `FILE_LIST_DIRECTORY`. Nothing is opened by path and no link is followed.
+/// `.` and `..` are left out.
+///
+/// # Errors
+/// The OS error if the listing fails.
+pub fn list_dir(handle: &OwnedHandle) -> io::Result<Vec<DirEntry>> {
+    use std::os::windows::ffi::OsStringExt;
+    // u64 elements give the 8-byte alignment FILE_FULL_DIR_INFO needs.
+    let mut buf = vec![0u64; 8192];
+    let bytes = buf.len() * 8;
+    // 64 KiB fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let size = bytes as u32;
+    let name_offset = std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName);
+    let mut out = Vec::new();
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        // SAFETY: `buf` is `size` writable, aligned bytes. The handle is open.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_raw_handle(),
+                class,
+                buf.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+        if ok == 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(18) {
+                // ERROR_NO_MORE_FILES: the listing is complete.
+                return Ok(out);
+            }
+            return Err(e);
+        }
+        class = FileFullDirectoryInfo;
+        let mut offset = 0usize;
+        loop {
+            if offset + name_offset > bytes {
+                return Err(io::Error::other("directory listing record out of bounds"));
+            }
+            let base = buf.as_ptr().cast::<u8>();
+            // SAFETY: the bounds check above keeps the fixed header inside
+            // `buf`. `read_unaligned` makes no alignment assumption.
+            #[allow(clippy::cast_ptr_alignment)]
+            let rec = unsafe {
+                base.add(offset)
+                    .cast::<FILE_FULL_DIR_INFO>()
+                    .read_unaligned()
+            };
+            let name_bytes = rec.FileNameLength as usize;
+            if offset + name_offset + name_bytes > bytes {
+                return Err(io::Error::other("directory listing name out of bounds"));
+            }
+            let start = offset + name_offset;
+            let units: Vec<u16> = (0..name_bytes / 2)
+                .map(|i| {
+                    // SAFETY: the check above proves the whole name lies
+                    // inside `buf`. `read_unaligned` makes no alignment
+                    // assumption.
+                    #[allow(clippy::cast_ptr_alignment)]
+                    unsafe {
+                        base.add(start + 2 * i).cast::<u16>().read_unaligned()
+                    }
+                })
+                .collect();
+            let name = std::ffi::OsString::from_wide(&units);
+            if name != "." && name != ".." {
+                out.push(DirEntry {
+                    name,
+                    attributes: rec.FileAttributes,
+                });
+            }
+            if rec.NextEntryOffset == 0 {
+                break;
+            }
+            offset += rec.NextEntryOffset as usize;
+        }
+    }
+}
+
+/// Attributes and hard link count of an open file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkInfo {
+    /// `FILE_ATTRIBUTE_*` bits.
+    pub attributes: u32,
+    /// Number of hard links to the file.
+    pub links: u32,
+}
+
+/// Reads `GetFileInformationByHandle` for `handle`.
+///
+/// # Errors
+/// The OS error if the query fails.
+pub fn link_info(handle: &OwnedHandle) -> io::Result<LinkInfo> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data. All zero is valid.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live struct of the documented type.
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(LinkInfo {
+        attributes: info.dwFileAttributes,
+        links: info.nNumberOfLinks,
+    })
+}
+
+/// Marks the file behind `handle` for deletion. It goes when the last
+/// handle closes. The handle needs `DELETE`. Deleting through the checked
+/// handle means the file checked is the file deleted.
+///
+/// # Errors
+/// The OS error if the call fails.
+pub fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // The struct is 1 byte, so the size fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let size = size_of::<FILE_DISPOSITION_INFO>() as u32;
+    // SAFETY: `info` is a live struct of the class and size passed.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const info).cast::<c_void>(),
+            size,
+        )
+    };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
