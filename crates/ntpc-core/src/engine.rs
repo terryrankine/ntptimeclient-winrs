@@ -647,7 +647,13 @@ impl Engine {
         self.gate = gate;
         match (was, gate.open()) {
             (true, false) => {
-                self.set_slew(0.0);
+                // Ruling R52. After a failed command the OS keeps its last
+                // rate, so the history keeps the last slew. Any other close
+                // hands the clock over (w32time, domain rule), so the
+                // engine no longer knows the rate and records none.
+                if reason != DisableReason::ClockFailed {
+                    self.set_slew(0.0);
+                }
                 out.push(Action::Log(LogEvent::AdjustmentDisabled { reason }));
             }
             (false, true) => {
