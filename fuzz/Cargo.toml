@@ -1,0 +1,25 @@
+[package]
+name = "ntpc-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ntpc-core = { path = "../crates/ntpc-core" }
+ntpc-service = { path = "../crates/ntpc-service" }
+
+# Its own workspace. The root workspace must never build this crate, because
+# libFuzzer needs the nightly toolchain and cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "parse_response"
+path = "fuzz_targets/parse_response.rs"
+test = false
+doc = false
+bench = false
