@@ -91,6 +91,9 @@ struct Harness {
     /// Queries to these sources are never answered.
     lost: Vec<SourceId>,
     model: Option<ClockModel>,
+    /// Mono resolution in nanoseconds, as on a host with coarse ticks. The
+    /// engine sees stamps rounded down and ticks rounded up to it.
+    grid: Option<u64>,
     inbox: Vec<(Mono, Event)>,
     log: Vec<(u64, Action)>,
 }
@@ -105,6 +108,7 @@ impl Harness {
             rtt: Duration::ZERO,
             lost: Vec::new(),
             model: None,
+            grid: None,
             inbox: Vec::new(),
             log: Vec::new(),
         }
@@ -120,6 +124,17 @@ impl Harness {
         h.feed(Event::AdjustmentAllowed(true));
         h.feed(Event::SourcesChanged(specs));
         h
+    }
+
+    fn down(&self, m: Mono) -> Mono {
+        self.grid
+            .map_or(m, |g| Mono::from_nanos(m.as_nanos() / g * g))
+    }
+
+    fn up(&self, m: Mono) -> Mono {
+        self.grid.map_or(m, |g| {
+            Mono::from_nanos(m.as_nanos().div_ceil(g).saturating_mul(g))
+        })
     }
 
     fn feed(&mut self, ev: Event) -> Vec<Action> {
@@ -150,7 +165,7 @@ impl Harness {
                 let ev = match (self.reply)(*source, secs(self.now)) {
                     Ok(o) => {
                         let d = (self.delay)(*source, secs(self.now));
-                        Event::Sample(sample_with(*source, o + shift, d, due))
+                        Event::Sample(sample_with(*source, o + shift, d, self.down(due)))
                     }
                     Err(f) => Event::Failed(*source, f),
                 };
@@ -177,6 +192,7 @@ impl Harness {
         loop {
             let wake = self.e.next_wake().expect("engine gives a wake time");
             let reply = self.inbox.iter().map(|(t, _)| *t).min();
+            let wake = self.up(wake);
             let t = reply.map_or(wake, |r| r.min(wake));
             if secs(t) > until {
                 return;
@@ -188,7 +204,7 @@ impl Harness {
                 let (_, ev) = self.inbox.remove(i);
                 // A failure carries no time, so the host ticks first.
                 if matches!(ev, Event::Failed(..)) {
-                    self.feed(Event::Tick(t));
+                    self.feed(Event::Tick(self.down(t)));
                 }
                 self.feed(ev);
             } else {
@@ -664,11 +680,12 @@ fn stale_lowest_delay_sample_is_not_reused() {
     // Every later round must feed its own new reading instead.
     let reply: Reply = Box::new(|_, t| Ok(if t == 64 { 0.05 } else { 0.01 }));
     let mut h = Harness::new(EngineConfig::default(), reply);
+    // Later delays stay under 3 x 10 ms, so the spike guard keeps out of it.
     h.delay = Box::new(|_, t| {
         if t == 64 {
-            0.001
+            0.010
         } else {
-            0.040 + 0.002 * f64::from(u8::try_from(t / 64 % 5).unwrap_or(0))
+            0.020 + 0.002 * f64::from(u8::try_from(t / 64 % 5).unwrap_or(0))
         }
     });
     h.feed(Event::AdjustmentAllowed(true));
@@ -746,10 +763,11 @@ fn refuses_step_when_pool_cross_check_disagrees() {
     let h = config_and_pool(steady(5.0), pool, 3600);
     let steps = h.steps();
     assert_eq!(steps.len(), 1, "steps {steps:?}");
-    // Each refusal on a stale pool reading asks the pool again within one
-    // poll, so the step follows the first agreeing reply.
+    // A refusal on a stale pool reading asks the pool again at once. A
+    // disagreeing reading is not stale yet, so while the pool disagrees it
+    // is asked every other poll. The step follows within three polls.
     assert!(
-        (800..=800 + 2 * 64).contains(&steps[0]),
+        (800..=800 + 3 * 64).contains(&steps[0]),
         "step at {}",
         steps[0]
     );
@@ -1006,6 +1024,220 @@ fn sample_from_before_a_frequency_change_does_not_feed_the_loop() {
     assert!(h.queries(1).contains(&192), "{:?}", h.queries(1));
     let fed: Vec<u64> = h.times(is_freq).into_iter().filter(|&t| t > 168).collect();
     assert_eq!(fed, vec![286]);
+}
+
+#[test]
+fn lone_falseticker_is_not_fed_when_majority_misses_rounds() {
+    // Reviewer probe. Sources 1 and 2 read 0, source 3 reads +100 ms. From
+    // 1000 s to 1100 s only source 3 answers. The tier still holds the
+    // agreeing pair in its eight-sample window, so source 3 alone must not
+    // feed the loop.
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(3) {
+            Ok(0.100)
+        } else if (1000..1100).contains(&t) {
+            Err(QueryFailure::Timeout)
+        } else {
+            Ok(0.0)
+        }
+    });
+    let specs = vec![
+        spec(1, Tier::Pool),
+        spec(2, Tier::Pool),
+        spec(3, Tier::Pool),
+    ];
+    let mut h = Harness::start_with(cfg, specs, reply);
+    h.run(990);
+    assert!(h.status().last_offset.is_some_and(|o| near(o, 0.0)));
+    let n = h.log.len();
+    h.run(1100);
+    let after = h.status().last_offset.expect("offset");
+    assert!(
+        after.as_secs().abs() < 0.01,
+        "falseticker fed alone: {}",
+        after.as_secs()
+    );
+    assert!(!h.log[n..].iter().any(|(_, a)| is_freq(a)), "nothing fed");
+    h.run(1300);
+    assert!(
+        h.status().last_offset.is_some_and(|o| near(o, 0.0)),
+        "majority feeds again"
+    );
+}
+
+#[test]
+fn one_lost_majority_reply_with_a_falseticker_feeds_nothing() {
+    // Defined behaviour: sources 1 and 2 read 0, source 3 reads +100 ms.
+    // Source 1 loses one reply. The new samples are 2 and 3, which do not
+    // agree, so that round feeds nothing. The tier stays usable and the
+    // next full round feeds 0 again.
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(3) {
+            Ok(0.100)
+        } else if s == id(1) && t == 640 {
+            Err(QueryFailure::Timeout)
+        } else {
+            Ok(0.0)
+        }
+    });
+    let specs = vec![
+        spec(1, Tier::Pool),
+        spec(2, Tier::Pool),
+        spec(3, Tier::Pool),
+    ];
+    let mut h = Harness::start_with(cfg, specs, reply);
+    h.run(700);
+    let fed = h.times(is_freq);
+    assert!(fed.contains(&576) && !fed.contains(&640), "fed {fed:?}");
+    assert_eq!(h.status().active_tier, Some(Tier::Pool));
+    h.run(800);
+    assert!(h.times(is_freq).contains(&704), "next full round feeds");
+    assert!(h.status().last_offset.is_some_and(|o| near(o, 0.0)));
+}
+
+#[test]
+fn one_lost_reply_among_agreeing_sources_still_feeds() {
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(1) && t == 640 {
+            Err(QueryFailure::Timeout)
+        } else {
+            Ok(0.002)
+        }
+    });
+    let specs = vec![
+        spec(1, Tier::Pool),
+        spec(2, Tier::Pool),
+        spec(3, Tier::Pool),
+    ];
+    let mut h = Harness::start_with(cfg, specs, reply);
+    h.run(700);
+    assert!(h.times(is_freq).contains(&640), "{:?}", h.times(is_freq));
+}
+
+#[test]
+fn start_step_with_zero_rtt_pool_reply() {
+    // The pool reply lands at the very instant of the refusal's frequency
+    // change. It must still count.
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(1) {
+            Ok(5.0)
+        } else if t == 0 {
+            Err(QueryFailure::Timeout)
+        } else {
+            Ok(5.05)
+        }
+    });
+    let mut h = Harness::start(vec![spec(1, Tier::Config), spec(2, Tier::Pool)], reply);
+    h.run(1000);
+    assert_eq!(h.steps(), vec![128]);
+}
+
+#[test]
+fn start_step_with_coarse_mono_ticks() {
+    // A 15.6 ms Mono and a 5 ms pool reply: the reply carries the same
+    // stamp as the frequency change.
+    let reply: Reply = Box::new(|s, t| {
+        if s == id(1) {
+            Ok(5.0)
+        } else if t == 0 {
+            Err(QueryFailure::Timeout)
+        } else {
+            Ok(5.05)
+        }
+    });
+    let mut h = Harness::new(EngineConfig::default(), reply);
+    h.grid = Some(15_625_000);
+    h.rtt = Duration::from_millis(5);
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![
+        spec(1, Tier::Config),
+        spec(2, Tier::Pool),
+    ]));
+    h.run(1000);
+    let steps = h.steps();
+    assert_eq!(steps.len(), 1, "steps {steps:?}");
+    assert!(steps[0] <= 64 * 3, "step at {}", steps[0]);
+}
+
+#[test]
+fn delay_spike_is_not_fed() {
+    // 20 ms path with one 300 ms spike reading +50 ms. The spike must not
+    // move the clock or teach drift.
+    let reply: Reply = Box::new(|_, t| Ok(if t == 640 { 0.050 } else { 0.0 }));
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let mut h = Harness::new(cfg, reply);
+    h.delay = Box::new(|_, t| if t == 640 { 0.300 } else { 0.020 });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![spec(1, Tier::Pool)]));
+    h.run(1000);
+    assert!(!h.times(is_freq).contains(&640));
+    assert!(h.status().last_offset.is_some_and(|o| near(o, 0.0)));
+    assert!(h.status().drift.value().abs() < 1e-12);
+    assert_eq!(h.status().active_tier, Some(Tier::Pool), "still usable");
+}
+
+#[test]
+fn path_that_stays_slow_is_fed_after_eight_samples() {
+    // From 640 s the path goes from 20 ms to 200 ms for good. The first
+    // seven slow samples still sit beside fast ones and are spikes. The
+    // eighth slow sample evicts the last fast one and is fed.
+    let reply: Reply = Box::new(|_, t| Ok(if t >= 640 { 0.004 } else { 0.0 }));
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let mut h = Harness::new(cfg, reply);
+    h.delay = Box::new(|_, t| if t >= 640 { 0.200 } else { 0.020 });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![spec(1, Tier::Pool)]));
+    h.run(2000);
+    let fed: Vec<u64> = h.times(is_freq).into_iter().filter(|&t| t >= 640).collect();
+    assert_eq!(fed.first(), Some(&(640 + 7 * 64)), "fed {fed:?}");
+    assert!(h.status().last_offset.is_some_and(|o| near(o, 0.004)));
+}
+
+#[test]
+fn lan_delay_bump_below_floor_is_fed() {
+    // A 0.3 ms LAN path reads 2 ms once. That is over 3 x its best, but
+    // under the 10 ms floor, so it is still fed.
+    let cfg = EngineConfig {
+        max_poll: Duration::from_secs(64),
+        ..EngineConfig::default()
+    };
+    let mut h = Harness::new(cfg, steady(0.001));
+    h.delay = Box::new(|_, t| if t == 640 { 0.002 } else { 0.0003 });
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![spec(1, Tier::Pool)]));
+    h.run(700);
+    assert!(h.times(is_freq).contains(&640), "{:?}", h.times(is_freq));
+}
+
+#[test]
+fn first_slow_samples_of_a_source_are_fed() {
+    // A 250 ms path from the start. With fewer than eight samples the best
+    // is the source's own, so nothing is a spike.
+    let mut h = Harness::new(EngineConfig::default(), steady(0.003));
+    h.delay = Box::new(|_, _| 0.250);
+    h.feed(Event::AdjustmentAllowed(true));
+    h.feed(Event::SourcesChanged(vec![spec(1, Tier::Pool)]));
+    h.run(200);
+    let fed: Vec<u64> = h.times(is_freq).into_iter().filter(|&t| t > 0).collect();
+    assert_eq!(fed[..2], [64, 128], "fed {fed:?}");
 }
 
 #[test]
