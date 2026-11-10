@@ -125,6 +125,8 @@ fn writes_status_json() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Covers `read_status` and `format_status` only. The `status` subcommand
+/// itself is wired in main.rs in 14c, which adds its own test.
 #[test]
 fn status_command_prints_status_json() {
     let dir = Rig::temp_dir("status-cmd");
@@ -183,6 +185,23 @@ fn escapes_control_characters_in_logs() {
         "a\\nFAKE LINE\\r\\u{001B}[31mred\\u{0000}nul\\u{2028}ls\\u{2029}ps\\u{202E}rlo\\u{2066}iso\\\\x"
     ));
     assert_eq!(escape("plain text 123"), "plain text 123");
+    // Hidden format characters (Cf): soft hyphen, Mongolian vowel separator,
+    // deprecated shaping controls, annotation controls, tag characters.
+    for c in [
+        '\u{00AD}',
+        '\u{180E}',
+        '\u{206A}',
+        '\u{206F}',
+        '\u{FFF9}',
+        '\u{FFFB}',
+        '\u{E0000}',
+        '\u{E0041}',
+        '\u{E007F}',
+    ] {
+        let e = escape(&format!("a{c}b"));
+        assert!(!e.contains(c), "{c:?} not escaped: {e:?}");
+        assert_eq!(e, format!("a\\u{{{:04X}}}b", u32::from(c)));
+    }
 
     // Through the host: a DHCP error text reaches the log escaped.
     let mut rig = Rig::new(0.0, 0.0);
@@ -624,4 +643,150 @@ fn end_to_end_with_config_and_pool_tiers() {
     assert_eq!(last.sources_config, 2);
     assert!(lock(&rig.world).err.abs() < 0.005);
     let _ = POOL;
+}
+
+// ------------------------------------------------------------ fix round 1
+
+fn times_of(rig: &Rig, want: Cmd) -> Vec<f64> {
+    rig.commands()
+        .iter()
+        .filter(|c| c.1 == want)
+        .map(|c| as_secs(c.0))
+        .collect()
+}
+
+#[test]
+fn w32time_start_hands_the_rate_back_once_and_stop_leaves_it() {
+    // R98. w32time starts at 3600 s and runs to the end.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 1e9)];
+    rig.run(3 * HOUR);
+    let resets = times_of(&rig, Cmd::Reset);
+    assert_eq!(resets.len(), 1, "{resets:?}");
+    assert!(resets[0] >= 3600.0 && resets[0] <= 3630.0, "{resets:?}");
+    assert_eq!(times_of(&rig, Cmd::Take).len(), 1);
+    assert!(rig.log_has("w32time runs: clock rate handed back to the system"));
+    // Nothing touches the clock after the hand-back.
+    assert!(rig.commands().iter().all(|c| as_secs(c.0) <= resets[0]));
+}
+
+#[test]
+fn w32time_stopping_again_retakes_the_rate() {
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(3600.0, 7200.0)];
+    rig.run(3 * HOUR);
+    let takes = times_of(&rig, Cmd::Take);
+    let resets = times_of(&rig, Cmd::Reset);
+    assert_eq!(takes.len(), 2, "{takes:?}");
+    assert!(takes[1] >= 7200.0 && takes[1] <= 7230.0, "{takes:?}");
+    assert_eq!(resets.len(), 2, "hand-back plus stop: {resets:?}");
+    // The re-take comes before the first command after w32time stops.
+    let first_after = clock_cmds(&rig)
+        .into_iter()
+        .find(|c| as_secs(c.0) >= 7200.0)
+        .expect("commands again");
+    assert!(as_secs(first_after.0) >= takes[1]);
+}
+
+#[test]
+fn flapping_w32time_gives_one_reset_per_start() {
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_running = vec![(1000.0, 1100.0), (2000.0, 2100.0), (3000.0, 3100.0)];
+    rig.run(HOUR);
+    let resets = times_of(&rig, Cmd::Reset);
+    let in_window = |a: f64| {
+        resets
+            .iter()
+            .filter(|t| **t >= a && **t <= a + 30.0)
+            .count()
+    };
+    assert_eq!(in_window(1000.0), 1, "{resets:?}");
+    assert_eq!(in_window(2000.0), 1, "{resets:?}");
+    assert_eq!(in_window(3000.0), 1, "{resets:?}");
+    assert_eq!(resets.len(), 4, "three hand-backs and the stop: {resets:?}");
+    assert_eq!(times_of(&rig, Cmd::Take).len(), 4);
+}
+
+#[test]
+fn clock_failure_with_moving_time_stays_in_its_batch() {
+    // I3: real time moves between the clock action and its result. With
+    // time moving on every read the failed step's result must still reach
+    // the engine before anything else, so no command follows it until the
+    // re-arm, and after the re-arm the step is allowed again.
+    let mut rig = Rig::new(0.5, 0.0);
+    rig.time.advance_per_read(1);
+    lock(&rig.world).fail_numbers.insert(2);
+    rig.run(HOUR);
+    let cmds = clock_cmds(&rig);
+    assert!(matches!(cmds[1].1, Cmd::Step(_)) && !cmds[1].2, "{cmds:?}");
+    let gap = cmds[2].0.saturating_duration_since(cmds[1].0);
+    assert!(gap >= REARM_FIRST, "next command after {gap:?}");
+    assert!(cmds[2..].iter().any(|c| matches!(c.1, Cmd::Step(_)) && c.2));
+}
+
+#[test]
+fn end_to_end_with_moving_time_converges() {
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.time.advance_per_read(1);
+    rig.run(12 * HOUR);
+    assert!(lock(&rig.world).err.abs() < 0.005);
+    assert!(clock_cmds(&rig).iter().all(|c| c.2));
+}
+
+#[test]
+fn a_panic_in_the_loop_still_resets_the_rate() {
+    // I4.
+    let mut rig = Rig::new(0.050, 20.0);
+    rig.monitor_panic_at = Some(600.0);
+    let r = rig.try_run(HOUR);
+    let Err(ntpc_service::host::HostError::Panicked(msg)) = r else {
+        panic!("expected a panic error, got {r:?}");
+    };
+    assert!(msg.contains("injected monitor panic"), "{msg}");
+    assert_eq!(times_of(&rig, Cmd::Reset).len(), 1);
+    assert!(rig.log_has("the host loop panicked: injected monitor panic"));
+    let last = lock(&rig.reports).last().cloned().expect("final status").1;
+    assert!(!last.running);
+}
+
+#[test]
+fn panicking_dhcp_reads_are_reported_and_the_reader_stops() {
+    let mut rig = dhcp_rig();
+    rig.dhcp.panics.store(true, Ordering::SeqCst);
+    rig.network_at = vec![700.0, 1400.0, 2100.0, 2800.0];
+    rig.run(HOUR);
+    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (1 of 3)"));
+    assert!(rig.log_has("DHCP read failed: the DHCP read panicked (3 of 3)"));
+    assert!(rig.log_has("the DHCP reader stopped"));
+    assert_eq!(
+        read_times(&rig).len(),
+        3,
+        "no read after the reader stopped"
+    );
+    assert!(!freqs(&rig).is_empty(), "timekeeping goes on");
+}
+
+#[test]
+fn a_panicking_resolver_is_replaced() {
+    let mut rig = Rig::new(0.0, 0.0);
+    *lock(&rig.lookup.panic_first) = 1;
+    rig.run(HOUR);
+    assert!(rig.log_has("the resolver panicked. Starting a fresh resolver"));
+    // The fresh resolver found the pool within the 15 min offline cap.
+    let q = lock(&rig.transport.queries).clone();
+    let first = q.first().expect("queries after the panic").0;
+    assert!(as_secs(first) <= 15.0 * 60.0 + 31.0, "{}", as_secs(first));
+}
+
+#[test]
+fn stuck_lookups_are_capped_at_three() {
+    let mut rig = Rig::new(0.0, 0.0);
+    rig.threads = true;
+    rig.patience = Duration::from_millis(20);
+    rig.lookup.hang.store(true, Ordering::SeqCst);
+    rig.run(HOUR);
+    assert_eq!(rig.lookup.calls.load(Ordering::SeqCst), 3);
+    assert!(rig.log_has("3 name lookups are stuck. No new lookup starts"));
+    // Let the stuck threads end.
+    rig.lookup.hang.store(false, Ordering::SeqCst);
 }

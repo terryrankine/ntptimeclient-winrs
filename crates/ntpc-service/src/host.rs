@@ -44,6 +44,7 @@ mod state;
 use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -293,6 +294,10 @@ pub(crate) enum Inner {
         specs: Vec<SourceSpec>,
         notes: Vec<ResolveNote>,
     },
+    /// The lookup worker panicked.
+    ResolveFailed {
+        generation: u64,
+    },
     Dhcp(Result<DhcpRead, DhcpReadError>),
 }
 
@@ -422,6 +427,9 @@ pub enum HostError {
     /// The config breaks a rule.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// The loop panicked. The shutdown sequence ran after it.
+    #[error("the host loop panicked: {0}")]
+    Panicked(String),
 }
 
 /// Runs the host until [`HostControl::shutdown`].
@@ -431,10 +439,37 @@ pub enum HostError {
 ///
 /// # Errors
 /// [`HostError::Config`] if `cfg` breaks a rule. Nothing has run then.
+/// [`HostError::Panicked`] if the loop or the shutdown panicked. The
+/// shutdown sequence (rate reset, drift, final status) has run as far as
+/// it could.
 pub fn run(cfg: Config, deps: HostDeps, inbox: Inbox) -> Result<(), HostError> {
     cfg.validate()?;
     let mut host = state::Host::start(cfg, deps, inbox);
-    while host.turn() {}
-    host.shutdown();
-    Ok(())
+    // A panic in the loop must not skip the shutdown: the clock rate would
+    // stay at our last frequency with the OS kept out. The panic is caught,
+    // the shutdown runs, and the panic comes back as an error so the
+    // service wrapper can report a failed stop. Not a Drop guard: a guard
+    // would run the shutdown during unwinding, where a second panic aborts
+    // the process before the rate is reset. This needs `panic = "unwind"`,
+    // the default, which the workspace keeps.
+    let looped = panic::catch_unwind(AssertUnwindSafe(|| while host.turn() {}));
+    let message = looped.err().map(|payload| panic_text(payload.as_ref()));
+    if let Some(m) = &message {
+        host.log_panic(m);
+    }
+    let stopped = panic::catch_unwind(AssertUnwindSafe(|| host.shutdown()));
+    match (message, stopped) {
+        (None, Ok(())) => Ok(()),
+        (Some(m), _) => Err(HostError::Panicked(m)),
+        (None, Err(payload)) => Err(HostError::Panicked(panic_text(payload.as_ref()))),
+    }
+}
+
+/// The text of a panic payload, for the log and the error.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_owned())
 }

@@ -7,6 +7,7 @@
 //! engine never gets two answers for one query.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use ntpc_core::{Mono, SourceId};
@@ -15,6 +16,9 @@ use ntpc_core::{Mono, SourceId};
 struct Entry {
     ticket: u64,
     started: Mono,
+    /// Where the query went. The host checks it against the id's address
+    /// when the answer comes, since ids can be reused by a fresh resolver.
+    addr: SocketAddr,
 }
 
 #[derive(Debug, Default)]
@@ -29,7 +33,7 @@ impl InFlight {
     }
 
     /// A ticket for a new query, or `None` if one for `source` runs.
-    pub(super) fn begin(&mut self, source: SourceId, now: Mono) -> Option<u64> {
+    pub(super) fn begin(&mut self, source: SourceId, addr: SocketAddr, now: Mono) -> Option<u64> {
         if self.map.contains_key(&source) {
             return None;
         }
@@ -40,18 +44,19 @@ impl InFlight {
             Entry {
                 ticket,
                 started: now,
+                addr,
             },
         );
         Some(ticket)
     }
 
-    /// Ends a query. False if the answer is stale and must be dropped.
-    pub(super) fn finish(&mut self, source: SourceId, ticket: u64) -> bool {
+    /// Ends a query and returns where it went. `None` if the answer is
+    /// stale and must be dropped.
+    pub(super) fn finish(&mut self, source: SourceId, ticket: u64) -> Option<SocketAddr> {
         if self.map.get(&source).is_some_and(|e| e.ticket == ticket) {
-            self.map.remove(&source);
-            true
+            self.map.remove(&source).map(|e| e.addr)
         } else {
-            false
+            None
         }
     }
 
@@ -87,6 +92,10 @@ impl InFlight {
 mod tests {
     use super::*;
 
+    fn a() -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, 1], 123))
+    }
+
     fn src() -> SourceId {
         SourceId::new(1)
     }
@@ -98,22 +107,25 @@ mod tests {
     #[test]
     fn second_query_for_a_running_source_is_not_sent() {
         let mut f = InFlight::default();
-        let t = f.begin(src(), at(0)).expect("first");
-        assert_eq!(f.begin(src(), at(1)), None, "deduped");
-        assert!(f.begin(SourceId::new(2), at(1)).is_some(), "other source");
-        assert!(f.finish(src(), t));
-        assert!(f.begin(src(), at(2)).is_some(), "free again");
+        let t = f.begin(src(), a(), at(0)).expect("first");
+        assert_eq!(f.begin(src(), a(), at(1)), None, "deduped");
+        assert!(
+            f.begin(SourceId::new(2), a(), at(1)).is_some(),
+            "other source"
+        );
+        assert_eq!(f.finish(src(), t), Some(a()));
+        assert!(f.begin(src(), a(), at(2)).is_some(), "free again");
     }
 
     #[test]
     fn answer_after_the_watchdog_is_dropped() {
         let mut f = InFlight::default();
-        let old = f.begin(src(), at(0)).expect("first");
+        let old = f.begin(src(), a(), at(0)).expect("first");
         assert_eq!(f.next_expiry(Duration::from_secs(15)), Some(at(15)));
         assert_eq!(f.take_expired(at(15), Duration::from_secs(15)), vec![src()]);
-        let new = f.begin(src(), at(20)).expect("new query");
-        assert!(!f.finish(src(), old), "stale answer dropped");
-        assert!(f.finish(src(), new));
+        let new = f.begin(src(), a(), at(20)).expect("new query");
+        assert_eq!(f.finish(src(), old), None, "stale answer dropped");
+        assert_eq!(f.finish(src(), new), Some(a()));
         assert_eq!(f.len(), 0);
     }
 }

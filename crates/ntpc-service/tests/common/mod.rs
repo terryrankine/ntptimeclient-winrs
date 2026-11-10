@@ -63,15 +63,21 @@ pub fn bench(n: u8) -> IpAddr {
 
 // ------------------------------------------------------------------ time
 
+/// Fake monotonic time. With `step` above zero every read moves it on by
+/// that many nanoseconds, as real time does between two reads.
 #[derive(Debug, Clone, Default)]
-pub struct FakeTime(Arc<AtomicU64>);
+pub struct FakeTime(Arc<AtomicU64>, Arc<AtomicU64>);
 
 /// 2026-11-10T00:00:00Z.
 const WALL_BASE: i128 = 1_794_268_800 * 1_000_000_000;
 
 impl FakeTime {
     pub fn now(&self) -> Mono {
-        Mono::from_nanos(self.0.load(Ordering::SeqCst))
+        let step = self.1.load(Ordering::SeqCst);
+        Mono::from_nanos(self.0.fetch_add(step, Ordering::SeqCst) + step)
+    }
+    pub fn advance_per_read(&self, ns: u64) {
+        self.1.store(ns, Ordering::SeqCst);
     }
     pub fn set(&self, t: Mono) {
         self.0.fetch_max(t.as_nanos(), Ordering::SeqCst);
@@ -393,6 +399,10 @@ pub struct FakeLookup {
     pub block_first: Mutex<u32>,
     pub gate: Mutex<Option<Receiver<()>>>,
     pub calls: AtomicU64,
+    /// The first `n` lookups panic.
+    pub panic_first: Mutex<u32>,
+    /// Every lookup hangs while this is set.
+    pub hang: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeLookup {
@@ -402,6 +412,8 @@ impl FakeLookup {
             block_first: Mutex::new(0),
             gate: Mutex::new(None),
             calls: AtomicU64::new(0),
+            panic_first: Mutex::new(0),
+            hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -409,6 +421,16 @@ impl FakeLookup {
 impl NameLookup for FakeLookup {
     fn lookup(&self, name: &str) -> io::Result<Vec<IpAddr>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let boom = {
+            let mut p = lock(&self.panic_first);
+            let yes = *p > 0;
+            *p = p.saturating_sub(1);
+            yes
+        };
+        assert!(!boom, "injected lookup panic");
+        while self.hang.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let block = {
             let mut b = lock(&self.block_first);
             let yes = *b > 0;
@@ -442,6 +464,8 @@ impl OwnAddresses for NoOwn {
 /// `w32time` runs during these fake time ranges, seconds.
 pub struct FakeMonitor {
     pub running: Vec<(f64, f64)>,
+    /// Panics on the first call at or after this time, seconds.
+    pub panic_at: Option<f64>,
     pub time: FakeTime,
     pub calls: Arc<Mutex<Vec<Mono>>>,
 }
@@ -451,6 +475,10 @@ impl ServiceMonitor for FakeMonitor {
         let now = self.time.now();
         lock(&self.calls).push(now);
         let t = as_secs(now);
+        assert!(
+            !self.panic_at.is_some_and(|p| t >= p),
+            "injected monitor panic"
+        );
         self.running.iter().any(|(a, b)| t >= *a && t < *b)
     }
 }
@@ -498,11 +526,13 @@ pub struct FakeDhcp {
     pub results: Mutex<Vec<Result<DhcpRead, DhcpReadError>>>,
     pub reads: Reads,
     pub gate: Mutex<Option<Receiver<()>>>,
+    pub panics: std::sync::atomic::AtomicBool,
 }
 
 impl DhcpSource for FakeDhcp {
     fn read(&self, skip: &BTreeSet<AdapterKey>) -> Result<DhcpRead, DhcpReadError> {
         lock(&self.reads).push((self.time.now(), skip.clone()));
+        assert!(!self.panics.load(Ordering::SeqCst), "injected DHCP panic");
         let gate = lock(&self.gate).take();
         if let Some(rx) = gate {
             let _ = rx.recv();
@@ -546,6 +576,7 @@ pub struct Rig {
     pub reports: Arc<Mutex<Vec<(Mono, StatusReport)>>>,
     pub lookup: Arc<FakeLookup>,
     pub monitor_running: Vec<(f64, f64)>,
+    pub monitor_panic_at: Option<f64>,
     pub monitor_calls: Arc<Mutex<Vec<Mono>>>,
     pub network_at: Vec<f64>,
     pub power_at: Vec<(f64, f64)>,
@@ -579,6 +610,7 @@ impl Rig {
             reports: Arc::new(Mutex::new(Vec::new())),
             lookup: Arc::new(FakeLookup::pool(4)),
             monitor_running: Vec::new(),
+            monitor_panic_at: None,
             monitor_calls: Arc::new(Mutex::new(Vec::new())),
             network_at: Vec::new(),
             power_at: Vec::new(),
@@ -587,6 +619,7 @@ impl Rig {
                 results: Mutex::new(Vec::new()),
                 reads: Arc::clone(&dhcp_reads),
                 gate: Mutex::new(None),
+                panics: std::sync::atomic::AtomicBool::new(false),
             }),
             dhcp_reads,
             state: SecureOutcome::Ok,
@@ -604,6 +637,11 @@ impl Rig {
 
     /// Runs the host for `secs` of fake time and returns.
     pub fn run(&mut self, secs_total: u64) {
+        self.try_run(secs_total).expect("host runs");
+    }
+
+    /// Runs the host and returns what `run` returned.
+    pub fn try_run(&mut self, secs_total: u64) -> Result<(), host::HostError> {
         let time = self.time.clone();
         // The real watchers wake the loop through `HostControl::wake`. A
         // no-op hook at each event time does the same on fake time.
@@ -645,6 +683,7 @@ impl Rig {
             own: Arc::new(NoOwn),
             monitor: Box::new(FakeMonitor {
                 running: self.monitor_running.clone(),
+                panic_at: self.monitor_panic_at,
                 time: time.clone(),
                 calls: Arc::clone(&self.monitor_calls),
             }),
@@ -672,7 +711,7 @@ impl Rig {
             }),
         };
         let (_control, inbox) = host::channel();
-        host::run(self.cfg.clone(), deps, inbox).expect("host runs");
+        host::run(self.cfg.clone(), deps, inbox)
     }
 
     pub fn lines(&self) -> Vec<String> {

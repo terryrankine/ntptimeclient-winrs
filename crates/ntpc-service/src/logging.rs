@@ -97,15 +97,23 @@ fn needs_escape(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            // Arabic letter mark, zero-width space to right-to-left mark,
-            // line and paragraph separators, bidi embeddings and overrides,
-            // word joiner and invisible operators, bidi isolates, BOM.
-            '\u{061C}'
+            // Format characters (category Cf) that hide, reorder or join
+            // text: soft hyphen, Arabic letter mark, Mongolian vowel
+            // separator, zero-width space to right-to-left mark, line and
+            // paragraph separators, bidi embeddings and overrides, word
+            // joiner and invisible operators, bidi isolates and the
+            // deprecated shaping controls, BOM, interlinear annotation
+            // controls and the tag characters.
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2066}'..='\u{206F}'
                 | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
         )
 }
 

@@ -1,18 +1,26 @@
 //! Start-up steps and log texts, kept apart from the loop.
 
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 
 use ntpc_core::Ppm;
 
-use super::{AdapterKey, DhcpSource, DriftFile, Inner, JoinClass, Msg, SecureOutcome};
+use super::{
+    AdapterKey, DhcpReadError, DhcpSource, DriftFile, Inner, JoinClass, Msg, SecureOutcome,
+};
 use crate::config::Config;
 use crate::logging::{Level, Logger};
 use crate::resolver::ResolveNote;
 
 /// Name of the DHCP reader thread.
 const DHCP_THREAD: &str = "ntpc-dhcp";
+
+/// Panicking reads before the DHCP reader gives up. A reader that keeps
+/// panicking has a bug, and DHCP is a lower tier, so the service runs on
+/// without it and says so.
+pub(super) const MAX_DHCP_PANICS: u32 = 3;
 
 /// The start lines: version, join state, active config and its warnings.
 pub(super) fn log_start(cfg: &Config, join: &dyn super::JoinStateProvider, logger: &dyn Logger) {
@@ -104,10 +112,20 @@ pub(super) fn start_dhcp_reader(
     let spawned = std::thread::Builder::new()
         .name(DHCP_THREAD.to_owned())
         .spawn(move || {
-            // Ends when the loop drops its sender, or when the loop is gone.
+            // Ends when the loop drops its sender, when the loop is gone, or
+            // after too many panics. A read that panics still answers, so
+            // the loop's busy flag clears. After the last one the request
+            // channel closes and the loop sees the reader is gone.
+            let mut panics = 0u32;
             while let Ok(skip) = req_rx.recv() {
-                let result = source.read(&skip);
-                if tx.send(Msg(Inner::Dhcp(result))).is_err() {
+                let read = std::panic::catch_unwind(AssertUnwindSafe(|| source.read(&skip)));
+                let result = read.unwrap_or_else(|_| {
+                    panics += 1;
+                    Err(DhcpReadError(format!(
+                        "the DHCP read panicked ({panics} of {MAX_DHCP_PANICS})"
+                    )))
+                });
+                if tx.send(Msg(Inner::Dhcp(result))).is_err() || panics >= MAX_DHCP_PANICS {
                     break;
                 }
             }
