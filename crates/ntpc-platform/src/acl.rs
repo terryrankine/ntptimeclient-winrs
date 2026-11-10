@@ -217,6 +217,9 @@ pub fn secure_state_dir(path: &Path) -> Result<Secured, AclError> {
 pub struct Secured {
     /// The fate of `restore.json`.
     pub restore_record: RestoreRecord,
+    /// The quarantine path ran (R78, R108): the old directory was replaced
+    /// by a fresh one, and its log, drift and status files are gone.
+    pub replaced: bool,
 }
 
 /// The w32time restore record (`restore.json`, Task 12) after securing.
@@ -236,6 +239,7 @@ pub enum RestoreRecord {
 impl Secured {
     const ABSENT: Self = Self {
         restore_record: RestoreRecord::Absent,
+        replaced: false,
     };
 }
 
@@ -565,7 +569,8 @@ fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<Secured, AclError> {
         return Err(AclError::UntrustedOwner);
     }
     let children = inspect_children(h, path)?;
-    let restore_record = match decide(dacl_is_secure(&sec), &children) {
+    let decision = decide(dacl_is_secure(&sec), &children);
+    let restore_record = match decision {
         Decision::Keep => {
             finish_keep(&OsOps, h, path)?;
             if children.iter().any(|c| c.restore) {
@@ -577,7 +582,10 @@ fn secure_existing(h: &OwnedHandle, path: &Path) -> Result<Secured, AclError> {
         Decision::Refuse => return Err(AclError::UnexpectedChild),
         Decision::Quarantine => quarantine_and_recreate(h, path)?,
     };
-    Ok(Secured { restore_record })
+    Ok(Secured {
+        restore_record,
+        replaced: replaces(decision),
+    })
 }
 
 /// What a child is, as far as the rules care.
@@ -626,6 +634,12 @@ fn decide(dacl_exact: bool, children: &[ChildObs]) -> Decision {
     } else {
         Decision::Quarantine
     }
+}
+
+/// Whether a decision replaces the directory, for [`Secured::replaced`].
+/// Only the quarantine path does, and an error there returns before.
+fn replaces(d: Decision) -> bool {
+    d == Decision::Quarantine
 }
 
 fn kind_of(attributes: u32) -> ChildKind {
@@ -1778,15 +1792,13 @@ mod tests {
         // dir, which is not under test here.
         let s = Scratch::new("elevated");
         let dir = s.0.join("state");
-        assert_eq!(
-            secure_final(&dir).unwrap().restore_record,
-            RestoreRecord::Absent
-        );
+        let first = secure_final(&dir).unwrap();
+        assert_eq!(first.restore_record, RestoreRecord::Absent);
+        assert!(!first.replaced, "a new directory is not a replacement");
         // The second call takes the already-exists path.
-        assert_eq!(
-            secure_final(&dir).unwrap().restore_record,
-            RestoreRecord::Absent
-        );
+        let second = secure_final(&dir).unwrap();
+        assert_eq!(second.restore_record, RestoreRecord::Absent);
+        assert!(!second.replaced, "the fast path replaces nothing");
         let h = win32::open_no_follow(&dir, READ_CONTROL | FILE_READ_ATTRIBUTES).unwrap();
         let sec = win32::read_security(&h).unwrap();
         assert!(owner_trusted(&sec) && dacl_is_secure(&sec), "{sec:?}");
@@ -1807,10 +1819,9 @@ mod tests {
         std::fs::write(dir.join("drift.txt"), b"1.0").unwrap();
         std::fs::write(dir.join("restore.json"), b"{\"r\":1}").unwrap();
         let before = win32::link_info(&listing_handle(&dir)).unwrap();
-        assert_eq!(
-            secure_final(&dir).unwrap().restore_record,
-            RestoreRecord::Kept
-        );
+        let fixed = secure_final(&dir).unwrap();
+        assert_eq!(fixed.restore_record, RestoreRecord::Kept);
+        assert!(fixed.replaced, "the quarantine path ran");
         assert_eq!(
             std::fs::read(dir.join("restore.json")).unwrap(),
             b"{\"r\":1}"
@@ -2101,6 +2112,13 @@ mod tests {
         let c = inspect(&dir);
         assert_eq!(c[0].links, 2);
         assert_eq!(decide(true, &c), Decision::Refuse);
+    }
+
+    #[test]
+    fn only_the_quarantine_decision_replaces() {
+        assert!(replaces(Decision::Quarantine));
+        assert!(!replaces(Decision::Keep));
+        assert!(!replaces(Decision::Refuse));
     }
 
     #[test]

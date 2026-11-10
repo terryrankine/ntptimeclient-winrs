@@ -510,6 +510,35 @@ fn refused_state_dir_keeps_timekeeping_without_files() {
 }
 
 #[test]
+fn a_replaced_state_dir_is_logged_once_and_keeps_persistence() {
+    const LINE: &str = "state directory replaced: previous log, drift and status were discarded";
+    for outcome in [SecureOutcome::Replaced, SecureOutcome::RestoreDropped] {
+        let mut rig = Rig::new(0.050, 20.0);
+        rig.state = outcome;
+        rig.run(2 * HOUR);
+        let n = rig.lines().iter().filter(|l| l.contains(LINE)).count();
+        assert_eq!(n, 1, "{outcome:?}");
+        assert!(
+            rig.lines()
+                .iter()
+                .any(|l| l.contains(" WARN ") && l.contains(LINE))
+        );
+        assert_eq!(lock(&rig.drift).loads, 1, "persistence on: {outcome:?}");
+        assert!(
+            !lock(&rig.reports).is_empty(),
+            "status written: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn a_kept_state_dir_logs_no_replacement() {
+    let mut rig = Rig::new(0.0, 0.0);
+    rig.run(60);
+    assert!(!rig.log_has("state directory replaced"));
+}
+
+#[test]
 fn status_is_written_every_30_seconds() {
     let mut rig = Rig::new(0.0, 0.0);
     rig.run(HOUR);

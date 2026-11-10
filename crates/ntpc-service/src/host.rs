@@ -192,8 +192,13 @@ pub trait DhcpSource: Send + Sync {
 pub enum SecureOutcome {
     /// Secured. Persistence is on.
     Ok,
-    /// Secured, but the `w32time` restore record was not trusted and was
-    /// dropped. Persistence is on.
+    /// Secured by replacing a weak directory with a fresh one (R78, R108).
+    /// The previous log, drift and status files were discarded. The
+    /// restore record was carried or there was none. Persistence is on.
+    Replaced,
+    /// Secured by replacing the directory, as [`SecureOutcome::Replaced`],
+    /// but the `w32time` restore record was not trusted and was dropped.
+    /// Persistence is on.
     RestoreDropped,
     /// Not secured. Persistence is off. Timekeeping goes on.
     Refused {

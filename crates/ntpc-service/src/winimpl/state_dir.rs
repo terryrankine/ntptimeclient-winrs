@@ -7,19 +7,23 @@ use ntpc_platform::{AclError, RestoreRecord, Secured};
 
 use crate::host::{SecureOutcome, StateDir};
 
-/// Maps the platform result. `Kept` and `Absent` are a plain secured
-/// directory. `Dropped` is secured with an untrusted restore record left in
+/// Maps the platform result. Not replaced is a plain secured directory.
+/// Replaced with the record `Kept` or `Absent` is `Replaced` (R108).
+/// `Dropped` is secured with an untrusted restore record left in
 /// quarantine. Any error refuses: the host then runs with persistence off
 /// and timekeeping on.
 #[must_use]
 pub fn secure_outcome(result: Result<Secured, AclError>) -> SecureOutcome {
     match result {
-        Ok(Secured {
-            restore_record: RestoreRecord::Kept | RestoreRecord::Absent,
-        }) => SecureOutcome::Ok,
+        // `Dropped` happens only on the replacement path, so it implies it.
         Ok(Secured {
             restore_record: RestoreRecord::Dropped,
+            ..
         }) => SecureOutcome::RestoreDropped,
+        Ok(Secured { replaced: true, .. }) => SecureOutcome::Replaced,
+        Ok(Secured {
+            replaced: false, ..
+        }) => SecureOutcome::Ok,
         Err(e) => SecureOutcome::Refused {
             reason: refusal_reason(&e),
         },
@@ -123,11 +127,25 @@ mod tests {
     }
 
     #[test]
-    fn secured_maps_by_restore_record() {
-        let ok = |r| secure_outcome(Ok(Secured { restore_record: r }));
-        assert_eq!(ok(RestoreRecord::Kept), SecureOutcome::Ok);
-        assert_eq!(ok(RestoreRecord::Absent), SecureOutcome::Ok);
-        assert_eq!(ok(RestoreRecord::Dropped), SecureOutcome::RestoreDropped);
+    fn secured_maps_by_restore_record_and_replacement() {
+        let ok = |restore_record, replaced| {
+            secure_outcome(Ok(Secured {
+                restore_record,
+                replaced,
+            }))
+        };
+        assert_eq!(ok(RestoreRecord::Kept, false), SecureOutcome::Ok);
+        assert_eq!(ok(RestoreRecord::Absent, false), SecureOutcome::Ok);
+        assert_eq!(ok(RestoreRecord::Kept, true), SecureOutcome::Replaced);
+        assert_eq!(ok(RestoreRecord::Absent, true), SecureOutcome::Replaced);
+        assert_eq!(
+            ok(RestoreRecord::Dropped, true),
+            SecureOutcome::RestoreDropped
+        );
+        assert_eq!(
+            ok(RestoreRecord::Dropped, false),
+            SecureOutcome::RestoreDropped
+        );
     }
 
     #[test]
@@ -162,6 +180,7 @@ mod tests {
     fn the_host_sees_the_outcome_of_the_one_call() {
         for o in [
             SecureOutcome::Ok,
+            SecureOutcome::Replaced,
             SecureOutcome::RestoreDropped,
             SecureOutcome::Refused { reason: "x" },
         ] {

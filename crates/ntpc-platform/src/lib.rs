@@ -58,6 +58,21 @@ pub fn replace_file_write_through(
     win32::scm::replace_file_write_through(from, to)
 }
 
+/// Whether this process's token gives new objects a trusted owner: SYSTEM
+/// or Administrators. Every file the service writes in the state directory
+/// gets that owner, and any other owner makes the next start replace the
+/// directory (R106). Read only.
+///
+/// # Errors
+/// The OS error if the token cannot be read.
+#[cfg(windows)]
+pub fn default_owner_is_trusted() -> std::io::Result<bool> {
+    Ok(matches!(
+        win32::token_default_owner()?,
+        win32::Principal::System | win32::Principal::Administrators
+    ))
+}
+
 /// The hard link count of an open file. Read only, through the handle, so
 /// a rename after the open cannot change the answer. Stable `std` has no
 /// way to read it on Windows. The host's log file sink refuses a file with
@@ -88,6 +103,13 @@ mod tests {
     #[test]
     fn depends_on_core() {
         assert_eq!(ntpc_core::CRATE_NAME, "ntpc-core");
+    }
+
+    /// Read only: `GetTokenInformation(TokenOwner)` on this process.
+    #[cfg(windows)]
+    #[test]
+    fn default_owner_reads() {
+        let _trusted: bool = default_owner_is_trusted().expect("token owner");
     }
 
     /// Only files in a fresh directory under the system temp folder. The
