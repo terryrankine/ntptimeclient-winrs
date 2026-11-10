@@ -384,23 +384,3 @@ pub fn replace_file_write_through(from: &std::path::Path, to: &std::path::Path) 
     }
     Ok(())
 }
-
-/// The hard link count of an open file. Read only.
-///
-/// # Errors
-/// The OS error.
-pub fn file_link_count(file: &std::fs::File) -> io::Result<u32> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain old data, all zero is valid.
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: `file` owns a live handle for the whole call. `info` is a live
-    // out slot of the documented type.
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info.nNumberOfLinks)
-}

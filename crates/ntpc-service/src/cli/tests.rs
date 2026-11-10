@@ -4,6 +4,7 @@ use ntpc_platform::w32time::fake::{Call, FakeScm, Script};
 use ntpc_platform::w32time::{RunState, StartType, SvcError, SvcState};
 
 use super::*;
+use crate::config::Config;
 
 // ---- Fakes ----
 
@@ -62,7 +63,7 @@ impl Host for FakeHost {
 #[derive(Debug, Default)]
 struct MemStore {
     record: Option<Result<Restore, LoadError>>,
-    secure_error: Option<String>,
+    secure_error: Option<SecureRefusal>,
     save_error: Option<String>,
     remove_error: Option<String>,
     secured: bool,
@@ -91,7 +92,7 @@ impl MemStore {
 }
 
 impl RecordStore for MemStore {
-    fn secure(&mut self) -> Result<(), String> {
+    fn secure(&mut self) -> Result<(), SecureRefusal> {
         if let Some(e) = &self.secure_error {
             return Err(e.clone());
         }
@@ -385,7 +386,7 @@ fn install_refuses_before_any_change_when_registration_is_not_built() {
 #[test]
 fn install_refuses_when_the_state_dir_cannot_be_secured() {
     let mut w = World::new(JoinState::Workgroup);
-    w.store.secure_error = Some("unexpected entry".to_owned());
+    w.store.secure_error = Some(SecureRefusal::Directory("unexpected entry".to_owned()));
     assert_eq!(w.install(SILENT), exit::STATE_DIR);
     assert!(w.untouched());
 }
@@ -469,6 +470,15 @@ fn already_disabled_without_a_record_is_refused() {
     assert_eq!(w.install(SILENT), exit::DISABLED_ORIGINAL);
     assert!(w.untouched());
     assert_eq!(w.store.saved(), None);
+    // Documented: the check runs after the state directory was secured.
+    assert!(w.store.secured);
+    assert_eq!(
+        w.w32time(),
+        Some(SvcState {
+            run: RunState::Stopped,
+            start: StartType::Disabled
+        })
+    );
     assert!(w.host.text().contains("--accept-disabled-original"));
 }
 
@@ -671,8 +681,14 @@ fn uninstall_args_parse() {
 
 #[test]
 fn bad_arguments_exit_with_usage_and_change_nothing() {
-    assert_eq!(run_install(&args(&["--nope"])), exit::USAGE);
-    assert_eq!(run_uninstall(&args(&["--nope"])), exit::USAGE);
+    assert_eq!(
+        run_install(&args(&["--nope"]), &Config::default()),
+        exit::USAGE
+    );
+    assert_eq!(
+        run_uninstall(&args(&["--nope"]), &Config::default()),
+        exit::USAGE
+    );
 }
 
 #[test]
@@ -691,9 +707,15 @@ fn every_exit_code_is_reachable() {
     w.host.consoles(true);
     seen.insert(w.install(PLAIN));
 
+    for r in refusals() {
+        let mut w = World::new(JoinState::Workgroup);
+        w.store.secure_error = Some(r);
+        seen.insert(w.install(SILENT));
+    }
+
     let mut w = World::new(JoinState::Workgroup);
-    w.store.secure_error = Some("x".to_owned());
-    seen.insert(w.install(SILENT));
+    w.store.secure_error = Some(SecureRefusal::RecordDropped);
+    seen.insert(w.uninstall());
 
     let mut w = World::new(JoinState::Workgroup);
     w.store = MemStore::invalid();
@@ -722,7 +744,7 @@ fn every_exit_code_is_reachable() {
     w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
     seen.insert(w.install(SILENT));
 
-    seen.insert(run_install(&args(&["--bad"])));
+    seen.insert(run_install(&args(&["--bad"]), &Config::default()));
 
     let all: BTreeSet<u8> = exit::ALL.iter().copied().collect();
     assert_eq!(seen, all);
@@ -752,7 +774,7 @@ fn messages_name_no_path() {
 fn run(a: &[&str]) -> (u8, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = dispatch(&args(a), &mut out, &mut err);
+    let code = dispatch(&args(a), &Config::default(), &mut out, &mut err);
     (
         code,
         String::from_utf8(out).unwrap(),
@@ -797,4 +819,178 @@ fn dispatch_bad_install_and_uninstall_arguments_exit_with_usage() {
     // Only invalid arguments: they stop at parsing, before any real call.
     assert_eq!(run(&["install", "--nope"]).0, exit::USAGE);
     assert_eq!(run(&["uninstall", "--nope"]).0, exit::USAGE);
+}
+
+// ---- R86: refusals while securing, per class ----
+
+fn refusals() -> Vec<SecureRefusal> {
+    vec![
+        SecureRefusal::Directory("untrusted parent".to_owned()),
+        SecureRefusal::BadPath("reserved name".to_owned()),
+        SecureRefusal::RollbackFailed("rollback failed".to_owned()),
+        SecureRefusal::CarryFailed("carry failed".to_owned()),
+        SecureRefusal::RecordDropped,
+    ]
+}
+
+#[test]
+fn every_secure_refusal_class_has_its_own_install_code_and_changes_nothing() {
+    let want = [
+        exit::STATE_DIR,
+        exit::BAD_STATE_PATH,
+        exit::ROLLBACK_FAILED,
+        exit::CARRY_FAILED,
+        exit::RECORD_DROPPED,
+    ];
+    for (r, code) in refusals().into_iter().zip(want) {
+        let mut w = World::new(JoinState::Workgroup);
+        w.store.secure_error = Some(r.clone());
+        assert_eq!(w.install(SILENT), code, "{r:?}");
+        assert_eq!(w.scm.calls(), Vec::<Call>::new(), "{r:?}");
+        assert_eq!(w.store.saves, 0);
+        assert!(!w.reg.registered);
+        assert_eq!(w.w32time(), original());
+        assert!(!w.host.text().contains('\\'), "{}", w.host.text());
+    }
+    let codes: BTreeSet<u8> = want.into_iter().collect();
+    assert_eq!(codes.len(), want.len());
+}
+
+#[test]
+fn a_dropped_record_says_to_restore_by_hand_first() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.store.secure_error = Some(SecureRefusal::RecordDropped);
+    assert_eq!(w.install(SILENT), exit::RECORD_DROPPED);
+    let t = w.host.text();
+    assert!(t.contains("Restore w32time by hand first"), "{t}");
+    assert!(t.contains("quarantine"), "{t}");
+}
+
+#[test]
+fn rollback_failed_points_at_the_quarantine_and_the_docs() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.store.secure_error = Some(SecureRefusal::RollbackFailed("x".to_owned()));
+    assert_eq!(w.install(SILENT), exit::ROLLBACK_FAILED);
+    let t = w.host.text();
+    assert!(t.contains("sibling quarantine directory"), "{t}");
+    assert!(t.contains("documentation"), "{t}");
+}
+
+#[test]
+fn install_refuses_an_untrusted_record_file() {
+    let mut w = World::new(JoinState::Workgroup);
+    w.store.record = Some(Err(LoadError::NotTrusted(TrustFailure::Owner)));
+    assert_eq!(w.install(SILENT), exit::RECORD_NOT_TRUSTED);
+    assert!(!w.scm.mutated());
+    assert_eq!(w.store.saves, 0);
+}
+
+/// The mapping from every `AclError` variant that exists today. The enum
+/// is non-exhaustive: the wildcard arm cannot be reached from a test,
+/// because no variant outside this list can be built.
+#[cfg(windows)]
+#[test]
+fn acl_errors_map_to_classes() {
+    use ntpc_platform::AclError as A;
+    let cases = [
+        (A::BadPath, exit::BAD_STATE_PATH),
+        (A::TrailingDotOrSpace, exit::BAD_STATE_PATH),
+        (A::ReservedName, exit::BAD_STATE_PATH),
+        (A::NotFixedDrive, exit::BAD_STATE_PATH),
+        (
+            A::RollbackFailed {
+                cause: "a".to_owned(),
+                rollback: "b".to_owned(),
+            },
+            exit::ROLLBACK_FAILED,
+        ),
+        (
+            A::RestoreCarryFailed {
+                detail: "c".to_owned(),
+            },
+            exit::CARRY_FAILED,
+        ),
+        (A::PathChanged, exit::STATE_DIR),
+        (A::Link, exit::STATE_DIR),
+        (A::ParentLink, exit::STATE_DIR),
+        (A::NotADirectory, exit::STATE_DIR),
+        (A::UntrustedOwner, exit::STATE_DIR),
+        (A::UntrustedParent, exit::STATE_DIR),
+        (A::UnexpectedChild, exit::STATE_DIR),
+        (A::DaclNotApplied, exit::STATE_DIR),
+        (
+            A::Os {
+                op: "open",
+                detail: "d".to_owned(),
+            },
+            exit::STATE_DIR,
+        ),
+    ];
+    for (e, code) in cases {
+        let c = classify_acl_error(&e);
+        assert_eq!(c.install_code(), code, "{e:?}");
+        // The class keeps the platform text, which holds no path.
+        assert!(!c.to_string().contains('\\'), "{c}");
+    }
+}
+
+// ---- R86: uninstall trusts only a secured directory and a checked file ----
+
+fn disabled_world_with_record() -> World {
+    let mut w = World::new(JoinState::Workgroup);
+    w.scm = FakeScm::new(Script::with(RunState::Stopped, StartType::Disabled));
+    w.store = MemStore::with(Restore::new(StartType::Manual, true));
+    w
+}
+
+#[test]
+fn uninstall_leaves_w32time_alone_when_the_directory_is_not_trusted() {
+    for r in refusals() {
+        let mut w = disabled_world_with_record();
+        w.store.secure_error = Some(r.clone());
+        assert_eq!(w.uninstall(), exit::RECORD_NOT_TRUSTED, "{r:?}");
+        assert_eq!(w.scm.calls(), Vec::<Call>::new(), "{r:?}");
+        let t = w.host.text();
+        assert!(t.contains("services.msc"), "{t}");
+        // The record is kept for the administrator.
+        assert!(w.store.saved().is_some());
+    }
+}
+
+#[test]
+fn uninstall_leaves_w32time_alone_when_the_record_file_is_not_trusted() {
+    for f in [
+        TrustFailure::Owner,
+        TrustFailure::Links,
+        TrustFailure::TooLarge,
+        TrustFailure::Reparse,
+        TrustFailure::NotAFile,
+    ] {
+        let mut w = disabled_world_with_record();
+        w.store.record = Some(Err(LoadError::NotTrusted(f)));
+        assert_eq!(w.uninstall(), exit::RECORD_NOT_TRUSTED, "{f:?}");
+        assert!(!w.scm.mutated(), "{f:?}");
+        assert!(w.host.text().contains("services.msc"));
+    }
+}
+
+#[test]
+fn uninstall_secures_before_it_reads_and_restores_a_trusted_record() {
+    let mut w = disabled_world_with_record();
+    assert_eq!(w.uninstall(), exit::OK);
+    assert!(w.store.secured);
+    assert_eq!(
+        w.w32time(),
+        Some(SvcState {
+            run: RunState::Running,
+            start: StartType::Manual
+        })
+    );
+}
+
+#[test]
+fn manual_restore_hint_guesses_no_start_type() {
+    for t in ["automatic", "manual", "disabled", "delayed"] {
+        assert!(!MANUAL_RESTORE.to_lowercase().contains(t), "{t}");
+    }
 }
