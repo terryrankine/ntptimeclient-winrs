@@ -101,7 +101,7 @@ jobs:
           rustup show
           rustc -vV
           cargo -V
-          if ((rustc -vV) -notmatch 'host: x86_64-pc-windows-msvc') { Write-Error 'host is not x86_64-pc-windows-msvc'; exit 1 }
+          if ((((rustc -vV) -join "`n")) -notmatch 'host: x86_64-pc-windows-msvc') { Write-Error 'host is not x86_64-pc-windows-msvc'; exit 1 }
 
       - name: Build release binary
         run: cargo build --release --locked -p ntpc-service
