@@ -586,10 +586,15 @@ mod tests {
         let cfg = dir.join("config.toml");
         std::fs::write(&cfg, b"dhcp = true").unwrap();
         let owned = check_config_location(&cfg);
+        // A non-elevated user owns the file, so the owner is refused. An
+        // elevated process (the CI runner) creates files owned by Administrators.
+        // The owner is then trusted, but the temp folder's inherited rights still
+        // let other accounts change the file. Either way the config is refused.
         assert!(
             owned
                 .iter()
-                .any(|r| r.contains("the config file is not owned")),
+                .any(|r| r.contains("the config file is not owned")
+                    || r.contains("the config file lets an account other than")),
             "{owned:?}"
         );
         let link = dir.join("second-name.toml");
