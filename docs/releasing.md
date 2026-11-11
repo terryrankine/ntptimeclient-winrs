@@ -56,7 +56,7 @@ Actions are pinned by commit SHA because a tag can be moved. Each pin ends with 
    ```
 6. Watch `release.yml`. Check the release page, the zip name and the hash.
 
-A bad release is never edited. Mark it a pre-release or delete it, and publish the next number. Never move or reuse a tag.
+A bad release is never edited. Mark it a pre-release or delete it, and publish the next number. Never move or reuse a tag that has a published release. A tag whose release run failed before it published anything may be deleted and set again on a fixed `main`.
 
 ## Not in place yet
 

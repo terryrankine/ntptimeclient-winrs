@@ -64,7 +64,6 @@ jobs:
           } else {
             ./scripts/check-version.ps1 -GithubOutput $env:GITHUB_OUTPUT
           }
-          if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Tag commit is on main
         if: github.event_name == 'push'
         shell: bash
