@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Actions are pinned by commit SHA with a "# vX.Y.Z" label (scripts/check-workflows.ps1
+  # enforces it). Dependabot proposes the new SHA and label. The pin monitor
+  # (monitor.yml) finds moved tags between these runs.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch and minor bumps arrive as one pull request. A major bump is its own.
+      rust-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"

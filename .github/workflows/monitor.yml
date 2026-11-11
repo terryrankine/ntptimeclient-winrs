@@ -1,0 +1,63 @@
+name: monitor
+
+# Daily watch on what the build depends on. It changes nothing. A red run
+# means "look". GitHub emails the repo owner for a failed scheduled run.
+#
+# pins      every pinned action: commit still exists, tag not moved, newer release listed
+# packages  Rust crates: security advisories, licences, bans, sources, and what an upgrade would pick up
+#
+# Upgrades come from Dependabot (.github/dependabot.yml) as pull requests.
+# Those run ci.yml. A person merges them. There is no auto-merge (docs/releasing.md).
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  pins:
+    name: pin monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check every pin against GitHub
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/check-pins.ps1
+
+  packages:
+    name: package checker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Advisories change without any commit here, so this runs on a timer.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
+        with:
+          command: check
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+        with:
+          toolchain: stable
+      - name: What an upgrade would pick up (Cargo.lock is not changed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## Crates with a newer compatible version'
+            echo '```'
+            cargo update --dry-run 2>&1 | grep -E 'Updating|Adding|Removing|Locking' || echo 'none'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
