@@ -309,7 +309,9 @@ jobs:
     name: attach to pre-release
     needs: [verify, package]
     # Real tag pushes only. A manual run stops after the artifact upload.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # !cancelled() is needed: sign is skipped when signing is off, and the default
+    # success() check would skip this job too because a skipped job is an ancestor.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.package.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
