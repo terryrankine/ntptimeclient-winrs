@@ -1,37 +1,84 @@
-name: preview
+name: release
 
-# Builds the UNSIGNED PREVIEW zip.
+# Builds the UNSIGNED zip and publishes it. Rules: docs/releasing.md.
 #
-# - A push of a tag "v*" builds, uploads the zip as a workflow artifact and
-#   attaches it to a GitHub PRE-RELEASE.
+# - A push of a tag "vMAJOR.MINOR.PATCH[-alpha.N|-beta.N|-rc.N]" runs the
+#   version checks, builds, gates the exe, uploads the zip as a workflow
+#   artifact and attaches it to a GitHub release. A tag with a pre-release
+#   part, or a 0.x version, is marked as a GitHub PRE-RELEASE.
+# - The tag must equal "v" + the Cargo.toml version, and its commit must be on
+#   main. Otherwise the run stops before anything is built.
 # - A manual run (workflow_dispatch) is a dry run. It builds and uploads the
 #   artifact only. It never publishes a release.
 #
-# There is NO code signing step. Previews are unsigned on purpose. The planned
-# route for public releases is SignPath Foundation, after a public release
-# exists. That is a human decision and is not made here. No secret other than
-# the built-in GITHUB_TOKEN is used.
+# There is NO code signing step. Releases are unsigned on purpose until
+# SignPath Foundation (or another route) is set up. That is a human decision
+# and is not made here. No secret other than the built-in GITHUB_TOKEN is used.
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# One preview build per ref at a time. A second tag push waits. It never
+# One release build per ref at a time. A second tag push waits. It never
 # cancels a build that may be half way through publishing.
 concurrency:
-  group: preview-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: version and tag rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      channel: ${{ steps.v.outputs.channel }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Workflows are pinned and free of placeholders
+        shell: pwsh
+        run: ./scripts/check-workflows.ps1
+      - name: Tag equals the Cargo version
+        id: v
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EVENT_NAME -eq 'push') {
+            ./scripts/check-version.ps1 -Tag $env:REF_NAME -GithubOutput $env:GITHUB_OUTPUT
+          } else {
+            ./scripts/check-version.ps1 -GithubOutput $env:GITHUB_OUTPUT
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Tag commit is on main
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag commit $GITHUB_SHA is not on main. Merge first, then tag." >&2
+            exit 1
+          fi
+
   build:
-    name: build unsigned preview zip
+    name: build unsigned zip
+    needs: verify
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
@@ -40,32 +87,14 @@ jobs:
       zip_name: ${{ steps.assemble.outputs.zip_name }}
       zip_sha256: ${{ steps.assemble.outputs.zip_sha256 }}
     steps:
-      # actions/checkout v7.0.1, commit looked up with `gh api` on 2026-11-10
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      # dtolnay/rust-toolchain stable branch, pinned by commit (same pin as ci.yml)
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
         with:
           toolchain: stable
       # No build cache here. A release build must not depend on cache contents
       # that an earlier pull request run could have written.
-
-      # This lint runs AFTER the actions above were fetched, so it cannot stop
-      # the current run from using an unpinned action. It guards future edits.
-      - name: Check the pins and placeholders
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # Fails if a placeholder was left in the workflow or the packaged files.
-          # The pattern is written so that this step does not match itself.
-          $files = @('.github/workflows/preview.yml') + @(Get-ChildItem packaging -Recurse -File | ForEach-Object FullName)
-          $hits = Select-String -Path $files -Pattern 'T[O]DO'
-          if ($hits) { $hits | ForEach-Object { Write-Error "$($_.Path):$($_.LineNumber): $($_.Line)" }; exit 1 }
-          # Every "uses:" in this file must be a full 40 character commit SHA.
-          $bad = Select-String -Path '.github/workflows/preview.yml' -Pattern '^\s*-?\s*uses:\s*(\S+)' |
-            Where-Object { $_.Matches[0].Groups[1].Value -notmatch '@[0-9a-f]{40}$' }
-          if ($bad) { $bad | ForEach-Object { Write-Error "unpinned action: $($_.Line)" }; exit 1 }
 
       - name: Toolchain
         shell: pwsh
@@ -79,64 +108,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked -p ntpc-service
 
-      # Exe gate. A stub exe, or one whose CLI is not the one the scripts call,
-      # must never be packaged. The probes below are non-mutating and a stub
-      # cannot fake them: the exit codes come from the exe's own table.
-      #   --help               exit 0, and the five commands listed as help lines
-      #   (no arguments)       exit 2
-      #   frob                 exit 2 (an unknown subcommand)
-      #   service              exit 26 (not started by the service manager)
-      #   status --config <a file that does not exist>   exit 22 or 24
-      # NEVER run install, uninstall, run or a real service start here. The
-      # runner is a throw-away machine, but the gate must stay safe to run
-      # anywhere. The probes may not write to the machine.
-      # R87 (human rule: no v* tag before Tasks 12 and 14 merge) can retire
-      # once this gate has passed against the merged exe.
+      # Exe gate: scripts/gate-exe.ps1 (same probes as ci.yml). A stub exe, or
+      # one with another CLI, is never packaged. The probes are non-mutating.
       - name: Gate the built exe
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $candidates = 'target/release/ntptimeclient-winrs.exe', 'target/release/ntpc-service.exe'
-          $found = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-          if (-not $found) { Write-Error 'No release binary found.'; exit 1 }
-          $exe = (Resolve-Path -LiteralPath $found).Path
-          $tmp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
-          $missing = Join-Path $tmp 'ntpc-gate-does-not-exist.toml'
-          if (Test-Path -LiteralPath $missing) { Write-Error "Probe path exists: $missing"; exit 1 }
-
-          function Invoke-Probe {
-            param([string[]]$ProbeArgs)
-            $out = Join-Path $tmp ('probe-out-' + [guid]::NewGuid().ToString('N') + '.txt')
-            $err = Join-Path $tmp ('probe-err-' + [guid]::NewGuid().ToString('N') + '.txt')
-            $sp = @{ FilePath = $exe; PassThru = $true; NoNewWindow = $true; RedirectStandardOutput = $out; RedirectStandardError = $err }
-            if ($ProbeArgs.Count -gt 0) { $sp.ArgumentList = $ProbeArgs }
-            $p = Start-Process @sp
-            $null = $p.Handle   # keeps the exit code readable after exit
-            if (-not $p.WaitForExit(30000)) { $p.Kill(); Write-Error "Probe hung: $($ProbeArgs -join ' ')"; exit 1 }
-            [pscustomobject]@{ Code = $p.ExitCode; Text = ((Get-Content -Raw -LiteralPath $out -ErrorAction SilentlyContinue) + (Get-Content -Raw -LiteralPath $err -ErrorAction SilentlyContinue)) }
-          }
-
-          $fail = @()
-          $help = Invoke-Probe @('--help')
-          Write-Host "--help exit $($help.Code)"; Write-Host $help.Text
-          if ($help.Code -ne 0) { $fail += "--help exited $($help.Code), want 0" }
-          if ([string]::IsNullOrWhiteSpace($help.Text)) { $fail += '--help printed nothing' }
-          # Command-list lines only: the word at the start of a line, then space or end.
-          foreach ($word in 'install', 'uninstall', 'run', 'service', 'status') {
-            if ($help.Text -notmatch "(?m)^\s*$word(\s|$)") { $fail += "--help has no command-list line for '$word'" }
-          }
-          $probes = @(
-            @{ Name = 'no arguments'; Args = @(); Want = @(2) },
-            @{ Name = 'unknown subcommand'; Args = @('frob'); Want = @(2) },
-            @{ Name = 'service from a console'; Args = @('service'); Want = @(26) },
-            @{ Name = 'status with a missing config'; Args = @('status', '--config', $missing); Want = @(22, 24) }
-          )
-          foreach ($pr in $probes) {
-            $r = Invoke-Probe $pr.Args
-            Write-Host "$($pr.Name): exit $($r.Code)"
-            if ($pr.Want -notcontains $r.Code) { $fail += "$($pr.Name) exited $($r.Code), want $($pr.Want -join ' or ')" }
-          }
-          if ($fail.Count -gt 0) { $fail | ForEach-Object { Write-Host "GATE FAIL: $_" }; exit 1 }
+        run: ./scripts/gate-exe.ps1
 
       # Packaging tests. The scripts are written for the inbox Pester 3.4 in
       # Windows PowerShell. The runner also has a newer Pester, and "Should Be"
@@ -166,6 +142,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          CHANNEL: ${{ needs.verify.outputs.channel }}
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
@@ -204,6 +182,8 @@ jobs:
           $version = @(
             'product: ntptimeclient-winrs'
             'channel: UNSIGNED PREVIEW, NOT FOR MACHINES THAT MATTER'
+            "version: $($env:VERSION)"
+            "release channel: $($env:CHANNEL)"
             "tag: $tag"
             "commit: $($env:COMMIT_SHA)"
             'target: x86_64-pc-windows-msvc'
@@ -230,10 +210,9 @@ jobs:
           "zip_name=$base.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "zip_sha256=$zipHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      # actions/upload-artifact v7.0.2, commit looked up with `gh api` on 2026-11-10
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: preview-zip
+          name: release-zip
           path: |
             dist/*.zip
             dist/*.zip.sha256
@@ -242,7 +221,7 @@ jobs:
 
   publish:
     name: attach to pre-release
-    needs: build
+    needs: [verify, build]
     # Real tag pushes only. A manual run stops after the artifact upload.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -250,10 +229,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      # actions/download-artifact v8.0.2, commit looked up with `gh api` on 2026-11-10
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
-          name: preview-zip
+          name: release-zip
           path: dist
       - name: Create pre-release
         shell: bash
@@ -261,6 +239,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          CHANNEL: ${{ needs.verify.outputs.channel }}
           # The hash comes from the build job output, not from a file in the
           # artifact. The zip is compared with it before it is published.
           ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
@@ -272,9 +252,7 @@ jobs:
             exit 1
           fi
           cat > notes.md <<'EOF'
-          # UNSIGNED PREVIEW. NOT FOR MACHINES THAT MATTER.
-
-          This is a developer preview, not a release.
+          # UNSIGNED. NOT FOR MACHINES THAT MATTER.
 
           - The binary is not code signed. Windows SmartScreen, Smart App Control or antivirus may warn or block it (unverified).
           - It sets the system clock and stops and disables the Windows Time service (w32time).
@@ -286,10 +264,11 @@ jobs:
           The hash file inside the zip finds accidental damage only. It does not prove the zip is genuine.
           EOF
           printf '\nSHA-256 of the zip:\n\n    %s  %s\n' "$ZIP_SHA256" "$ZIP_NAME" >> notes.md
+          flags=(--verify-tag --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --prerelease \
-            --title "$TAG UNSIGNED PREVIEW" \
+            "${flags[@]}" \
+            --title "$TAG ($CHANNEL, unsigned)" \
             --notes-file notes.md \
             "dist/${ZIP_NAME}" "dist/${ZIP_NAME}.sha256"
