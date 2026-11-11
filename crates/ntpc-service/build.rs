@@ -17,7 +17,12 @@ fn main() {
         return;
     }
     let version = env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
-    let num = |name: &str| env::var(name).ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+    let num = |name: &str| {
+        env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(0)
+    };
     let (major, minor, patch) = (
         num("CARGO_PKG_VERSION_MAJOR"),
         num("CARGO_PKG_VERSION_MINOR"),
