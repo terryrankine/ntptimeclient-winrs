@@ -5,6 +5,9 @@ Versions follow [SemVer 2.0](https://semver.org/) as set out in `docs/releasing.
 
 ## [Unreleased]
 
+- The exe carries a Windows version resource: product name `ntptimeclient-winrs` and the SemVer version.
+- Release pipeline can sign the exe through SignPath Foundation once `docs/signing.md` is done. Until then releases stay unsigned.
+
 ## [0.1.0-alpha.1]
 
 First alpha. Unsigned. Not for machines that matter.

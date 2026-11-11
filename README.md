@@ -68,6 +68,28 @@ Tests never change the clock, services, registry or ACLs of the machine. Tests t
 
 Versioning, tags and the release steps are in `docs/releasing.md`. The crate layout is in `docs/architecture.md`.
 
+## Code signing policy
+
+Releases are unsigned until the project is approved for free signing. Status: not yet applied.
+
+When signing is on:
+
+- Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+- Only `ntptimeclient-winrs.exe` built by `release.yml` from this repository is signed. Nothing built elsewhere is signed.
+- Every signing request needs manual approval.
+
+Team roles (one person fills all three today):
+
+| Role | Who |
+| --- | --- |
+| Author (trusted committer) | Terry Rankine, `terryrankine` |
+| Reviewer (reviews changes from anyone else) | Terry Rankine |
+| Approver (approves each signing request) | Terry Rankine |
+
+Privacy policy: this program does not collect or send personal data to the project or anyone else. It sends NTP requests to the servers you configure, to servers a DHCP server names, and to the global NTP pool. It reads local network settings and may send a DHCP request on the local network. It writes a log and state files on the machine. It has no telemetry and no update check. It stops and disables the Windows Time service. `README-PREVIEW.txt` in the release zip says how to undo that.
+
+Setup and wiring: `docs/signing.md`.
+
 ## Licence
 
 `MIT OR Apache-2.0`. See `LICENSE-MIT` and `LICENSE-APACHE`.
