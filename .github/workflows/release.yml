@@ -77,15 +77,14 @@ jobs:
           fi
 
   build:
-    name: build unsigned zip
+    name: build and gate the exe
     needs: verify
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
       contents: read
     outputs:
-      zip_name: ${{ steps.assemble.outputs.zip_name }}
-      zip_sha256: ${{ steps.assemble.outputs.zip_sha256 }}
+      exe_artifact_id: ${{ steps.exe.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -134,6 +133,99 @@ jobs:
       - name: Dependency rule
         run: pwsh scripts/check-deps.ps1
 
+      - name: Collect the exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path exe-out -Force | Out-Null
+          Copy-Item -LiteralPath target/release/ntptimeclient-winrs.exe -Destination exe-out/
+      # The exe goes to SignPath as a GitHub artifact when signing is on, and to
+      # the package job either way.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        id: exe
+        with:
+          name: unsigned-exe
+          path: exe-out/ntptimeclient-winrs.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  sign:
+    name: sign the exe (SignPath Foundation)
+    needs: [verify, build]
+    # Runs only for a real tag, and only once the repo variable SIGNPATH_ORGANIZATION_ID
+    # is set (docs/signing.md). Until then the release is unsigned and this job is skipped.
+    if: github.event_name == 'push' && vars.SIGNPATH_ORGANIZATION_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The signing request waits for a person to approve it in SignPath. That is a policy requirement.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # signpath/github-action-submit-signing-request v2, commit looked up with `gh api` on 2026-11-11
+      - uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627  # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ needs.build.outputs.exe_artifact_id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: signed
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: signed-exe
+          path: signed/ntptimeclient-winrs.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: package the zip
+    needs: [verify, build, sign]
+    # The sign job is skipped when signing is not set up. A failed signing run stops the release.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      zip_name: ${{ steps.assemble.outputs.zip_name }}
+      zip_sha256: ${{ steps.assemble.outputs.zip_sha256 }}
+      signed: ${{ steps.pick.outputs.signed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+        with:
+          toolchain: stable
+      - name: Pick the exe
+        id: pick
+        shell: pwsh
+        env:
+          SIGN_RESULT: ${{ needs.sign.result }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signed = if ($env:SIGN_RESULT -eq 'success') { 'true' } else { 'false' }
+          "signed=$signed" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ needs.sign.result == 'success' && 'signed-exe' || 'unsigned-exe' }}
+          path: exe-in
+      - name: Check the exe (gate, and signature when signed)
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.pick.outputs.signed }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'exe-in/ntptimeclient-winrs.exe'
+          ./scripts/gate-exe.ps1 -Exe $exe
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          Write-Host "Authenticode status: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($env:SIGNED -eq 'true' -and $sig.Status -ne 'Valid') { Write-Error "Signed exe has status $($sig.Status)"; exit 1 }
+          if ($env:SIGNED -ne 'true' -and $sig.Status -ne 'NotSigned') { Write-Error "Unsigned build has status $($sig.Status)"; exit 1 }
+
       - name: Assemble zip
         id: assemble
         shell: pwsh
@@ -144,6 +236,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           VERSION: ${{ needs.verify.outputs.version }}
           CHANNEL: ${{ needs.verify.outputs.channel }}
+          SIGNED: ${{ steps.pick.outputs.signed }}
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
@@ -152,18 +245,12 @@ jobs:
           # The tag ends up in a file name. Allow only plain characters.
           if ($tag -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$') { Write-Error "Unusable tag name: $tag"; exit 1 }
 
-          $base = "ntptimeclient-winrs-$tag-UNSIGNED-PREVIEW-x86_64-windows"
+          $mark = if ($env:SIGNED -eq 'true') { 'SIGNED' } else { 'UNSIGNED-PREVIEW' }
+          $base = "ntptimeclient-winrs-$tag-$mark-x86_64-windows"
           $stage = Join-Path 'dist' $base
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
-          # The scripts and the plan call the binary ntptimeclient-winrs.exe.
-          # Cargo names it after the [[bin]] or the package. Take either and
-          # ship it under the documented name.
-          $candidates = 'target/release/ntptimeclient-winrs.exe', 'target/release/ntpc-service.exe'
-          $built = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-          if (-not $built) { Write-Error "No release binary found. Looked for: $($candidates -join ', ')"; exit 1 }
-          Write-Host "Using $built"
-          Copy-Item -LiteralPath $built -Destination (Join-Path $stage 'ntptimeclient-winrs.exe')
+          Copy-Item -LiteralPath 'exe-in/ntptimeclient-winrs.exe' -Destination (Join-Path $stage 'ntptimeclient-winrs.exe')
 
           foreach ($f in 'install.ps1', 'uninstall.ps1', 'preview-common.ps1', 'default-config.toml', 'README-PREVIEW.txt') {
             Copy-Item -LiteralPath (Join-Path 'packaging' $f) -Destination $stage
@@ -181,7 +268,7 @@ jobs:
           $rustc = (rustc -vV) -join "`n"
           $version = @(
             'product: ntptimeclient-winrs'
-            'channel: UNSIGNED PREVIEW, NOT FOR MACHINES THAT MATTER'
+            $(if ($env:SIGNED -eq 'true') { 'signing: signed via SignPath Foundation' } else { 'signing: UNSIGNED PREVIEW, NOT FOR MACHINES THAT MATTER' })
             "version: $($env:VERSION)"
             "release channel: $($env:CHANNEL)"
             "tag: $tag"
@@ -221,7 +308,7 @@ jobs:
 
   publish:
     name: attach to pre-release
-    needs: [verify, build]
+    needs: [verify, package]
     # Real tag pushes only. A manual run stops after the artifact upload.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -238,12 +325,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-          ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+          ZIP_NAME: ${{ needs.package.outputs.zip_name }}
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
           CHANNEL: ${{ needs.verify.outputs.channel }}
+          SIGNED: ${{ needs.package.outputs.signed }}
           # The hash comes from the build job output, not from a file in the
           # artifact. The zip is compared with it before it is published.
-          ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
+          ZIP_SHA256: ${{ needs.package.outputs.zip_sha256 }}
         run: |
           set -euo pipefail
           actual="$(sha256sum "dist/${ZIP_NAME}" | cut -d' ' -f1)"
@@ -251,7 +339,18 @@ jobs:
             echo "zip hash $actual does not match the build job output $ZIP_SHA256" >&2
             exit 1
           fi
-          cat > notes.md <<'EOF'
+          if [ "$SIGNED" = "true" ]; then
+            cat > notes.md <<'EOF'
+          # Signed release
+
+          The exe is signed. Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+
+          - It sets the system clock and stops and disables the Windows Time service (w32time).
+          - Read README-PREVIEW.txt inside the zip before you run anything.
+          - Extract only into a folder that only administrators can write.
+          EOF
+          else
+            cat > notes.md <<'EOF'
           # UNSIGNED. NOT FOR MACHINES THAT MATTER.
 
           - The binary is not code signed. Windows SmartScreen, Smart App Control or antivirus may warn or block it (unverified).
@@ -263,12 +362,13 @@ jobs:
           Extract only into a folder that only administrators can write. Install and uninstall with the scripts in the zip. Both need an elevated PowerShell.
           The hash file inside the zip finds accidental damage only. It does not prove the zip is genuine.
           EOF
+          fi
           printf '\nSHA-256 of the zip:\n\n    %s  %s\n' "$ZIP_SHA256" "$ZIP_NAME" >> notes.md
           flags=(--verify-tag --generate-notes)
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             "${flags[@]}" \
-            --title "$TAG ($CHANNEL, unsigned)" \
+            --title "$TAG ($CHANNEL)" \
             --notes-file notes.md \
             "dist/${ZIP_NAME}" "dist/${ZIP_NAME}.sha256"

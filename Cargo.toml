@@ -20,6 +20,8 @@ getrandom = "0.4"
 # Config file. Parse and serde only, no writer or display code.
 toml = { version = "1.2", default-features = false, features = ["std", "parse", "serde"] }
 serde = { version = "1", features = ["derive"] }
+# Build time only. Embeds the Windows version resource (product name and version) that code signing needs.
+embed-resource = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
